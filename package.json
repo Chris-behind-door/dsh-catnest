@@ -1,0 +1,35 @@
+{
+  "name": "dsh-catnest",
+  "version": "0.1.0",
+  "description": "猫窝子系统（陪伴系统）宿主实现：家状态账本 + 时间片生命周期，落盘 ~/.dsh/.catnest/。",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "index.js",
+    "lib.js",
+    "lib/client.js",
+    "assets/homeplan.svg",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "license": "MIT"
+}

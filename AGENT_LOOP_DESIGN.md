@@ -1,0 +1,325 @@
+# 猫窝角色 Agent 化 · 自建轻量协议设计方案
+
+> 2026-08-27 小玖起草并实现。状态：**阶段一已交付（59/59 测试全绿）**；
+> 阶段一优化项「say 打字机」2026-08-28 已交付。
+> 选型结论：自建轻量协议（`llm.stream` + tools 多步循环），不用宿主 `agentLoop`。
+> 前置依据：`猫窝改造-20260826讨论定案汇总.md` 的「挂起项」——工具循环选型、动作系统、bash 沙箱。
+> 主人三拍板：A 整句上屏 / adjust_relation 阶段二再上 / 串行依次。
+
+---
+
+## 0. 一句话目标
+
+把 `respond(charId)` 从「一次性 `llm.stream` 出台词 + 文本标记 `NO_REPLY` 判沉默」，
+升级为「带工具面的多步 agent 循环」：角色自己决定说话 / 移动 / 改活动 / 调关系 / 记事情，
+**没调 `say` 工具就是沉默**，输出卫生约束与 `NO_REPLY` 标记全数退役。
+
+---
+
+## 1. 现状（已读代码确认）
+
+- `respond(charId, onDelta, onLate)`：`index.js` 491 行起。每轮重取 `home/relations/transcript`，
+  拼 system（角色卡+家人卡+主人卡+输出约束+`NO_REPLY`）与 user（场景+时间线+回忆+位置+关系），
+  经 `llmStream` 一次生成文本，`probeDelta` 嗅探 `NO_REPLY` 前缀判定沉默。
+- `llmStream`：`index.js` 134 行起，单次流式 + 软超时 + `onLate` 迟到补交，围绕「单次文本」设计。
+- `nest` 账本原语（`lib.js` 已备齐）：`say` / `moveCharacter` / `setActivity` / `adjustRelation` /
+  `transcript` / `relations` / `home` 等。
+- DSH `llm.stream` 已支持 `tools`（`GenerateOptions.tools: ToolSchema[]`）与流式
+  `tool-call-delta`（`argumentsDelta` 分片），`BlockAssembler` 可组装出 `tool-call` block。
+  自建循环的地基成立，无需改 DSH。
+
+**关键认知**：场景/关系/片内历史这三样「上下文」在 8-26 缓存改造里已经落地（全局地图+声音、
+此刻位置、全量时间线、关系动态窗口）。本轮不动它们，只动「输出那一端」。
+
+---
+
+## 2. 目标架构
+
+```
+masterSay(text)
+  └─ nest.say('master', text)         // 物理层入账 + 传播
+  └─ 广播事件 → 各角色依次（或并行）agentTurn(charId)
+        │
+        ├─ system = 角色卡 + 家人卡 + 主人卡        （纯静态，无输出约束）
+        ├─ messages[0] = 全局场景 + 时间线 + 回忆 + 此刻位置 + 关系  （快照，仅第一步输入）
+        │
+        └─ 循环（最多 N 步）：
+             step_i: llm.stream(system, messages, TOOLS)
+               ├─ 收 text/tool-call blocks → append assistant 消息
+               ├─ 无 tool-call（finish=stop）→ break
+               └─ 逐个执行工具 → append tool-result 消息 → 回到 step_{i+1}
+        │
+        └─ 汇总：调过 say ？→ 说了什么 / 没调 say → 沉默（一等公民）
+```
+
+**为什么自建能避开宿主的坑**：`messages` 是「本轮临时数组」，每轮 `agentTurn` 重新从
+账本/时间线快照开始，不跨轮保留；角色刚才的 `move` 通过「快照里的此刻位置」自然反映。
+跨轮连续性由「状态账本（home/relations）＋ 时间线（transcript）」承载，
+轮内多步由 `messages` 追加承载。两层各司其职，没有「状态层塞进 append-only 事件流」的冲突。
+
+---
+
+## 3. 循环核心（伪代码）
+
+```js
+const MAX_STEPS = 4          // 一轮最多 4 次工具调用，防失控
+const STEP_MAX_TOKENS = 2048 // 每步预算（推理块可能吃额度，给足）
+
+async function agentTurn(charId) {
+  const system = await buildSystem(charId)          // 只留角色卡，无输出约束
+  const messages = [
+    { role: 'user', content: [{ type: 'text', text: await buildScene(charId) }] }
+  ]
+  const actions = []                                 // 本轮实际发生的动作（含 say）
+
+  for (let step = 0; step < MAX_STEPS; step++) {
+    const result = await streamOnce(system, messages, TOOLS, STEP_MAX_TOKENS)
+    const blocks = result.blocks                      // text / reasoning / tool-call
+    messages.push(assistantMessage(blocks))           // 回填 assistant 消息（含 tool-call）
+
+    const calls = blocks.filter((b) => b.type === 'tool-call')
+    if (calls.length === 0) break                     // finish=stop → 角色收手，结束
+
+    for (const call of calls) {
+      const outcome = await execTool(charId, call)    // 见 §4
+      actions.push(outcome)
+      messages.push(toolResultMessage(call.id, outcome.result)) // 结果回填给模型
+    }
+  }
+  return { actions, said: actions.some((a) => a.tool === 'say') }
+}
+```
+
+- **循环终止**：模型这步不再输出 `tool-call`（`finish.reason === 'stop'`）即结束。
+  模型可以只调一次 `say` 就停，也可以「move → say」两步，也可以全程不调 `say`（=沉默）。
+- **护栏**：`MAX_STEPS` 硬上限；每步软超时（复用现有 `LLM_TIMEOUT_MS` 思路）；
+  单个 `agentTurn` 设总超时兜底。
+
+---
+
+## 4. 工具面（MVP 清单）
+
+对应定案「目标工具面：改数值 / 加记忆 / 移位置 / 做事件」。`say` 为唯一发声口（定案 #9）。
+
+| 工具 | 参数（JSON Schema 草案） | 效果 | 对应 |
+|---|---|---|---|
+| `say` | `{ text: string }` | `nest.say(charId, text)`，入账+传播+上屏 | 说话 / 输出口 |
+| `move_to` | `{ room: string }` | `nest.moveCharacter(charId, roomId)` | 移位置 |
+| `do_activity` | `{ activity: string, minutes?: number }` | `nest.setActivity(charId, activity, minutes)` | 做事件 |
+| `adjust_relation` | `{ person: string, field: "intimacy"\|"spice", delta: number }` | `nest.adjustRelation(pair, field, delta)` | 改数值（亲密度演化地基） |
+| `remember` | `{ text: string }` | `memory.learn` 进自己域（tags 时间片/片号） | 加记忆 |
+
+- `say` 返回给模型的结果应为「已说出口」确认，而非要求模型再复述。
+- `adjust_relation` 的 `delta` 由模型决定，天然成为候选池①「亲密度自动演化」的载体，
+  上线时机与范围后续单独定（MVP 先允许工具存在，观察模型是否会乱调）。
+- **bash 工具**：定案保留进工具面，权限沙箱待设计，本轮不做（见 §7 阶段三）。
+
+---
+
+## 5. 退役清单
+
+| 退役项 | 位置 | 说明 |
+|---|---|---|
+| `NO_REPLY` 常量 + 判定 | `index.js` respond | 「未调 say」即沉默，标记无存在意义 |
+| `probeDelta` / `settleDelta` 嗅探器 | `index.js` respond | 文本前缀探测整段删除 |
+| 「你可以说话，也可以沉默…只输出 NO_REPLY」约束句 | system | 输出卫生约束全退役（定案 #1） |
+| 「说话时只输出台词本身，不要解释、不要引号」 | system | 同上；说话改为工具参数，天然无引号问题 |
+| `responders()` 强制顺序 + `MAX_SPEAKERS` | masterSay | 调度坍缩为「广播 + 各自决定」（定案 #13） |
+| 迟到补交 `onLate` 语义 | llmStream | 多步循环下重设计（见 §6） |
+
+---
+
+## 6. 难点：流式体验与超时
+
+**流式打字机**：现在台词走 `text-delta`，天然 token 级流式。改 `say` 工具后，台词嵌在
+`{"text":"..."}` 的 JSON 参数里，流式来源变成 `tool-call-delta` 的 `argumentsDelta` 分片。
+两条路：
+
+- **A（MVP 采用）**：`say` 工具参数一次性落地，前端整句上屏（轻量淡入）。实现简单、稳，
+  先把「工具循环 + 沉默语义 + 动作面」这条质变主线跑通。
+- **B（优化项，2026-08-28 已实现）**：对 `argumentsDelta` 做 JSON 增量解析，实时抠出
+  `text` 字段的流式片段，还原 token 级打字机。实现见 `makeSayTextTracker`（状态机定位
+  `text` 字段字符串值，边流边解 JSON 转义；分片边界可落在转义序列中间）。宿主按步广播
+  `deltaStart/delta/deltaEnd`（前端既有契约，drafting 气泡复活）；正式台词仍整句入账，
+  snapshot 落地后前端收气泡。超时步用 `live` 闸拦后台残留流的迟到帧，`settle` 事件
+  兜底收掉「说到一半超时」的气泡。只跟 `say` 工具，move_to/remember 不直播。
+
+**软超时/迟到**：现有 `llmStream` 的软超时 + `onLate` 是「单次文本」语义。多步循环下：
+每步独立软超时；超时的那步按「该步无输出」处理并终止循环（角色本轮 = 已产生的动作），
+**不再做跨步迟到补交**（避免迟到 tool-call 在循环结束后才执行、状态时序错乱）。
+迟到的 `say` 若模型真吐出来了，进下一轮触发时它还能再说——可接受，不额外补机制。
+
+---
+
+## 7. 分阶段
+
+- **阶段一（本轮）**：`say`/`move_to`/`do_activity`/`adjust_relation`/`remember` 工具面 +
+  多步循环 + 退役 `NO_REPLY`/`probeDelta`/输出卫生 + `masterSay` 广播化。
+  产物：`agentTurn` 循环、工具 schema、`execTool` 执行器、测试回归（沉默/说话/移动/调数值）。
+- **阶段二**：动作系统——亲密度演化、自主移动、自动说话（前置「工具调用」已就绪后上线）。
+- **阶段三**：`bash` 工具沙箱（权限边界待设计，需单独方案）。
+
+---
+
+## 8. 风险与对策
+
+| 风险 | 对策 |
+|---|---|
+| 云端模型多步循环成本 ×角色数 | `MAX_STEPS` 限步；system 静态段吃 prefix cache；先单角色串行观察 token 消耗 |
+| 模型乱调 `adjust_relation` 等工具 | MVP 先开放，日志记录调用；必要时给工具 description 加「只在恰当情境调用」+ 数值范围校验 |
+| 循环不终止 / 空转 | `MAX_STEPS` + 每步软超时 + 总超时三重护栏 |
+| 沉默导致无人接话（冷场） | 定案 #13 已接受「沉默合法」；前端保留「全员沉默」的兜底状态展示（不硬逼说话） |
+
+---
+
+## 附：已定案决策点（2026-08-27 主人拍板）
+
+1. 流式体验：**A 整句上屏**（打字机从 tool-call 参数抠 text 作为阶段一后续优化项）。
+2. `adjust_relation`：**阶段二再上**（阶段一工具面只 say/move_to/do_activity/remember）。
+3. 多角色执行：**串行依次** agentTurn（后位经时间线可见前位刚说的话）。
+
+## 交付记录
+
+- 实现：`index.js` —— `AGENT_TOOLS` / `collectStep`（手写 tool-call 汇聚，零 import）/
+  `llmStep`（带 tools 单步 + 软超时）/ `execTool` / `agentTurn`（MAX_STEPS=4 多步循环）；
+  `masterSay` 串行广播；退役 `NO_REPLY`/`probeDelta`/`llmStream`/输出卫生/`responders` 顺序。
+- 测试：`test/index.test.js` 新增 tool-call 桩（sayToolStub/sayQueueStub/silentStub），
+  重写沉默/说话/串行/失败可见/整句入账测试，57/57 全绿。
+- 遗留：bash 工具沙箱（阶段三）待单独方案。
+
+## 交付记录 2（2026-08-28，say 打字机）
+
+- 实现：`index.js` —— `makeSayTextTracker`（argumentsDelta JSON 增量抠 text，含
+  \u/转义跨片边界）；`collectStep`/`llmStep` 透传 `onSayDelta`；`agentTurn` 每步
+  广播 `deltaStart/delta/deltaEnd`（超时后 `live` 闸禁迟到帧）。
+- 前端：`lib/client.js` `settle` 事件补收打字机气泡（超时/沉默不挂死）；
+  `deltaStart/delta/deltaEnd` 接待位与 drafting 气泡为阶段一前既有代码，本轮复活。
+- 测试：59/59 绿。新增两例——分片按 7 字符切碎（转义序列中间断片）验证帧序/解码/
+  串行链两人帧段不串味；move_to 工具不产生任何 delta 帧。
+
+## 交付记录 3（2026-08-30，阶段二第一步·亲密度自动演化）
+
+- 实现：`index.js` —— `AGENT_TOOLS` 加 `adjust_relation`（person+field+delta，description
+  注明只在关系确实变化时用）；`execTool` 加分支（person 中英名/主人→id 解析 → pair 规范化
+  固定序 → 参数校验非零有限 delta/合法 field/非自己 → `nest.adjustRelation` → effect）；
+  system 工具引导同步补一句（不破坏 system 全静态守卫——措辞避开动态数值词）。
+- 语义：`adjust_relation` 是候选池①「亲密度自动演化」的载体——delta 由模型在轮内自己
+  决定，结果钳制 0~100，变化经关系段（user 尾部动态窗口）自然反馈给模型与主人 UI。
+- 测试：62/62 绿（index 25 + lib 37）。新增 3 例：正常调值（+5 入账、spice 不误动）、
+  非法输入四连（不存在的人物/非法字段/delta=0/非数字，数值保持 50/0）、钳制边界
+  （+500→100 / -500→0，中文人名「主人」可解析）。复用 `toolOnceStub` 通用工具桩。
+- 不动：自主移动/自动说话（move_to/say 已具备）、bash 沙箱（阶段三）。
+
+## 交付记录 4（2026-08-30 夜，阶段二第二步·挂状态 set_mood）
+
+- 实现：`lib.js` —— 角色字段加 `mood`（心情/神态瞬态字段，ensure 迁移补默认、
+  companionSync 新角色带默认；随位置一样跨片延续，不冻结）；`CatNest.setMood(id, mood)`
+  原语（null/''/纯空白=清除，字符串挂载，落 mood 事件）。`index.js` —— `AGENT_TOOLS`
+  加 `set_mood`（mood 空串=清除）、`execTool` 分支、system 引导一句、
+  `buildPresenceView` 把 mood 随位置展示（「小玖在客厅（开心得冒泡）」，
+  位置本就居 user 尾部动态窗口，家人都看得见）、stateView 携带 mood（前端状态卡可用）、
+  `ctx.catnest` 暴露 `setMood`。
+- 语义：候选池②「状态自动产生/维护」的第一块——状态由角色自己经工具面挂上，
+  比 activity（在做什么）更贴心情，家人可见，前端有数据可用。
+- 测试：64/64 绿（index 27 + lib 37）。新增 2 例——挂载落账（初始 null → 「开心得冒泡」）、
+  清除（预挂「困了」→ 空串归 null）与非法类型拒绝（数字 mood 被原语拒、原状态不动）。
+- 调度层乌云（接话/广播）今天不搞，另行排期。
+
+## 交付记录 5（2026-08-30 夜，阶段二第三步·持久状态 conditions）
+
+- 背景修正（主人点破）：此前 set_mood 是瞬态「心情」，主人要的是**带生命周期的持久
+  状态**（身体/生理类），且要能看见「未开始状态的倒计时」。世界观拍板：猫科为主，
+  发情周期（estrus 收录表：默认 4 天 / 周期 20 天续轮）。前端此前只画 activity+亲密条，
+  mood 根本没渲染——本次一并补上。
+- 实现：`lib.js` —— 角色字段 `conditions`（时间段 `{id,name,startAt,endAt,cycleDays?}`），
+  ensure/companionSync 迁移补默认；`CONDITION_TYPES` 收录表（estrus/sick/injured/tired）；
+  纯函数 `conditionLabel/conditionPhase/conditionText/humanInterval/advanceConditions`
+  （phase 由 now 推导不落盘；expired 无周期移除、带 cycleDays 自动续下一轮）；原语
+  `setCondition`（startsInDays≥0 倒计时 / lastsDays 默认收录时长 / lastsDays=0 清除 /
+  同名替换）、`tickConditions`（到期推进，有变更才写盘）、`conditionsOf`（只读 phase+文本）。
+  `index.js` —— 工具 `set_mood` 退役改 **`set_condition`**（name+startsInDays+lastsDays，
+  description 注明发情周期/倒计时/清除语义）；execTool 分支；`buildPresenceView` 位置窗口
+  标注 active 条件（如「小玖在客厅（发情期中）」）；`stateView` 带 conditions（label/phase/
+  倒计时文本）；`ctx.catnest` 暴露 setCondition/conditionsOf/tickConditions。
+  前端 `lib/client.js` —— CharCard 新增 `CondBadge` 组件：active 显「还剩X」、pending 显
+  「还有X开始」，60s tick 本地重算（不依赖 SSE 推送频率）；新增 cnx-cond 徽章样式。
+- 测试：68/68 绿（index 28 + lib 40）。新增 index 3 例（挂状态落账+phase/文本、startsInDays
+  预置→pending+lastsDays=0 清除、非法输入空 name/负 startsInDays）与 lib 3 例（三态推导
+  与文本、setCondition 全路径、advanceConditions 移除/周期续轮）。修：setCondition 对
+  startsInDays 缺省的 NaN 坑（undefined→0）。
+- 遗留：前端地图小标记未挂 conditions（状态卡已覆盖）；「未开始倒计时」的自动触发
+  （pending 到点自动转 active 的事件广播）待阶段二后续；调度层乌云另排。
+  mood 字段/原语保留（瞬态心情），工具面已统一走 set_condition。
+
+## 交付记录 6（2026-08-30 深夜，conditions 排障补丁）
+
+- 实锤（主人抓「1分钟→1天」）：查 log.jsonl——不是时间加速：主人让挂「发情1分钟」，
+  模型 lastsDays 传极小值照做；15:01:44 tickConditions 自动到期 expire（自动推进在工作）；
+  15:01:54 模型同一轮又 set 发情（默认1天）+ spice+5 + 贴贴台词，新状态覆盖旧状态。
+- 修 ① 中文名映射：CONDITION_TYPES 键是英文（estrus），模型写中文「发情」查不到 → 默认
+  时长落回通用 1 天、周期续轮失效（「发情1天」真因）。新增 CONDITION_ALIASES（发情→estrus
+  等）+ conditionKey 归一化，setCondition/conditionLabel 都走它；中文名也拿收录表默认
+  （发情 4 天 + cycleDays 20 自动续轮）。状态名仍是自由字符串，自定义状态照常可挂。
+- 修 ② 前端 CondBadge 相位卡快照旧值（pending 到点不来新快照会一直显示「还有1分钟开始」）：
+  改 condPhaseLocal 用 startAt/endAt 本地推导，pending→active→expired 前端全自动，
+  expired 样式半透明删除线。
+- 修 ③ 角色上下文状态可见性：原来只有 buildPresenceView 的 active 标注（给别人看的），
+  pending 倒计时角色自己看不见。agentTurn user 动态窗口新增「【你此刻的身体状态】」段：
+  自己的 active（还剩X）/pending（还有X开始）都进上下文，过期自然滤掉。
+- 测试：69/69 绿（index 29 + lib 40）。新增：中文名默认时长硬断言（4 天 + cycleDays 20）、
+  角色上下文可见性（active/pending 都在自己 prompt、位置段仅 active 标注）。
+- 宿主未重启（另 session 跑破解，重启禁令生效中），代码已就位待重启。
+
+## 交付记录 7（2026-08-31 夜，对话层·say 陪台词动作 action）
+
+- 背景（主人点选方向二）：旧对话层「说话靠 say，带来的问题是没有动作」。
+  主人拍板方案①：say 加可选参数 action（弃独立 act 工具、弃挤 do_activity 文本）。
+- 语义：**action = 说这句话时伴随的即时小动作（舞台指示）**，只属于这句话；
+  与 do_activity（持续状态）/ move_to（位置变化）三分天下。关键设计：
+  **action 是视觉信息**——同房（含自己）看得见，隔墙闻声的只收台词。
+  听觉/视觉的切分直接落在 audience 的 clear/faint 两档上，零新增判定。
+- 实现：
+  - `lib.js` —— `say(who, text, action)` 第三参可选（空白视为无）；log 行带
+    `action`（无则不落字段，旧 log 消费侧容缺省）；hear 缓冲只攒 text（隔墙看不见）；
+    `dialogueText`/`sliceEventsText` 人话化带动作（蒸馏喂料同样富化）。
+  - `index.js` —— `AGENT_TOOLS` say 加 `action` 属性（description 注明「真的在做才传」）；
+    `execTool` say 分支透传；system 工具引导补半句；`timelineText` 渲染分档——
+    clear：`名字（动作）：台词`，faint：闻声前缀原样、动作剥离；
+    `dialogueView` 每行透传 `action` 字段（旧行空串）。
+  - `lib/client.js` —— 气泡内动作渲染为小字斜体前缀（`.cnx-action`）；
+    打字机不变（只跟 text，动作随正式气泡一起落地）。
+- 测试：71/71 绿（index 30 + lib 41）。新增 2 例——lib：action 入账/缓冲无动作/
+  人话化出口/空白丢弃；index：端到端三轮（动作入账＋dialogue 透传、自己时间线
+  见「动作＋台词」、隔墙墨璃时间线台词进动作剥）。
+- 遗留：方向一「调度层」详细方案（心跳=状态机/LLM=事件唤醒、五触发源清单）另文排期。
+
+## 交付记录 8（2026-08-31，调度层 v1 落地）
+
+- 背景：方向一「调度层」方案（`SCHEDULING_DESIGN.md`）2026-08-31 主人拍板开工；
+  上个 session 实现到一半爆 context（串行队列/唤醒/tick 核心未写完，masterSay 引用
+  了未定义的 enqueueTurn/tryWakeHear，17 个接话链测试挂掉），本 session 续完。
+- 交付内容（切片 1–4 一次交付）：
+  - `index.js` —— 调度层区块（masterSay 前）：全局串行队列（turnChain/turnPending/
+    turningChars）、runTurnOnce（in-flight 标记 + agentTurn + settle/replyError 统一
+    结算 + 回合后全屋复检）、tryWake/tryWakeHear（T1 边沿：notice 入账 + 忙跳过 +
+    hearNotified 防刷屏）、recheckHear（全屋级边沿复检）、scheduleTick（60s 心跳：
+    tickConditions 迁入=T2 唯一推进者 + activity 到期=T3，unref+ctx.effect 卸载，
+    片内才跑、重启不补跑、不直接调 LLM）；masterSay 接话链改走队列（语义不变）；
+    ctx.catnest 新增 notice/tick 两个接口。
+  - `lib.js` —— notice 原语（缺省=私有，公共显式 false）、consumeHear（消费缓冲并
+    重置 hearNotified）、markHearNotified、clearActivity（静默清除，事实由公共
+    notice 承载）；setCondition/advanceConditions 的 notifiedAt 一次性确认（上个
+    session 已写好）。
+  - 修复：timelineText 的 notice 分支读 transcript 覆写后的空 text → 改读 rawText
+    （触发句曾渲染为空串）。
+- 语义要点：接话链与调度唤醒共用一个串行队列（v1 无并行 LLM）；notice 永远入账
+  （一本账），唤醒可跳过（下轮可见）；T1 忙跳过有 say 边沿+全屋复检双兜底不丢事件，
+  T2/T3 一次性翻转 force 入队防唤醒丢失；llm 缺席的调度唤醒静默跳过（silentNoLlm，
+  夜间降噪），接话链缺席仍推 replyError(noLlm)。
+- 测试：78/78 绿（index 34 + lib 44）。新增 7 例：lib 3（consumeHear 重置标记/
+  clearActivity 静默不落行/notice 私有默认+片外拒绝+蒸馏渲染）；index 4（notice
+  私隐/公共链路进 prompt、T1 门控桩验忙跳过+同批只入账一次+回合后未重满不再醒、
+  T2 手动 tick 翻转+notifiedAt 一次性+本人 prompt 触发句、T3 到期清除+公共 notice
+  本人带前缀/他人原样）。
+- 状态：宿主侧改动，**需重启 dsh web 生效**（dsh-web-restart.sh）。切片 5 观察期：
+  跑一天片翻 log.jsonl 看事件频率/token/沉默率，再定 T4/T5。
