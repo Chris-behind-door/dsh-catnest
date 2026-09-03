@@ -323,3 +323,64 @@ async function agentTurn(charId) {
   本人带前缀/他人原样）。
 - 状态：宿主侧改动，**需重启 dsh web 生效**（dsh-web-restart.sh）。切片 5 观察期：
   跑一天片翻 log.jsonl 看事件频率/token/沉默率，再定 T4/T5。
+
+## 附：与 LangGraph 对照（2026-09-01，面试备战）
+
+背景：携程 MJ036678（云原生研发·AI Agent 方向）研究日。本节记录猫窝自建协议与
+LangGraph 的架构对照（诚实边界版），供面试直接取用。
+
+### 映射表
+
+| LangGraph 概念 | 猫窝手搓等价物 | 边界 |
+|---|---|---|
+| StateGraph（显式 schema + reducer 合并） | agentTurn 的 messages 列表 | 同构但非 schema 化，可变参数传递 |
+| 节点（agent/工具/确定性步骤混排） | collectStep / llmStep + execTool | ✔ |
+| 条件边（循环/终止） | MAX_STEPS=4 循环，沉默即终止 | ✔ 但为隐式循环，非显式图 |
+| thread | 时间片 | ✔ |
+| checkpoint（每步落盘快照） | 关片快照 + summary.json | 片级快照，非每步 |
+| interrupt / HITL | 无 | 缺口（阶段二候选，见设计要点） |
+| executor | 串行队列 | ✔ |
+| streaming | say 打字机（argumentsDelta 状态机跟踪） | ✔ |
+
+### 诚实边界话术（面试用）
+
+「没直接用过 LangGraph。手搓过猫窝 agent 系统：循环与记忆机制与 LangGraph 设计
+同构（时间片≈thread、关片快照≈checkpoint、串行队列≈executor），但没实现图本身，
+持久化是片级非每步，没有 HITL。跑过 LangGraph 最小图做过逐项对照。」
+
+### LangGraph 核心概念速记（langgraph 1.2.11 源码实证）
+
+- **StateGraph**：state 为显式 schema 共享对象；节点不直接改 state，return 部分
+  更新，按字段 reducer 合并（`Annotated[list, add_messages]`）；无 reducer = 覆盖
+- **checkpoint**：每步落盘序列化 state 快照（put/put_writes/get_tuple/list），
+  按 thread_id 组织；支撑崩溃续跑、time travel 分叉、多会话隔离
+- **interrupt**：节点内抛可恢复异常暂停；恢复时**节点从头重跑**（逻辑须幂等）；
+  强依赖 checkpointer
+- **Command 双方向**：节点 return `Command(goto, update)` 动态选下一跳；
+  `invoke(Command(resume=...))` 恢复 interrupt
+- **产品矩阵**：LangChain（框架层：抽象+集成+预置 loop，1.x 预置 agent 跑在
+  LangGraph 上）/ LangGraph（低层运行时）/ LangSmith（可观测）/ Deep Agents
+- **一句话**：LangGraph 的核心不是「画图」，是「每步落盘」
+
+### 模拟面试翻车清单（2026-09-01，5 题实测）
+
+1. ❌「LangChain 链式编排 vs LangGraph 图式编排」——过时框架。正确：分层，上层
+   管省事、下层管可控，上层预置 agent 跑在下层上
+2. ❌ LangChain 风评差只答「历史包袱/文档过时」——那是症状；根因=抽象过度 +
+   API 频繁大改 + 子包迷宫
+3. ⚠️ checkpoint 用 KV cache 类比只对一半：共同点=持久化前缀跳过前缀；差别=
+   KV cache 是显存加速随进程消失，checkpoint 是磁盘容错为崩溃而生且每步可寻址
+   （time travel）
+4. ⚠️ HITL 设计只答「停在哪」，欠「怎么恢复」：等待状态须持久化（进程重启后
+   暂停仍在）/ 主人确认消息须路由到 pending 判定而非下一轮对话 / 拒绝时已落库
+   的亲密度回滚语义须定义（干净做法=批准前不落库，恢复时才应用）
+5. ✔ 加分项：快手实习 harness-cli（7 阶段多 agent 流水线）= 真实多阶段编排经验，
+   主动亮出
+
+### 猫窝 HITL 设计草稿（阶段二候选，源自 Q5 设计题）
+
+- 轮内型（亲密度检定）：工具串行化（禁批量，每次调用后检定），超阈值即打断
+  循环，代价=延迟换控制
+- 轮间型（B 该说话被暂停）：调度层加门，B 的回合 park 在队列带 pending 标记
+- 恢复三件事：① 等待状态持久化（片内快照或独立 pending 记录）② 主人下一句的
+  路由判定（确认答复 vs 普通对话）③ 拒绝语义（回滚 or 批准前不落库）
