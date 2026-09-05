@@ -62,7 +62,9 @@ export function initialRelationsOf(companionId) {
 }
 
 // ── 家物理常量（草案第四节）──
-export const HOME_VERSION = 2
+// v2→v3（2026-09-05 §9）：home.topics 话题状态（片内作用域）+ 角色 activityPaused
+// （pause_activity 放下锅铲）+ lastAmbientAt（活动隔墙动静去重）
+export const HOME_VERSION = 3
 // "听到"决策链阈值（草案：小玖3条/姐姐5条，待调——存 home.json 可改）
 export const HEAR_THRESHOLDS = { kyu: 3, moli: 5 }
 // 同房接话顺序：小玖活泼先抢，姐姐谦让（草案 4.5）
@@ -124,6 +126,8 @@ function defaultHome() {
           activity: null,
           activityEndsAt: null,
           activityLeftMs: null, // 模式外冻结时的剩余毫秒（close 时写入，open 时换回 endsAt）
+          activityPaused: null, // pause_activity「放下锅铲」：暂停中的活动标记（暂停=不忙）
+          lastAmbientAt: null, // 活动隔墙动静上次入账时刻（§9.5，每 10min 补一条去重）
           mood: null, // 挂状态（心情/神态，字符串；空=无），瞬态随位置进场景动态窗口
           conditions: [], // 持久状态（时间段）：{ id, name, startAt, endAt, cycleDays? }
           hear: [], // "听到"决策链缓冲（相邻动静攒存）
@@ -132,6 +136,7 @@ function defaultHome() {
     ),
     hearThresholds: { ...HEAR_THRESHOLDS },
     master: { atHome: false, room: null },
+    topics: {}, // 话题状态（§9.2，片内作用域：open 时清空；跨片不延续）
   }
 }
 
@@ -184,9 +189,11 @@ export function roomRelation(home, fromRoom, toRoom) {
   return room.adjacent.includes(toRoom) ? 'adjacent' : 'far'
 }
 
-// 角色是否在忙（有活动且未到期；无结束时间的活动视为一直在忙）
+// 角色是否在忙（有活动且未到期；无结束时间的活动视为一直在忙）。
+// 暂停中的活动（activityPaused，「放下锅铲」）= 不忙：可被叫、可接话、可被轻推（§9.9）。
 export function isBusy(ch, now) {
   if (!ch || !ch.activity) return false
+  if (ch.activityPaused) return false
   if (!ch.activityEndsAt) return true
   return new Date(ch.activityEndsAt).getTime() > now.getTime()
 }
@@ -301,6 +308,196 @@ export function charName(home, id) {
   return (home.characters && home.characters[id] && home.characters[id].name) || CHARACTER_NAMES[id] || String(id)
 }
 
+// ── 话题（topic）状态纯函数（路 B §9.2，2026-09-05 三轮定稿）──
+// home.topics = { [openedBy + '|' + about]: { about, room, openedBy, to?, participants,
+//   openedAt, lastTurnAt, turns, status: 'open'|'closing'|'ended', endedBy?, endedAt? } }
+// status 流转：open →（end_topic 提议）closing →（另一参与方裁决 / 沉默兜底）ended；
+// 裁决否决（对方继续说 X）回 open。话题是片内作用域（nest.open 清空；片内进程重启不丢）。
+// 一轮 = 一条解析到 X 的 say；账本行只记 open/join/end/reopen，接受/沉默收尾无独立行。
+
+// 收话题沉默超时（tick 兜底）：自最后一条 mention 起 10 分钟无人对 X 说话 → 沉默自动收
+export const TOPIC_SILENCE_TIMEOUT_MS = 10 * 60000
+// 活动隔墙动静「持续中」补条间隔（§9.5）：每 10min tick 补一条，同窗不重复
+export const AMBIENT_REPEAT_MS = 10 * 60000
+
+export function topicKey(charId, about) {
+  return charId + '|' + about
+}
+
+// 匹配规则（「解析到 X」）：about 完全相等优先；否则 X 是 X.room 里唯一话题 且
+// 说话人是参与方 且这次 say 带 about。拿不准按不解析（保守，可用精确短语消歧）。
+export function matchTopic(home, charId, about) {
+  const topics = home && home.topics ? home.topics : {}
+  const list = Object.values(topics).filter((x) => x && x.status !== 'ended')
+  const a = typeof about === 'string' ? about.trim() : ''
+  if (!a || list.length === 0) return null
+  const exact = list.filter((x) => x.about === a)
+  if (exact.length > 0) {
+    return exact.sort((p, q) => String(q.lastTurnAt || '').localeCompare(String(p.lastTurnAt || '')))[0]
+  }
+  const ch = home.characters && home.characters[charId]
+  const myRoom = ch ? ch.room : null
+  const inRoom = myRoom ? list.filter((x) => x.room === myRoom) : []
+  if (inRoom.length === 1) {
+    const x = inRoom[0]
+    if (Array.isArray(x.participants) && x.participants.includes(charId)) return x
+  }
+  return null
+}
+
+// 开启话题（幂等）：同人同短语重复提起＝幂等更新（不重置参与方/轮次，只刷新现场）。
+// 返回 { key, opened, topic }；opened=false 表示更新的是既有话题。
+export function topicOpenState(home, now, charId, about, to) {
+  const topics = home.topics || (home.topics = {})
+  const a = String(about).trim()
+  const key = topicKey(charId, a)
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  const ch = home.characters && home.characters[charId]
+  const room = ch ? ch.room : null
+  const existing = topics[key]
+  if (existing) {
+    existing.room = room
+    existing.lastTurnAt = new Date(t).toISOString()
+    existing.turns = (existing.turns || 0) + 1
+    return { key, opened: false, topic: existing }
+  }
+  const topic = {
+    about: a,
+    room,
+    openedBy: charId,
+    ...(to ? { to } : {}),
+    participants: [charId],
+    openedAt: new Date(t).toISOString(),
+    lastTurnAt: new Date(t).toISOString(),
+    turns: 1,
+    status: 'open',
+  }
+  topics[key] = topic
+  return { key, opened: true, topic }
+}
+
+// 一次 say 后的话题账：裁决（closing 中另一参与方说话→否决，其他动作/不解析→接受）+
+// 加入（open 中非参与方第一条解析到 X 的 say）+ 续谈（参与方轮数 +1）。
+// 返回 { matched, key, verdict: null|'reopen'|'join', joined, accepted:[话题] }
+// accepted=本次说话顺带裁决收掉的话题（无独立账本行，仅状态，供测试观察）。
+export function topicResolveSay(home, now, charId, about) {
+  const topics = home.topics || {}
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  const accepted = []
+  const mx = matchTopic(home, charId, about)
+  // 1) 裁决接受：参与中的 closing 话题，除解析到 X 的（→ 下面否决），其余接受收掉
+  for (const x of Object.values(topics)) {
+    if (!x || x.status !== 'closing') continue
+    if (x.endedBy === charId) continue // 提议人自己不动自己的话题
+    if (!Array.isArray(x.participants) || !x.participants.includes(charId)) continue
+    if (mx === x) continue // 说得正起劲 → 否决，算继续聊
+    x.status = 'ended'
+    x.endedBy = charId
+    x.endedAt = new Date(t).toISOString()
+    accepted.push(x)
+  }
+  if (!mx) return { matched: false, key: null, verdict: null, joined: false, accepted }
+  const key = Object.keys(topics).find((k) => topics[k] === mx)
+  // 2) 否决：另一参与方在 closing 中说了解析到 X 的内容 → 回 open（reopen 账本行）
+  if (mx.status === 'closing' && mx.endedBy !== charId && Array.isArray(mx.participants) && mx.participants.includes(charId)) {
+    mx.status = 'open'
+    mx.turns = (mx.turns || 0) + 1
+    mx.lastTurnAt = new Date(t).toISOString()
+    return { matched: true, key, verdict: 'reopen', joined: false, accepted }
+  }
+  // 3) 加入：open 话题里非参与方第一条解析到 X 的 say（topic-join 账本行）
+  if (mx.status === 'open' && !(Array.isArray(mx.participants) && mx.participants.includes(charId))) {
+    mx.participants = [...(mx.participants || []), charId]
+    mx.turns = (mx.turns || 0) + 1
+    mx.lastTurnAt = new Date(t).toISOString()
+    return { matched: true, key, verdict: 'join', joined: true, accepted }
+  }
+  // 4) 续谈：参与者（或 closing 中提议人自己再说）轮数 +1；非参与方提到不算
+  if (Array.isArray(mx.participants) && mx.participants.includes(charId)) {
+    mx.turns = (mx.turns || 0) + 1
+    mx.lastTurnAt = new Date(t).toISOString()
+  }
+  return { matched: true, key, verdict: null, joined: false, accepted }
+}
+
+// 一次非说话动作后的话题账：参与中的 closing 话题 → 裁决接受（ended）。
+// （B 做了 do_activity/move_to/set_condition 等 → 接受；无独立账本行，仅状态）
+export function topicResolveAction(home, now, charId) {
+  const topics = home.topics || {}
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  const accepted = []
+  for (const x of Object.values(topics)) {
+    if (!x || x.status !== 'closing') continue
+    if (x.endedBy === charId) continue
+    if (!Array.isArray(x.participants) || !x.participants.includes(charId)) continue
+    x.status = 'ended'
+    x.endedBy = charId
+    x.endedAt = new Date(t).toISOString()
+    accepted.push(x)
+  }
+  return { accepted }
+}
+
+// end_topic：open → closing（提议收掉）；另一参与方在 closing 中再 end → 双收（ended）。
+// 只允许话题参与方调用。end_topic 是精确动作（要收哪个说哪个）：只匹配 about 完全相等。
+// 返回 { key, verdict: 'propose'|'accepted'|null }；找不到返回 key:null。
+export function topicEndState(home, now, charId, about) {
+  const topics = home.topics || {}
+  const a = typeof about === 'string' ? about.trim() : ''
+  if (!a) return { key: null, verdict: null }
+  const cands = Object.entries(topics)
+    .map(([k, v]) => ({ k, v }))
+    .filter(
+      ({ v }) =>
+        v &&
+        v.status !== 'ended' &&
+        v.about === a &&
+        Array.isArray(v.participants) &&
+        v.participants.includes(charId),
+    )
+    .sort((p, q) => String(q.v.lastTurnAt || '').localeCompare(String(p.v.lastTurnAt || '')))
+  if (cands.length === 0) return { key: null, verdict: null }
+  const x = cands[0].v
+  const key = cands[0].k
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  if (x.status === 'closing') {
+    if (x.endedBy !== charId) {
+      // 双收：对方也提收 → 直接 ended
+      x.status = 'ended'
+      x.endedBy = charId
+      x.endedAt = new Date(t).toISOString()
+      return { key, verdict: 'accepted' }
+    }
+    x.lastTurnAt = new Date(t).toISOString()
+    return { key, verdict: 'propose' } // 自己再提：幂等保持 closing
+  }
+  if (x.status === 'open') {
+    x.status = 'closing'
+    x.endedBy = charId
+    x.lastTurnAt = new Date(t).toISOString()
+    return { key, verdict: 'propose' }
+  }
+  return { key, verdict: null } // 已 ended
+}
+
+// tick 兜底：status!=ended 且超时（默认 10 分钟）无人说话 → 沉默自动收（endedBy='silence'）
+export function topicExpire(home, now, timeoutMs) {
+  const topics = home.topics || {}
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  const ms = Number(timeoutMs) > 0 ? Number(timeoutMs) : TOPIC_SILENCE_TIMEOUT_MS
+  const expired = []
+  for (const x of Object.values(topics)) {
+    if (!x || x.status === 'ended') continue
+    const last = x.lastTurnAt ? new Date(x.lastTurnAt).getTime() : t
+    if (t - last <= ms) continue
+    x.status = 'ended'
+    x.endedBy = 'silence'
+    x.endedAt = new Date(t).toISOString()
+    expired.push(x)
+  }
+  return expired
+}
+
 // 模式外冻结：close 时把进行中的活动换算成剩余毫秒（模式外时间不流逝）
 export function freezeActivities(home, now) {
   for (const ch of Object.values(home.characters || {})) {
@@ -337,11 +534,23 @@ export function dialogueText(home, e) {
   const name = charName(home, who)
   switch (e.type) {
     case 'say':
-      return e.action ? `${name}（${e.action}）：${e.text}` : `${name}：${e.text}`
+      return e.action
+        ? `${name}（${e.action}）${typeof e.about === 'string' && e.about ? `（聊${e.about}）` : ''}：${e.text}`
+        : `${name}${typeof e.about === 'string' && e.about ? `（聊${e.about}）` : ''}：${e.text}`
     case 'shout':
       return `${name}喊话（喊${charName(home, e.target)}）：${e.text}`
     case 'hear':
       return `${charName(home, e.char)}听到${charName(home, e.from)}的动静：${e.text}`
+    case 'topic-open':
+      return `${name}${e.to ? '向' + charName(home, e.to) : ''}提起话题：${e.about}`
+    case 'topic-join':
+      return `${name}加入了话题：${e.about}`
+    case 'topic-end':
+      return `${name}提议收掉话题：${e.about}`
+    case 'topic-reopen':
+      return `${name}：这个还要聊`
+    case 'activity-pause':
+      return `${name}放下了手里的活（${e.activity}）`
     default:
       return ''
   }
@@ -436,6 +645,8 @@ export function companionSync(home, companions) {
       activity: null,
       activityEndsAt: null,
       activityLeftMs: null,
+      activityPaused: null,
+      lastAmbientAt: null,
       mood: null,
       conditions: [],
       hear: [],
@@ -470,13 +681,30 @@ export function sliceEventsText(home, logText) {
   for (const e of events) {
     switch (e.type) {
       case 'say':
-        lines.push(`${charName(home, e.who)}${e.action ? `（${e.action}）` : ''}：${e.text}`)
+        lines.push(
+          `${charName(home, e.who)}${e.action ? `（${e.action}）` : ''}${typeof e.about === 'string' && e.about ? `（聊${e.about}）` : ''}：${e.text}`,
+        )
         break
       case 'shout':
         lines.push(`${charName(home, e.char)}朝${charName(home, e.target)}喊话：${e.text}`)
         break
       case 'hear-ignore':
         lines.push(`${charName(home, e.char)}掂量了一下，没理会动静`)
+        break
+      case 'topic-open':
+        lines.push(`${charName(home, e.char)}${e.to ? '向' + charName(home, e.to) : ''}提起话题：${e.about}`)
+        break
+      case 'topic-join':
+        lines.push(`${charName(home, e.char)}加入了话题：${e.about}`)
+        break
+      case 'topic-end':
+        lines.push(`${charName(home, e.char)}提议收掉话题：${e.about}`)
+        break
+      case 'topic-reopen':
+        lines.push(`${charName(home, e.char)}：这个还要聊`)
+        break
+      case 'activity-pause':
+        lines.push(`${charName(home, e.char)}放下了手里的活（${e.activity}）`)
         break
       case 'move':
         lines.push(`${charName(home, e.char)}从${roomName(home, e.from)}挪去了${roomName(home, e.to)}`)
@@ -553,8 +781,12 @@ export class CatNest {
     if (!home || !Array.isArray(home.rooms) || typeof home.characters !== 'object') {
       await this.writeJsonAtomic(homePath, defaultHome())
     } else {
-      // v1 → v2 迁移：补听到缓冲 / 阈值 / 冻结字段，旧房间与角色保持原样
+      // v2 → v3 迁移：补 topics / 暂停标记 / 隔墙动静去重，旧房间与角色保持原样
       let changed = false
+      if (!home.topics || typeof home.topics !== 'object') {
+        home.topics = {}
+        changed = true
+      }
       if (!home.hearThresholds || typeof home.hearThresholds !== 'object') {
         home.hearThresholds = { ...HEAR_THRESHOLDS }
         changed = true
@@ -567,6 +799,14 @@ export class CatNest {
         }
         if (ch.activityLeftMs === undefined) {
           ch.activityLeftMs = null
+          changed = true
+        }
+        if (ch.activityPaused === undefined) {
+          ch.activityPaused = null
+          changed = true
+        }
+        if (ch.lastAmbientAt === undefined) {
+          ch.lastAmbientAt = null
           changed = true
         }
         if (ch.mood === undefined) {
@@ -641,6 +881,8 @@ export class CatNest {
     // 解冻活动：片外流逝不计入（模式外家静止）
     const home = await this.home()
     thawActivities(home, this.now())
+    // 话题是片内作用域：开新片清空全部旧话题（对话不跨片，回顾归蒸馏；片内进程重启则留存）
+    home.topics = {}
     await this.saveHome(home)
     const snapshot = { home, relations: await this.relations() }
     await this.writeJsonAtomic(join(dir, OPEN_SNAP_FILE), snapshot)
@@ -663,6 +905,16 @@ export class CatNest {
       home,
       relations: await this.relations(),
     })
+    // 暂停中的活动是片内瞬态，不跨片：清掉（不落 activity 行、无 notice）
+    for (const ch of Object.values(home.characters || {})) {
+      if (ch && ch.activityPaused) {
+        ch.activity = null
+        ch.activityEndsAt = null
+        ch.activityLeftMs = null
+        ch.activityPaused = null
+        ch.lastAmbientAt = null
+      }
+    }
     // 再冻结活动写入 home.json：剩余时长换算为毫秒，模式外不流逝
     freezeActivities(home, this.now())
     await this.saveHome(home)
@@ -715,14 +967,31 @@ export class CatNest {
       const ch = home.characters[id]
       if (!ch) throw new Error(`角色 "${id}" 不存在`)
       if (activity === null || activity === undefined || activity === '') {
+        // 停下当前活动；若有暂停中的一并视为放弃（同 do_activity('') 语义）
         ch.activity = null
         ch.activityEndsAt = null
         ch.activityLeftMs = null
+        ch.activityPaused = null
+        ch.lastAmbientAt = null
         await this.saveHome(home)
         await this.log('activity', { char: id, activity: null })
         return { char: id, activity: null, activityEndsAt: null }
       }
       if (typeof activity !== 'string') throw new Error('activity 需要是字符串（或 null 清除）')
+      // 回灶续做：同名 do_activity → 解冻暂停的活动（§9.9；不记账本行，presence 可见）
+      if (ch.activityPaused && ch.activity === activity) {
+        if (Number.isFinite(ch.activityLeftMs) && ch.activityLeftMs > 0) {
+          ch.activityEndsAt = new Date(this.now().getTime() + ch.activityLeftMs).toISOString()
+        }
+        ch.activityLeftMs = null
+        ch.activityPaused = null
+        ch.lastAmbientAt = this.now().toISOString()
+        await this.saveHome(home)
+        return { char: id, activity, activityEndsAt: ch.activityEndsAt, resumed: true }
+      }
+      // 新活动（若之前有暂停中的视为放弃）
+      ch.activityPaused = null
+      ch.activityLeftMs = null
       let endsAt = null
       if (durationMin !== undefined && durationMin !== null) {
         const d = Number(durationMin)
@@ -731,6 +1000,19 @@ export class CatNest {
       }
       ch.activity = activity
       ch.activityEndsAt = endsAt
+      // 活动隔墙动静（§9.5，切片 2）：开始时相邻房角色 hear 缓冲加一条（主体先于事件）
+      const around = this.perceiveAround(home, ch.room, false, id)
+      const roomTxt = roomName(home, ch.room) || ch.room
+      const text = roomTxt + '传来' + activity + '的动静'
+      for (const aid of around.adjacent) {
+        if (aid === 'master') continue // 主人不攒缓冲（人是即时感知的）
+        const ach = home.characters && home.characters[aid]
+        if (!ach) continue
+        ach.hear = ach.hear || []
+        ach.hear.push({ t: this.now().toISOString(), from: id, text })
+        await this.log('hear', { char: aid, from: id, text })
+      }
+      ch.lastAmbientAt = this.now().toISOString()
       await this.saveHome(home)
       await this.log('activity', { char: id, activity, endsAt })
       return { char: id, activity, activityEndsAt: endsAt }
@@ -931,20 +1213,22 @@ export class CatNest {
   // action（可选）= 说这句话时伴随的即时小动作（舞台指示，如「蹭了蹭主人」）。
   // 它是视觉信息：同房（含自己）看得见，隔墙闻声的只收台词（听觉）。
   // 与 do_activity（持续状态）/ move_to（位置变化）不同，action 只属于这句话。
-  async say(who, text, action) {
+  // about（可选）= 话题短语（topic 套件 §9.2）：在某个话题里说的话带上它；轻飘飘一句不带。
+  async say(who, text, action, about) {
     return this.mutate(async () => {
       await this.requireOpen()
       if (typeof who !== 'string' || !who) throw new Error('who 需要是角色 id 或 "master"')
       if (typeof text !== 'string' || !text.trim()) throw new Error('text 需要是非空字符串')
       const act = typeof action === 'string' ? action.trim() : ''
+      const ab = typeof about === 'string' ? about.trim() : ''
       const home = await this.home()
-      return this._sayCore(home, who, text, act || undefined)
+      return this._sayCore(home, who, text, act || undefined, ab || undefined)
     })
   }
 
   // 说话核心（必须在 mutate 内调用）：入账 say 行 + 相邻进缓冲 + 落盘。
   // say() 与 resolveHear() 共用；后者不能直接调 this.say()（mutate 内再 mutate 会死锁排队）。
-  async _sayCore(home, who, text, action) {
+  async _sayCore(home, who, text, action, about) {
     const room = this.locateRoom(home, who)
     if (!room) {
       if (who === 'master') throw new Error('主人不在家（先 moveMaster 进房）')
@@ -963,6 +1247,8 @@ export class CatNest {
       text,
       // 动作随台词入账（视觉信息）；旧 log 无此字段，消费侧容缺省
       ...(action ? { action } : {}),
+      // 话题短语（topic 套件）：话题里的发言带 about，口径与渲染一致
+      ...(about ? { about } : {}),
       positions,
       audience: { clear: [...around.direct], faint: [...around.adjacent] },
     })
@@ -1087,8 +1373,151 @@ export class CatNest {
       const from = ch.activity || null
       ch.activity = null
       ch.activityEndsAt = null
+      ch.activityLeftMs = null
+      ch.activityPaused = null
+      ch.lastAmbientAt = null
       await this.saveHome(home)
       return { char: id, from }
+    })
+  }
+
+  // 话题：开启并说开场白（open_topic，§9.2）——一个调用完成「开启+开场」。
+  // 入账一条 topic-open 行 + 一条带 about 的 say 行（走正常 say 通道）。
+  // to：可选定向对象（角色 id 或名字），缺省=对房间（同房者皆可加入）。
+  async openTopic(charId, about, text, to) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const a = typeof about === 'string' ? about.trim() : ''
+      if (!a) throw new Error('about 话题短语不能为空')
+      const t0 = typeof text === 'string' ? text.trim() : ''
+      if (!t0) throw new Error('open_topic 需要开场白 text')
+      const home = await this.home()
+      if (!home.characters || !home.characters[charId]) throw new Error(`角色 "${charId}" 不存在`)
+      let toId = null
+      if (to !== undefined && to !== null && to !== '') {
+        const toRaw = String(to).trim()
+        const found = Object.keys(home.characters || {}).find(
+          (id) => id === toRaw || (home.characters[id] && home.characters[id].name === toRaw),
+        )
+        if (!found) throw new Error('to 指向的角色不存在：' + toRaw)
+        toId = found
+      }
+      const r = topicOpenState(home, this.now(), charId, a, toId)
+      await this.log('topic-open', { char: charId, about: a, ...(toId ? { to: toId } : {}), room: r.topic.room })
+      const said = await this._sayCore(home, charId, t0, undefined, a)
+      return { char: charId, about: a, to: toId, opened: r.opened, said }
+    })
+  }
+
+  // 话题：提议收掉（end_topic）——topic-end 行 +（可选）带 about 的收尾 say。
+  // 只允许话题参与方调用；另一参与方在 closing 中再 end → 双收（accepted）。
+  async endTopic(charId, about, text) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const a = typeof about === 'string' ? about.trim() : ''
+      if (!a) throw new Error('about 话题短语不能为空')
+      const home = await this.home()
+      const r = topicEndState(home, this.now(), charId, a)
+      if (!r.key) throw new Error('没有你参与的「' + a + '」话题')
+      await this.log('topic-end', { char: charId, about: a, ...(typeof text === 'string' && text.trim() ? { text: text.trim() } : {}) })
+      let said = null
+      if (typeof text === 'string' && text.trim()) {
+        said = await this._sayCore(home, charId, text.trim(), undefined, a)
+      } else {
+        await this.saveHome(home) // 无收尾句：topicEndState 的改动也要落盘
+      }
+      return { char: charId, about: a, verdict: r.verdict, said }
+    })
+  }
+
+  // 「放下锅铲」（pause_activity，§9.9 一等公民）：暂停当前活动——计时冻结
+  // （activityEndsAt → activityLeftMs，同 freezeActivities 机制）+ activityPaused 标记。
+  // 暂停=不忙；回灶＝同名 do_activity（setActivity 解冻）。入账 activity-pause 行。
+  async pauseActivity(id) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const ch = home.characters[id]
+      if (!ch) throw new Error(`角色 "${id}" 不存在`)
+      if (!ch.activity) throw new Error('没有正在做的活动可以暂停')
+      if (ch.activityPaused) throw new Error('活动已经在暂停中')
+      const from = ch.activity
+      if (typeof ch.activityEndsAt === 'string') {
+        const left = new Date(ch.activityEndsAt).getTime() - this.now().getTime()
+        ch.activityLeftMs = left > 0 ? left : null
+      }
+      ch.activityEndsAt = null
+      ch.activityPaused = true
+      await this.saveHome(home)
+      await this.log('activity-pause', { char: id, activity: from })
+      return { char: id, activity: from, activityPaused: true }
+    })
+  }
+
+  // 话题：一次 say 后入账（在 nest.say 之后调用）。join/reopen 各落对应账本行，
+  // 裁决接受（ended）无独立行。about 为本句带的话题短语（无则 null）。
+  async resolveTopicSay(charId, about) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const r = topicResolveSay(home, this.now(), charId, about)
+      if (r.verdict === 'join') await this.log('topic-join', { char: charId, about: r.key ? r.key.split('|')[1] : String(about || '') })
+      else if (r.verdict === 'reopen') await this.log('topic-reopen', { char: charId, about: r.key ? r.key.split('|')[1] : String(about || '') })
+      await this.saveHome(home)
+      return r
+    })
+  }
+
+  // 话题：一次非说话动作后入账（closing 裁决接受——无账本行，仅状态）。
+  async resolveTopicAction(charId) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const r = topicResolveAction(home, this.now(), charId)
+      if (r.accepted.length > 0) await this.saveHome(home)
+      return r
+    })
+  }
+
+  // 话题：tick 兜底沉默自动收（10 分钟无人对 X 说话 → endedBy='silence'）
+  async expireTopics() {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const expired = topicExpire(home, this.now(), TOPIC_SILENCE_TIMEOUT_MS)
+      if (expired.length > 0) await this.saveHome(home)
+      return { expired }
+    })
+  }
+
+  // 活动隔墙动静（§9.5，切片 2）：活动持续中每 10min tick 给相邻房角色补一条
+  // （lastAmbientAt 去重，同窗不重复）。阈值/边沿触发复用 T1 现有链路。
+  async ambientTick() {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const nowT = this.now().getTime()
+      const dropped = []
+      for (const ch of Object.values(home.characters || {})) {
+        if (!ch || !ch.activity || ch.activityPaused || !ch.activityEndsAt) continue
+        if (!ch.lastAmbientAt) continue // 旧数据无条目：不补
+        if (nowT - new Date(ch.lastAmbientAt).getTime() <= AMBIENT_REPEAT_MS) continue
+        const around = this.perceiveAround(home, ch.room, false, ch.id)
+        const roomTxt = roomName(home, ch.room) || ch.room
+        const text = roomTxt + '传来' + ch.activity + '的动静'
+        for (const aid of around.adjacent) {
+          if (aid === 'master') continue
+          const ach = home.characters && home.characters[aid]
+          if (!ach) continue
+          ach.hear = ach.hear || []
+          ach.hear.push({ t: new Date(nowT).toISOString(), from: ch.id, text })
+          await this.log('hear', { char: aid, from: ch.id, text })
+        }
+        ch.lastAmbientAt = new Date(nowT).toISOString()
+        dropped.push(ch.id)
+      }
+      if (dropped.length > 0) await this.saveHome(home)
+      return { ambient: dropped }
     })
   }
 

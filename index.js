@@ -47,7 +47,7 @@
 // 宿主服务取法：llm / memory / personas 一律调用点惰性 ctx.get（B 规范不 import
 // 宿主包；服务时序不假设——personas 缺席时名册回退默认，llm 缺席时生成回落规则化）。
 
-import { readFile } from 'node:fs/promises'
+import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, isBusy, humanInterval } from './lib.js'
@@ -60,6 +60,10 @@ const AVATAR_IDS = ['kyu', 'moli', 'master']
 const avatarUrl = (id) => new URL('./assets/avatars/' + id + '.png', import.meta.url)
 // 有 delta 打字机看着，慢不再是无反馈的黑等；150s 给免费模型高峰期留足余地。
 const LLM_TIMEOUT_MS = 150000
+// T6 自主节奏轻推（§9.1）：主人最后交互后留 10 分钟过渡；T6 自身 5 分钟说话冷却
+// （自循环保险丝：轻推→说句没做事→仍空闲→下个 tick 又轻推；非猫间闸）
+const T6_MASTER_GAP_MS = 10 * 60000
+const T6_SAY_COOLDOWN_MS = 5 * 60000
 
 // 收尾蒸馏（2026-08-26 定案 #3/#4）：一次生成、按角色分段的条目式输出。
 // 【回顾】段=主人回来时的总述（写 summary.json/recap）；每角色段=该角色自己的记忆
@@ -341,15 +345,27 @@ export default {
 
     // 动态快照：全员此刻位置（随 move 实时变化，只允许出现在 user 尾部动态窗口）。
     // 挂的状态（mood/conditions active）随位置一并展示：家人都能看见谁现在什么状态。
-    const buildPresenceView = (home) => {
+    // §9.3 前置补丁：时钟行（猫没有钟就谈不上困）+ 忙中可视化（轻的不追、重的停一下）；
+    // §9.2：【当前话题】动态窗口（她参与且未收掉的话题，至多 2 行）。
+    const buildPresenceView = (home, charId) => {
+      const nowDate = new Date()
+      const clock = '现在是 ' + nowDate.getHours() + ' 点 ' + nowDate.getMinutes() + ' 分'
       const at = Object.values(home.characters || {})
         .filter((c) => c && c.room)
         .map((c) => {
           let where = (c.name || c.id) + '在' + (roomName(home, c.room) || c.room)
           const conds = (Array.isArray(c.conditions) ? c.conditions : [])
-            .filter((x) => conditionPhase(x, new Date()) === 'active')
+            .filter((x) => conditionPhase(x, nowDate) === 'active')
             .map((x) => conditionLabel(x.name) + '中')
           if (conds.length > 0) where += '（' + conds.join('、') + '）'
+          else if (c.activityPaused) {
+            // 暂停标注：「没在做」但手里有活（§9.9），presence 可见，T6/接话可叫
+            const left =
+              Number.isFinite(c.activityLeftMs) && c.activityLeftMs > 0
+                ? '·还剩 ' + Math.ceil(c.activityLeftMs / 60000) + ' 分'
+                : ''
+            where += '（' + (c.activity || '活') + '中·暂停' + left + '）'
+          } else if (c.activity) where += '（在做：' + c.activity + '）'
           else if (c.mood) where += '（' + c.mood + '）'
           return where
         })
@@ -358,7 +374,25 @@ export default {
         home.master && home.master.atHome && home.master.room
           ? '主人在' + (roomName(home, home.master.room) || home.master.room)
           : '主人不在家'
-      return '【此刻的位置】' + (at ? at + '，' : '') + masterAt
+      const topics = home.topics || {}
+      const myTopics = Object.values(topics)
+        .filter(
+          (x) => x && x.status !== 'ended' && Array.isArray(x.participants) && x.participants.includes(charId),
+        )
+        .slice(0, 2)
+      const topicsText =
+        myTopics.length > 0
+          ? '\n\n【当前话题】\n' +
+            myTopics
+              .map((x) => {
+                if (x.status === 'closing') {
+                  return x.about + '（' + (charName(home, x.endedBy) || x.endedBy) + '提议收掉）'
+                }
+                return x.about + '（' + (charName(home, x.openedBy) || x.openedBy) + '发起，已聊 ' + (x.turns || 0) + ' 轮）'
+              })
+              .join('\n')
+          : ''
+      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + topicsText
     }
 
     // 片内时间线人话化：say 按 audience 名单查表渲染（同房真切/相邻弱化前缀/远处不入）；
@@ -415,6 +449,22 @@ export default {
           else if (!l.private) out.push(ntext)
           continue
         }
+        if (l.type === 'topic-open' || l.type === 'topic-join' || l.type === 'topic-end' || l.type === 'topic-reopen' || l.type === 'activity-pause') {
+          // 话题与放下锅铲账本行（§9.2/§9.9）：公共家庭事实，全员时间线可见
+          flushMoves()
+          if (l.type === 'topic-open') {
+            out.push(nameOf(l.char) + (l.to ? '向' + nameOf(l.to) : '') + '提起话题：' + l.about)
+          } else if (l.type === 'topic-join') {
+            out.push(nameOf(l.char) + '加入了话题：' + l.about)
+          } else if (l.type === 'topic-end') {
+            out.push(nameOf(l.char) + '提议收掉话题：' + l.about)
+          } else if (l.type === 'topic-reopen') {
+            out.push(nameOf(l.char) + '：这个还要聊')
+          } else {
+            out.push(nameOf(l.char) + '放下了手里的活（' + l.activity + '）')
+          }
+          continue
+        }
         if (l.type === 'move' || l.type === 'master-move') {
           const mover = l.type === 'move' ? l.char : l.who || 'master'
           if (!mover) continue
@@ -429,11 +479,14 @@ export default {
         if (!level) continue
         const speakerRoom = (l.positions && l.positions[who]) || l.room
         const act = typeof l.action === 'string' ? l.action.trim() : ''
+        // 话题短语（§9.2）：带 about 的发言渲染「（聊那盆花）」前缀；隔墙只闻声不见形，
+        // 话题标记与 action 一样是视觉/语境信息，faint 不展示
+        const aboutTxt = typeof l.about === 'string' && l.about && level !== 'faint' ? '（聊' + l.about + '）' : ''
         if (level === 'faint') {
           // 隔墙只闻声不见形：action 是视觉信息，不入听者的时间线
           out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + '的声音：）' + l.rawText)
         } else {
-          out.push(nameOf(who) + (act ? '（' + act + '）' : '') + '：' + l.rawText)
+          out.push(nameOf(who) + (act ? '（' + act + '）' : '') + aboutTxt + '：' + l.rawText)
         }
       }
       flushMoves()
@@ -455,7 +508,9 @@ export default {
         name: 'say',
         description:
           '对家人说一句话。这是唯一的说话方式：想说话就调用它，把要说的话放进 text；' +
-          '说这句话时如果伴随着一个具体的即时小动作，把它放进 action（可选）。',
+          '直接输出的文字家人听不见、也不会入账，只有这里的 text 才算说出口。' +
+          '说这句话时如果伴随着一个具体的即时小动作，把它放进 action（可选）。' +
+          '如果在某个话题里说话（接了别人的话题或自己开的话题），把 about 带上话题短语。',
         parameters: {
           type: 'object',
           properties: {
@@ -465,6 +520,12 @@ export default {
               description:
                 '说这句话时伴随的一个即时小动作（可选，几个字，如「蹭了蹭主人」「把书合上」）。' +
                 '只有真的在做这个动作时才传，别为了带而带；持续在做的事用 do_activity，不走这里。',
+            },
+            about: {
+              type: 'string',
+              description:
+                '可选：话题短语（几个字，如「那盆花」）。在某个话题里的发言带上它，' +
+                '对方才好确认你接的是哪条线；接别人的话题会算加入那个话题。轻飘飘的一句不用带。',
             },
           },
           required: ['text'],
@@ -481,7 +542,9 @@ export default {
       },
       {
         name: 'do_activity',
-        description: '开始做一件事，或停下来（activity 传空字符串表示停下当前活动）。',
+        description:
+          '开始做一件事，或停下来（activity 传空字符串表示停下当前活动）。' +
+          '如果之前用 pause_activity 暂停过同名活动，再传同名就是「回灶续做」（接着原来的计时）。',
         parameters: {
           type: 'object',
           properties: {
@@ -490,6 +553,43 @@ export default {
           },
           required: ['activity'],
         },
+      },
+      {
+        name: 'open_topic',
+        description:
+          '提起一个话题并说开场白（一次完成「开启+开场」，像打个招呼把话头递出去）。' +
+          '想正经开聊时用它；对方用带同一话题短语的 say 接话就是加入，' +
+          '聊透了用 end_topic 收掉。轻飘飘的一句话不用开话题。',
+        parameters: {
+          type: 'object',
+          properties: {
+            about: { type: 'string', description: '话题短语（几个字，如：那盆花 / 今晚吃什么）' },
+            to: { type: 'string', description: '可选：定向邀请的对象（名字或角色 id）。缺省=对房间，同房者皆可加入。' },
+            text: { type: 'string', description: '开场白（要说的话，会作为 say 入账并带话题标记）' },
+          },
+          required: ['about', 'text'],
+        },
+      },
+      {
+        name: 'end_topic',
+        description:
+          '提议收掉一个话题（「这个先聊到这」）。' +
+          '对方接同一话题的话=否决（还想聊，话题接着开）；对方不接/去忙别的=接受（聊完了）。',
+        parameters: {
+          type: 'object',
+          properties: {
+            about: { type: 'string', description: '要收掉的话题短语（和你提起/加入时一致）' },
+            text: { type: 'string', description: '可选：收尾句（会作为 say 入账并带话题标记）' },
+          },
+          required: ['about'],
+        },
+      },
+      {
+        name: 'pause_activity',
+        description:
+          '暂时放下手里正在做的事（可以接回来）。暂停时计时照走，你不算在忙：' +
+          '可以接话、挪地方、被叫。想接着做就再用 do_activity 传同名活动。',
+        parameters: { type: 'object', properties: {} },
       },
       {
         name: 'remember',
@@ -676,9 +776,41 @@ export default {
           const text = typeof args.text === 'string' ? args.text : ''
           if (!text.trim()) return fail('say 需要非空 text')
           const action = typeof args.action === 'string' ? args.action.trim() : ''
-          await nest.say(charId, text, action || undefined)
+          const about = typeof args.about === 'string' ? args.about.trim() : ''
+          await nest.say(charId, text, action || undefined, about || undefined)
+          // 话题账（§9.2）：带 about=解析话题（加入/续谈/否决）；不带 about 也是裁决动作
+          await nest.resolveTopicSay(charId, about || null)
           scheduleSnapshot()
-          return { ok: true, result: '已说出口。', effect: { tool: 'say', text, ...(action ? { action } : {}) } }
+          return { ok: true, result: '已说出口。', effect: { tool: 'say', text, ...(action ? { action } : {}), ...(about ? { about } : {}) } }
+        }
+        if (name === 'open_topic') {
+          const about = typeof args.about === 'string' ? args.about.trim() : ''
+          const text = typeof args.text === 'string' ? args.text.trim() : ''
+          if (!about) return fail('open_topic 需要 about 话题短语')
+          if (!text) return fail('open_topic 需要 text 开场白')
+          const r = await nest.openTopic(charId, about, text, args.to)
+          await nest.resolveTopicAction(charId)
+          scheduleSnapshot()
+          return { ok: true, result: '已提起话题「' + about + '」并说了开场白。', effect: { tool: 'open_topic', about, to: r.to || null } }
+        }
+        if (name === 'end_topic') {
+          const about = typeof args.about === 'string' ? args.about.trim() : ''
+          const text = typeof args.text === 'string' ? args.text.trim() : ''
+          if (!about) return fail('end_topic 需要 about 话题短语')
+          const r = await nest.endTopic(charId, about, text || undefined)
+          await nest.resolveTopicAction(charId)
+          scheduleSnapshot()
+          return {
+            ok: true,
+            result: r.verdict === 'accepted' ? '话题「' + about + '」聊完了。' : '已提议收掉话题「' + about + '」。',
+            effect: { tool: 'end_topic', about, verdict: r.verdict },
+          }
+        }
+        if (name === 'pause_activity') {
+          const r = await nest.pauseActivity(charId)
+          await nest.resolveTopicAction(charId)
+          scheduleSnapshot()
+          return { ok: true, result: '已放下手里的活（' + r.activity + '）。', effect: { tool: 'pause_activity', activity: r.activity } }
         }
         if (name === 'move_to') {
           const room = typeof args.room === 'string' ? args.room.trim() : ''
@@ -687,6 +819,7 @@ export default {
           const target = (home.rooms || []).find((r) => r.name === room || r.id === room)
           if (!target) return fail('没有叫「' + room + '」的房间')
           await nest.moveCharacter(charId, target.id)
+          await nest.resolveTopicAction(charId)
           scheduleSnapshot()
           return { ok: true, result: '已移动到' + (target.name || target.id) + '。', effect: { tool: 'move_to', room: target.id } }
         }
@@ -694,6 +827,7 @@ export default {
           const activity = typeof args.activity === 'string' ? args.activity : ''
           const minutes = args.minutes
           await nest.setActivity(charId, activity === '' ? null : activity, minutes)
+          await nest.resolveTopicAction(charId)
           scheduleSnapshot()
           return {
             ok: true,
@@ -710,6 +844,7 @@ export default {
             const sliceId = st && st.sliceId ? String(st.sliceId) : ''
             await memory.learn(charId, text, ['猫窝', '时间片', sliceId].filter(Boolean))
           }
+          await nest.resolveTopicAction(charId)
           return { ok: true, result: '已记下。', effect: { tool: 'remember', text } }
         }
         if (name === 'set_condition') {
@@ -722,6 +857,7 @@ export default {
             startsInDays,
             lastsDays,
           })
+          await nest.resolveTopicAction(charId)
           scheduleSnapshot()
           if (r.action === 'clear') {
             return { ok: true, result: '已清除状态：' + cname + '。', effect: { tool: 'set_condition', action: 'clear', name: cname } }
@@ -761,6 +897,7 @@ export default {
           const pair = RELATION_PAIRS.includes(cand1) ? cand1 : cand2
           if (!RELATION_PAIRS.includes(pair)) return fail('adjust_relation：你和对方之间没有关系对')
           const r = await nest.adjustRelation(pair, field, d)
+          await nest.resolveTopicAction(charId)
           scheduleSnapshot()
           const otherName = otherId === 'master' ? '主人' : charName(await nest.home(), otherId) || otherId
           return {
@@ -775,12 +912,37 @@ export default {
       }
     }
 
+    // ── agent 步诊断日志（观测补盲）──
+    // 家庭账本只记工具效果；「本步没调工具」（只有文本/纯沉默/无结果）此前无任何痕迹，
+    // 无法区分「模型在直接说话」与「模型选择安静」。落片目录 agent-debug.log，每步一行。
+    const agentDebug = async (charId, sliceId, line) => {
+      if (!sliceId) return
+      try {
+        await appendFile(
+          join(dir, 'slices', sliceId, 'agent-debug.log'),
+          new Date().toISOString() + ' [' + charId + '] ' + line + '\n',
+          { mode: 0o600 },
+        )
+      } catch {
+        /* 诊断不拖累回合 */
+      }
+    }
+
     // 角色 agent 回合：多步工具循环。返回 { said, error, actions }：
     // said=是否通过 say 工具说了话（已入账）；error=非空表示 llm 缺席/异常。
     const agentTurn = async (charId) => {
       const home = await nest.home()
       const ch = home.characters && home.characters[charId]
       const name = (ch && ch.name) || charId
+      let dbgSlice = ''
+      try {
+        const s0 = await nest.status()
+        if (s0 && s0.sliceId) dbgSlice = String(s0.sliceId)
+      } catch {
+        /* 无打开的片：诊断不落盘 */
+      }
+      const turnStart = Date.now()
+      void agentDebug(charId, dbgSlice, '回合开始')
       // 调度层：回合开始弹出「听到」缓冲（一次唤醒=一次决策）：本回合上下文用弹出的
       // 副本（【最近听到的】段），回合中新增动静攒新鲜缓冲。消费失败回落快照只读。
       let heardBuf = []
@@ -833,7 +995,15 @@ export default {
         '想走动就调用 move_to；想做事就调用 do_activity；' +
         '想记住什么就调用 remember；心情/状态变化时用 set_condition 设置身体状态（发情/生病/受伤…，可带倒计时）；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
-        '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。'
+        '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
+        '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。\n\n' +
+        '【家里的分寸（路 B §9.6）】\n' +
+        '· 家人正忙着各自的事时，可以轻飘飘地说一句（分享见闻、打招呼），别追着聊；重要的事才停一下手里的。\n' +
+        '· 轻飘飘的话对方不接也正常，不接也是回应，不用追着问。\n' +
+        '· 想正经开聊就用 open_topic 带个话题（传开场白）；对方接了同一话题就是加入；聊透了用 end_topic 收掉，' +
+        '或带个新的；对方不接就别追着聊。轻飘飘的一句不用开话题。\n' +
+        '· 想暂时放下手里的活，用 pause_activity（计时继续走，之后同名 do_activity 可以接回来）；做完了用 do_activity 传空字符串。\n' +
+        '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题，或继续安静待着。'
 
       // 关系段（易变）：构建逻辑不变，出口搬到 user 尾部动态窗口
       const relLines = []
@@ -872,7 +1042,7 @@ export default {
         '【这个时间片里发生的事】\n' +
         (timeline.length > 0 ? timeline.join('\n') : '（还很安静，没什么动静。）') +
         memText +
-        '\n\n' + buildPresenceView(home) +
+        '\n\n' + buildPresenceView(home, charId) +
         selfCondText +
         heardText +
         relText +
@@ -904,13 +1074,25 @@ export default {
         const result = await llmStep(system, messages, STEP_MAX_TOKENS, onSayDelta)
         live = false
         if (started) broadcast({ kind: 'deltaEnd', char: charId, name })
-        if (!result) break // 超时/失败：本轮到此为止，保留已产生的动作
+        if (!result) {
+          void agentDebug(charId, dbgSlice, '本步无结果（软超时或异常，详情见控制台）')
+          break // 超时/失败：本轮到此为止，保留已产生的动作
+        }
         const { toolCalls, text } = result
         const content = []
         if (text && text.trim()) content.push({ type: 'text', text })
         for (const c of toolCalls) content.push({ type: 'tool-call', id: c.id, name: c.name, arguments: c.arguments })
         messages.push({ role: 'assistant', content })
-        if (toolCalls.length === 0) break // 模型收手（只出文本也算沉默）
+        if (toolCalls.length === 0) {
+          // 诊断：本步未调工具。有文本=模型「直接说话」了（听不见、不入账）；无文本=纯沉默。
+          const t0 = text.trim()
+          void agentDebug(
+            charId,
+            dbgSlice,
+            t0 ? '本步未调工具，只有文本（家人听不见）：' + t0.slice(0, 150) : '本步未调工具，纯沉默',
+          )
+          break // 模型收手（只出文本也算沉默）
+        }
         for (const c of toolCalls) {
           let args = {}
           try { args = c.arguments ? JSON.parse(c.arguments) : {} } catch { args = { raw: c.arguments } }
@@ -925,6 +1107,10 @@ export default {
           })
         }
       }
+      void agentDebug(
+        charId, dbgSlice,
+        '回合结束 said=' + said + ' 耗时=' + ((Date.now() - turnStart) / 1000).toFixed(1) + 's',
+      )
       return { said, error: null, actions }
     }
 
@@ -1138,6 +1324,49 @@ export default {
       return task
     }
 
+    // T6 自主节奏轻推（§9.1，tick 第 3 步）：主人离家 + 最后交互超 10 分钟过渡 + 角色
+    // 空闲（无自主 activity；暂停=不忙可推）+ 未睡 + 自己 5 分钟说话冷却 + 非 in-flight
+    // → 私有 notice「家里很安静，你闲下来了」+ 非 force 唤醒（队列忙则跳过，下次 tick 重评）。
+    // notice 只在排上回合时入账（免刷屏，无需额外标记）；频率自节流（醒来通常挂活动→忙→闸住）。
+    const maybeT6 = async (home) => {
+      if (!home.master || home.master.atHome) return
+      let lines = []
+      try {
+        const t = await nest.transcript()
+        lines = (t && Array.isArray(t.lines) ? t.lines : []) || []
+      } catch {
+        lines = []
+      }
+      let lastMasterMs = 0
+      const lastSayMs = {}
+      for (const l of lines) {
+        if (!l || typeof l.t !== 'string') continue
+        const tt = new Date(l.t).getTime()
+        if (Number.isNaN(tt)) continue
+        if (l.type === 'master-move' || (l.type === 'say' && l.who === 'master')) {
+          if (tt > lastMasterMs) lastMasterMs = tt
+        } else if (l.type === 'say' && l.who && l.who !== 'master') {
+          if (!lastSayMs[l.who] || tt > lastSayMs[l.who]) lastSayMs[l.who] = tt
+        }
+      }
+      // 从未交互（家未开张）视为早过过渡期：主人长期不在，猫该有自己的生活
+      if (Date.now() - lastMasterMs <= T6_MASTER_GAP_MS) return
+      for (const id of Object.keys(home.characters || {})) {
+        const ch = home.characters[id]
+        if (!ch) continue
+        if (turningChars.has(id)) continue
+        if (isBusy(ch, new Date())) continue // 有活动在忙（暂停=不忙，可以被轻推）
+        const sleeping = (Array.isArray(ch.conditions) ? ch.conditions : []).some(
+          (c) => c.name === '睡觉' && conditionPhase(c, new Date()) === 'active',
+        )
+        if (sleeping) continue // 睡着的猫不被「安静」叫醒
+        if (lastSayMs[id] && Date.now() - lastSayMs[id] <= T6_SAY_COOLDOWN_MS) continue
+        if (turnPending > 0) continue // 队列忙则跳过（非 force），下次 tick 重评
+        await nest.notice(id, 'self', '家里很安静，你闲下来了', true)
+        void enqueueTurn(id, { silentNoLlm: true })
+      }
+    }
+
     // 时驱动层心跳：60s 只推状态（免费、片内才跑、不直接调 LLM）；重启不补跑；
     // unref 不挡进程退出；ctx.effect 卸载。
     const SCHED_TICK_MS = 60000
@@ -1169,6 +1398,10 @@ export default {
           await nest.notice(ch.id, ch.id, (ch.name || ch.id) + '做完了' + actName, false)
           await tryWake(ch.id, true)
         }
+        // 3) 话题沉默自动收（状态机）+ 活动隔墙动静持续补条 + T6 自主节奏轻推
+        await nest.expireTopics()
+        await nest.ambientTick()
+        await maybeT6(await nest.home())
       } catch (error) {
         console.log('[dsh-catnest] 调度 tick 异常: ' + (error && error.message ? error.message : String(error)))
       }
@@ -1311,7 +1544,14 @@ export default {
       adjustRelation: (pair, field, delta) => nest.adjustRelation(pair, field, delta),
       recap: () => nest.recap(),
       recapLLM: (sliceId) => recapLLM(sliceId),
-      say: (who, text) => nest.say(who, text),
+      say: (who, text, action, about) => nest.say(who, text, action, about),
+      openTopic: (charId, about, text, to) => nest.openTopic(charId, about, text, to),
+      endTopic: (charId, about, text) => nest.endTopic(charId, about, text),
+      resolveTopicSay: (charId, about) => nest.resolveTopicSay(charId, about),
+      resolveTopicAction: (charId) => nest.resolveTopicAction(charId),
+      pauseActivity: (id) => nest.pauseActivity(id),
+      expireTopics: () => nest.expireTopics(),
+      ambientTick: () => nest.ambientTick(),
       notice: (char, source, text, isPrivate) => nest.notice(char, source, text, isPrivate),
       hear: (charId) => nest.hear(charId),
       resolveHear: (charId, decision, text) => nest.resolveHear(charId, decision, text),
@@ -1572,4 +1812,13 @@ export {
   INITIAL_RELATIONS,
   HEAR_THRESHOLDS,
   TURN_ORDER,
+  topicKey,
+  matchTopic,
+  topicOpenState,
+  topicResolveSay,
+  topicResolveAction,
+  topicEndState,
+  topicExpire,
+  TOPIC_SILENCE_TIMEOUT_MS,
+  AMBIENT_REPEAT_MS,
 } from './lib.js'

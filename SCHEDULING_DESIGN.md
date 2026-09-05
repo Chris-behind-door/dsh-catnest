@@ -1,6 +1,6 @@
 # 猫窝调度层设计方案（方向一）
 
-> 2026-08-31 夜 小玖起草。**状态：v1 已交付（2026-08-31，78/78 测试全绿；宿主重启后生效）**。
+> 2026-08-31 夜 小玖起草。**状态：v1 已交付（2026-08-31，78/78 测试全绿；宿主重启后生效）；路 B「猫自主行动」方案三轮定稿（2026-09-05 夜，见 §9，自包含设计文档）；路 B 切片 1+2 已交付（2026-09-06，92/92 测试全绿，见 §9.11）**。
 >
 > **交付记录（2026-08-31，切片 1–4 一次交付，切片 5 观察期待跑）**：
 > 实现落点：index.js 调度层区块（masterSay 前）+ lib.js 原语（notice/consumeHear/
@@ -276,3 +276,170 @@ T5 管「别让家死寂」。共处时机 = 宽窗 × 各自 LLM 裁决 × 意�
 > 她动了（煮饭/移动/做事），别的猫（和主人）才有得可听。主体先于事件。
 > 性质：比作息大的系统工程，需拆片慢慢搭；她会真的自己动，可能有小状况需观察调。
 > 待小玖出正式方案（含与 T1 hear/agentTurn 的咬合、防刷、成本）再单独排期，不进今天。
+> → **2026-09-05 夜收口：正式方案见 §9，主人已拍板，进入实现。**
+
+---
+
+## 9. 路 B「猫自主行动」正式方案（2026-09-05 夜拍板落盘）
+
+> **拍板记录（2026-09-05 夜，主人）**：
+> - **A 触发闸 = 只在主人离家时**（`master.atHome === false`）。理由＝本地模型并发：本地单 llama-server（-np 2）与主人自己的 agent 活共享槽位，主人在家时猫自主回合抢并发；主人离家机器空闲才放猫跑。
+>   依赖：闸门读 atHome，需主人在前端标记出门（moveMaster 现有能力）；忘标＝家继续安静（主人接受的代价）。
+> - **B 主动台词完全不限**（句数不卡，成本交给观察期看；防抖只用时间闸，见 §9.2）。
+> - **C 活动词汇地板 = 房间功能种子 + 猫自造**：home.json 房间 functions 做地板（做饭/读书/看电视/发呆…），猫回合里可自造新活动记进片当先例，池子随住随长；主人可随时往家配置里加。
+> - **D 纯自主睡眠**：系统不强制挂睡觉、不发睡前提醒；猫困了自己 set_condition（睡觉，可带倒计时）。
+> - **E 自主台词入账进片**：say 本来就进一本账，零新机制（确认项）。
+> - **第二轮修订（2026-09-05 夜，主人）**：① 撤 T1 全局冷却闸（lastSayAt 5min 闸）——量不重要、主人离家时显卡空闲，时间闸治不了复读；② 撤自我最近行（动态窗口列她最近动作/台词）——时间线已含全量，属重复信息，留作观察期备胎。T6 自身 5min 冷却保留（§9.1 第 5 条，T6 自循环保险丝，非猫间闸）。
+> - **第三轮定稿（2026-09-05 夜，主人）**：① topic 由 say.about 隐式字段**升为完整工具套件**（open_topic/end_topic + closing 状态机 + topic-open/topic-end/topic-join/topic-reopen 账本行 + home.topics 状态 + 【当前话题】动态窗口）——主人原话「加一整套相关 topic 的工具，像 TCP 握手那样（虽然可能不用那么多次）确认开启和结束一个话题，为了控制质量不跑偏」；接话即加入（对方解析到同一话题的 say，无独立工具）；收话题裁决归有意图的那方（D2，见 §9.2）；② **「放下锅铲」升一等公民**：新工具 pause_activity（计时冻结复用 freezeActivities 机制、新字段 activityPaused；同名 do_activity＝回灶续做；暂停＝不忙；close 清暂停活动，见 §9.9）；③ 主人开新 session 实现，§9 自包含（代码锚点见 §9.10）。
+>
+> **直接继承 09-04 共识（不重议）**：事件驱动非接龙；事件从各自在干的活里长出（主体先于事件）；主人插话最高优先级（串行队列已保证）；被插话时话停事不停；轻分享不追、重的停一下；不接也是回应、沉默即结尾；聊完冷却几分钟（§9.2 机制化）。
+
+### 9.1 T6 自主节奏轻推（新触发源，tick 第 3 步）
+
+- **检测**（60s tick，全满足才推）：
+  1. 主人离家：`master.atHome === false`；
+  2. 主人最后交互（master say / master-move 的 max）超过 **10 分钟**——出门后留 10 分钟过渡（不立刻开闹），离家时长无限增长故必越过；
+  3. 该角色**空闲**：无自主 activity；
+  4. 该角色**未睡**：无 active 的睡觉 condition；
+  5. 该角色**冷却过了**：自己上次 say 超过 5 分钟（或从未说过）；
+  6. 非 in-flight（turningChars 现有语义）。
+- **动作**：私有 notice「家里很安静，你闲下来了」（source=self）→ `tryWake`（**非 force**：队列忙则跳过，下次 tick 重评，事件不丢；notice 只在成功排回合时入账，免刷屏，无需额外标记）。
+- **醒来后**：现有完整工具面（do_activity/move_to/say/set_condition/remember/adjust_relation/沉默），自由裁决。提示词静态段加一句「被『闲下来了』叫醒时：可以找个事做、挪个地方、说句轻的，或继续安静待着」。
+- **频率自节流**（非硬帽）：醒来通常挂 30-60min activity → 忙 → 空闲闸挡住下次轻推；每片每角色预期个位数次。「完全不限」＝不设每片上限，观察期兜底。
+
+### 9.2 质量层：topic 完整工具套件（2026-09-05 夜第三轮定稿）
+
+> 演进：第一轮 T1 冷却闸/自我最近行 → 撤（量不重要、上下文够、时间闸治不了复读）；第二轮 say.about 隐式字段 → 第三轮升为完整工具套件（主人：「加一整套相关 topic 的工具，像 TCP 握手那样（虽然可能不用那么多次）」）。
+> 保留：T6 自身 5min 冷却（§9.1 第 5 条）——那是 T6 自循环（轻推→说句没做事→仍空闲→下个 tick 又轻推）的保险丝，与猫间节奏无关。
+
+**工具套件（2 个新工具 + say 扩展）：**
+1. `open_topic(about, to?, text)`——提起话题并说开场白，一个调用完成「开启+开场」：
+   - `about`：话题短语（几个字，如「那盆花」）；`to`（可选）：目标角色 id（定向），缺省＝对房间（同房者皆可加入）；`text`：开场白（必填）。
+   - 入账：一条 topic-open 行 `{t, type:'topic-open', char, about, to?, room}` + 一条 say 行（走正常 say 通道，带 about）。
+   - 状态：`home.topics[char + '|' + about] = {about, room, openedBy, to?, participants:[char], openedAt, lastTurnAt, turns:1, status:'open'}`（同人同短语重复提起＝幂等更新）。
+2. `end_topic(about, text?)`——「这个先聊到这」：
+   - `text`：可选收尾句（有则走正常 say，带 about）；
+   - 入账：一条 topic-end 行 `{t, type:'topic-end', char, about, text?}`；状态：`status='closing'`（提议中，未生效）。
+3. `say` 加**可选 `about` 字段**（say(who, text, action, about)）——话题内的话带话题短语；不带 about 的话不属于任何话题（轻飘飘一句不用开话题）。
+
+**加入（SYN-ACK，无独立工具）**：非参与角色第一条「解析到该话题」的 say（匹配规则见下）→ `participants += 她`，入账 topic-join 行 `{t, type:'topic-join', char, about}`；她不接＝没开成（「不接也是回应」，零惩罚）。
+
+**收话题裁决（D2：裁决权归有意图的那方）**：A 调 end_topic 后 X 进 closing，**B（另一参与方）的下一个动作即裁决**（B 的 prompt 里【当前话题】行始终有「小玖提议收掉」，她知道被问了什么）：
+- B 说了**解析到 X** 的内容 → 否决，X 回 `open`，入账 topic-reopen 行 `{t, type:'topic-reopen', char, about}`；
+- B 说了不带 about 的话 / 解析到别的话题的 say / 自己也调 end_topic（双收）/ 做了 do_activity、move_to、set_condition 等非说话动作 → 接受，X 置 `ended`、`endedBy=B`、`endedAt`；
+- B 没动作（睡着/忙到没醒）→ 兜底：**沉默自动收**——自 topic-end 行（或 open 话题的最后一条 mention）起 10 分钟内无人对 X 说话 → tick 置 `ended`、`endedBy='silence'`。
+- B 的唤醒走现有链路：A 的收尾句（end_topic 的 text）进 hear 缓冲 → T1 照常叫醒。
+
+**匹配规则（「解析到 X」）**：B 的 say 的 about 与 X.about **完全相等**，或（X 是 X.room 里**唯一**话题 且 B 是参与方 且 B 的 say 带 about）。拿不准时按「不解析」处理（保守方向，模型可用精确短语消歧）。
+
+**话题状态与生命周期：**
+- home.json 顶层 `topics: {}`（v2→v3 迁移：ensure 补空对象，不碰用户房间表）；**话题是片内作用域：open() 时清空全部旧话题**（对话不跨片，回顾归蒸馏；进程在片内重启则 topics 随 home.json 留存，不丢）。
+- **轮数** `turns`＝解析到 X 的 say 行数（入账时递增，供【当前话题】「已聊 N 轮」）。
+- **prompt 动态窗口【当前话题】行**（buildPresenceView 内或紧邻）：她参与的话题渲染「那盆花（墨璃发起，已聊 5 轮）」/「那盆花（小玖提议收掉）」；至多 1-2 行。
+- **账本行渲染**（timelineText 新增类型）：topic-open「小玖向墨璃提起话题：那盆花」；topic-join「墨璃加入了话题：那盆花」；topic-end「小玖提议收掉话题：那盆花」；topic-reopen「墨璃：这个还要聊」；带 about 的 say 行渲染「小玖（聊那盆花）：……」。
+- **蒸馏**（sliceEventsText）：渲染 topic 行（家史有「两人聊了一会儿花」）。
+- `dialogueView` 不渲染 topic 行（对话流保持纯净，同 v1 notice 语义）。
+
+**TCP 对应**（主人原话的映射）：SYN=open_topic（带开场白）；SYN-ACK=对方解析到 X 的 say；数据传输=话题内每句 say；FIN=end_topic；ACK=沉默/其他动作（接受）或再开口（否决＝重开）。一个话题生命周期只有 3 个显式工具调用（开、接是普通 say、关），少于 TCP 四次。
+
+**为何能控质量（对主人目标逐条核过）：** ① 框架常驻（【当前话题】行，每回合可见）；② 显式出口（end_topic 是专门的裁决回合，不是慢慢淡出）；③ 轮数可见（已聊 N 轮，「聊透了」有数字依据）；④ 指标精确（话题数/时长/每话题轮数/同片重开同一话题＝复读率，账本行精确计数）。
+**残余风险（诚实声明）**：话题内打转（话题正经但原地循环）结构治不干净，靠【已聊 N 轮】+ prompt 基调 + 观察期「每话题轮数」指标；超标上备胎旋钮。
+**与旧定案相容性（核过不冲突）**：#12 不设菜单——topic 工具不是「接/搭腔/无视」菜单，是任何回合可用的可选动作，无视仍是沉默；轻飘飘一句不用开话题；主人侧不设话题状态（主人不说话了话题自然死，猫回话可带 about 标记接的是哪条线，无需 end_topic）。
+**与 T6 咬合**：空闲轻推后猫有三个有内容感的出口：带个话题跟谁说两句 / 找个事做（do_activity）/ 回灶续做（pause 的活动）——「闲下来了」不再是只会「喵」。
+
+### 9.3 前置补丁（零 LLM，prompt 事实补齐）
+
+- **时钟行**：buildPresenceView 动态窗口加「现在是 X 点 Y 分」——猫没有钟就谈不上困（D 依赖），一切时段判断的依据。
+- **忙中可视化**：presence 行加活动标注（`墨璃在厨房（在做：做饭）`）——共识 4「轻的不追、重的停一下」需要看得见对方在忙；conditionLabel 未知名原样透传，「睡觉」无需改标签表。
+
+### 9.4 睡眠（D：纯自主，几乎零新代码）
+
+- 夜里主人在家 → T6 闸关闭 → 无自主唤醒 → 家天然安静（零成本）。
+- 猫自睡：回合里 `set_condition 睡觉`（可带倒计时）；睡觉 active → 排除出空闲闸（不被推醒）；到期 → tickConditions 翻转走**现有 T2 路径**「你睡醒了」notice + 唤醒 → 她自己决定起不起床。
+- 白天小睡是自然行为（主人离家时段的回合里可能挂），不特判。
+
+### 9.5 活动 → 隔墙动静（纯状态机，零 LLM）
+
+- do_activity 开始时：相邻房角色 hear 缓冲加一条动静（人话模板按活动词，如「厨房传来做饭的动静」）；
+- 活动持续中：每 10min tick 补一条（`lastAmbientAt` 去重，同窗不重复）；
+- 阈值/边沿触发全部复用 T1 现有链路。
+- 语义＝主体先于事件的落地：不是天降纸条，是她**真在煮**才有的锅铲声。
+
+### 9.6 提示词基调（零新机制）
+
+system 静态段补（状态事实走 presence，指令走静态，prefix cache 友好）：
+- 「家人正忙着各自的事时，可以轻飘飘地说一句（分享见闻、打招呼），别追着聊；重要的事才停一下手里的。」
+- 「轻飘飘的话对方不接也正常，不接也是回应。」
+- 「想正经聊天就用 open_topic 带个话题（传开场白）；对方接了同一话题就是加入；聊透了用 end_topic 收掉，或带个新的；对方不接就别追着聊。轻飘飘的一句不用开话题。」
+- 「想暂时放下手里的活，用 pause_activity（计时继续走，之后同名 do_activity 可以接回来）；做完了用 do_activity 传空字符串。」
+- 「被『闲下来了』叫醒时：可以找个事做、挪个地方、带个话题，或继续安静待着。」
+
+### 9.7 成本与观察期指标
+
+- 成本账：白天离家 ≈8h，每猫自节流个位数唤醒 + 若干 T1 + 若干话题回合；全片 LLM 回合预期几十以内，观察期兜底。
+- 观察期指标（扩 v1 切片 5）：T6 唤醒次数 / 猫自主 say 数与发起者 / 猫间对话次数 / ambient 动静数 / token 消耗 / 静默长度分布 / 离家时段总成本 / **每话题指标（话题数、每话题轮数、持续时长、同片是否重开同一话题＝复读率，topic-open/topic-reopen 账本行精确计数）/ 放下锅铲次数（pause_activity 调用数）**。
+- 备胎旋钮（观察期超标才上）：服务端温度上调（主人 dial）、硬闸「同一片不重复同一活动」（免费状态机）、自我最近行（动态窗口一行）、T1 冷却闸（5min 时间闸）。
+
+### 9.8 实现切片（每片独立可验收）
+
+1. **T6 自主节奏 + 离家闸 + topic 套件 + 放下锅铲**：lib（isBusy 暂停修复、空闲判定/睡觉排除、话题状态纯函数：open/join/end/resolve/reopen/expire + 匹配规则、活动暂停冻结/解冻、home v3 迁移：topics {} + char.activityPaused）+ index（AGENT_TOOLS + open_topic/end_topic/pause_activity + say.about + tick 第 3 步 [T6 + 话题沉默自动收] + timelineText 新行类型（topic-open/end/join/reopen、activity-pause、say.about 渲染）+ sliceEventsText + buildPresenceView [时钟行/忙中可视化/【当前话题】/暂停标注] + system 静态基调 + close 清暂停活动）+ 测试（topic 全生命周期 / T6 门控 / 暂停）。（T1 冷却闸与自我最近行已撤，见 §9.2 修订记录）
+2. **活动 → 隔墙动静**：ambient 状态机（开始一条/持续每 10min）+ 复用 T1 + 测试。
+3. **观察期**：关旧 33h 零行片、开新片跑一天，log 统计，回填 §9.7 指标（冷却时长/10min 线/ambient 频率均观察期可调）。
+
+> 注：重启宿主必须走 ~/.dsh/scripts/dsh-web-restart.sh（--check 先看状态）；旧片 `20260904T100819`（09-04 10:08 开、33h 零行）在切片 3 观察期前关掉换新片。
+
+### 9.9 activity × topic 联动（含「放下锅铲」一等公民）
+
+**原则**：状态机只走时、只叫人（activity 倒计时、话题沉默计时器、T1/T3/T6 唤醒）；所有「切换」是模型回合里的决定。prompt 动态窗口提供三件事实：自己在做什么（含剩余/暂停）、对方在做什么（忙中可视化）、自己在哪个话题里（【当前话题】）。
+
+**放下锅铲（pause_activity，一等公民）：**
+- 新工具（无参）：「暂时放下手里在做的事（可以接回来）。」
+- 执行：角色须有 active（未暂停）activity → activityEndsAt 转 activityLeftMs（同 freezeActivities 机制）+ `activityPaused=true`；入账 activity-pause 行 `{t, type:'activity-pause', char, activity}` → timeline「小玖放下了手里的活（做饭）」。
+- 回灶＝`do_activity` 传同名活动：有同名暂停活动 → 解冻（activityLeftMs 换回 activityEndsAt）+ activityPaused=false（不记账本，presence 可见）；无暂停或名字不同 → 放弃暂停、正常开新活动。
+- stop＝do_activity('') 语义不变；若有暂停中的一并视为放弃（清除）。
+- **isBusy 修复**：`ch.activityPaused` → 返回 false（暂停＝不忙）——同房接话序（responders 排除忙的）与 T6 空闲闸都自动得到「暂停的猫可以被叫、可以接话、可以被轻推」。
+- T3：暂停的 activity 无 activityEndsAt，tick 自然跳过（不会误发「做完了事」）。
+- **close**：清掉暂停中的 activity（clearActivity 式，不 notice；暂停是片内瞬态，不跨片）。
+- prompt presence 行：「小玖在厨房（做饭中·暂停·还剩 20 分）」。
+- T6 咬合：空闲轻推后若她有暂停活动，prompt 显示暂停中，她选回灶（同名 do_activity）或放弃（新活动/''）。
+
+**四个联动情形**（全是模型决定，零新状态机）：
+1. **做事时被人搭话**：轻的→边做边回一句（activity 不动）；重的→pause_activity 放下再接（或边做边说）；不想理→沉默。
+2. **聊到一半去做事**：她从话题 X 里抽身——不需要状态变更，她的缺席是自然的；X 要么剩余参与者继续（一人独聊也合法，猫自言自语很猫）要么沉默计时器收掉。
+3. **做完事的瞬间（T3）**：天然切换点——她被「做完了事」叫醒，这一回合里决定：接回 X / 开新话题 / 开新活动 / 去睡。
+4. **事生出话题（切片 2 完整环）**：A 真在厨房做饭 → 锅铲声过墙（ambient）→ B 的 hear 攒满 → T1 叫醒 B → B 可以 open_topic「你在煮啥呀？」——主体先于事件。
+
+### 9.10 实现锚点（2026-09-05 核对过，供新 session）
+
+> 行号会随改动漂移，**以函数名为锚**。
+
+- **基线**：2026-09-05 `node --test test/lib.test.js test/index.test.js` = **78/78 全绿**（干净起点；新 session 完工后此数只增不减）。
+- **index.js**：调度层区块 ~1065（turningChars/turnPending/turnChain ~1072、runTurnOnce ~1079、tryWake ~1111、tryWakeHear ~1121、recheckHear ~1158、enqueueTurn ~1170、scheduleTick ~1187：tick 第 1 步=conditions ~1193、第 2 步=activity 到期 ~1206，**第 3 步 T6+话题沉默自动收在此新增**）；masterSay ~1229；AGENT_TOOLS ~453（say ~454 / move_to ~474 / do_activity ~484 / remember ~495 / set_condition ~505 / adjust_relation ~515）；agentTurn ~797；system prompt 组装 ~853；user 组装 ~897（末行即触发句）；buildHomeViewStatic ~325；buildPresenceView ~344；timelineText ~368；服务面 `ctx.provide('catnest', ...)` ~1338（现有：status/open/close/home/relations/moveCharacter/setActivity/setMood/setCondition/conditionsOf/tickConditions/tick/moveMaster/adjustRelation/recap/recapLLM/say/notice/hear/resolveHear/scene/responders/interrupt/interruptReaction/transcript/companions/syncCompanions/probeLlm/distill）。
+- **lib.js**：`CatNest.say(who, text, action)` → `_sayCore`（加第四参 about，缺省透传兼容旧数据）；character schema ~115-133（新字段 `activityPaused`）；home v2 ensure 迁移 ~568（加 v3：home.topics={} + char.activityPaused=null，不碰用户房间表）；freezeActivities ~305 / thawActivities ~325；isBusy ~188（加暂停返回 false）；hearReadyOf ~282；conditionLabel ~197（未知名原样透传，「睡觉」无需改标签表）；advanceConditions ~239；HEAR_THRESHOLDS ~67（kyu3/moli5，home.json hearThresholds 可调）；sliceEventsText ~467；roomRelation ~180；DEFAULT_ROOMS ~40（玄关/客厅/书房/厨房/卧室/浴室/阳台，客厅枢纽）。
+- **账本行现有类型**：say/shout/move/hear/notice/relation/master-move/condition/interrupt；**新增**：topic-open/topic-end/topic-join/topic-reopen/activity-pause；say 行加可选 about 字段。
+- **home.json 活体**：version 2，7 房间（客厅枢纽），characters {kyu, moli}，hearThresholds {kyu:3, moli:5}，master {atHome, room}；活体旧片 `20260904T100819`（09-04 10:08 开、33h 零行，观察期前关掉）。
+- **重启**：~/.dsh/scripts/dsh-web-restart.sh（先 --check 看状态；禁止手动 kill + nohup——dsh 是宿主，连坐杀自己进程组）。宿主重启后先关旧片再开新片观察。
+- **模型**：跟随 agentDefaultModel（当前本地 llama-server 127.0.0.1:8080，qwen38 27B GGUF，-np 2）。
+
+### 9.11 交付记录（2026-09-06，切片 1+2 一次交付，92/92 测试全绿）
+
+> 实现落点：lib.js（topic 状态纯函数 open/join/end/reopen/expire + matchTopic 匹配规则、
+> home v3 迁移 topics{}/activityPaused/lastAmbientAt、isBusy 暂停修复、pauseActivity/回灶解冻、
+> setActivity 活动隔墙动静、ambientTick 10min 补条、expireTopics、open 清话题/close 清暂停活动、
+> sliceEventsText·dialogueText 新行渲染）+ index.js（AGENT_TOOLS 加 open_topic/end_topic/pause_activity、
+> say.about、timelineText 新行类型、buildPresenceView 时钟行/忙中可视化/【当前话题】/暂停标注、
+> system 静态基调【家里的分寸】、tick 第 3 步 [T6+话题沉默自动收+ambient]、服务面 openTopic/endTopic/
+> resolveTopicSay/resolveTopicAction/pauseActivity/expireTopics/ambientTick）。
+> 与设计的四处偏差（均为实现中发现、语义不偏离拍板）：
+> 1. **end_topic 匹配改精确**：只用 about 完全相等（参与者），不走 §9.2 匹配规则的
+>    「room 唯一话题」容错——end_topic 是精确动作，容错会把「收月亮」误解析到「那盆花」。
+> 2. **T6 同 tick 至多推一只**：串行队列 turnPending 闸天然如此（队列忙则跳过、下次 tick 重评，
+>    就是 §9.1 非 force 语义的实测形态）；「从未交互」按已超过渡期处理（家未开张→主人长期不在）。
+> 3. **resolveTopicSay/resolveTopicAction 暴露为服务方法**：execTool 每个动作后调（say 带 about 走
+>    resolveTopicSay，非说话动作走 resolveTopicAction——closing 裁决接受无账本行、仅状态），
+>    观察期与测试需要这层入口。
+> 4. **回灶解冻不记账本行**（照 §9.9 原文），但会刷新 lastAmbientAt（重新开始计隔墙动静窗）。
+> 测试：lib 新增 9 例（topic 全生命周期/匹配规则/裁决边界、v3 迁移、话题片内作用域、暂停+回灶+close、
+> ambient 动静、方法与账本行、sliceEventsText 渲染）、index 新增 5 例（open_topic/end_topic/pause_activity
+> 工具接线、say.about+【当前话题】+时钟行渲染、T6 门控[离家/睡觉/忙/冷却/在宅闸]）。
+> 基线：78/78 → **92/92**。观察期（切片 3）待跑：关旧片 `20260904T100819` 开新片，统计 §9.7 指标。

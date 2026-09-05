@@ -31,6 +31,14 @@ import {
   conditionText,
   advanceConditions,
   CONDITION_TYPES,
+  topicKey,
+  matchTopic,
+  topicOpenState,
+  topicResolveSay,
+  topicResolveAction,
+  topicEndState,
+  topicExpire,
+  TOPIC_SILENCE_TIMEOUT_MS,
 } from '../lib.js'
 
 const FIXED = new Date('2026-08-22T11:00:00+08:00')
@@ -202,7 +210,8 @@ test('状态跨实例延续：close 后新实例读到全部变更 + 片目录�
     assert.equal(snap.home.characters.kyu.room, 'kitchen')
     const logText = await readFile(join(dir, 'slices', opened.sliceId, 'log.jsonl'), 'utf8')
     const types = logText.trim().split('\n').map((l) => JSON.parse(l).type).sort()
-    assert.deepEqual(types, ['activity', 'master-move', 'move', 'relation'])
+    // hear = 活动隔墙动静（§9.5）：墨璃读书 → 相邻厨房的小玖攒一条「客厅传来读书的动静」
+    assert.deepEqual(types, ['activity', 'hear', 'master-move', 'move', 'relation'])
   } finally {
     await cleanup()
   }
@@ -984,3 +993,329 @@ test('notice：私有默认只进本人时间线；公共例外全员可见；�
 function dir0(nest) {
   return nest.dir
 }
+
+// ── 路 B §9：话题 / 放下锅铲 / 隔墙动静（2026-09-05 三轮定稿）──
+
+test('topic 纯函数：open→幂等→join→续谈→propose→否决(reopen)→动作接受→沉默自动收', () => {
+  const now = (ms) => new Date(FIXED.getTime() + ms)
+  const home = {
+    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+    characters: {
+      kyu: { id: 'kyu', name: '小玖', room: 'living' },
+      moli: { id: 'moli', name: '墨璃', room: 'living' },
+    },
+    topics: {},
+  }
+  // 小玖开启「那盆花」
+  const r1 = topicOpenState(home, now(0), 'kyu', '那盆花')
+  assert.equal(r1.opened, true)
+  assert.equal(r1.key, topicKey('kyu', '那盆花'))
+  let x = home.topics[r1.key]
+  assert.equal(x.status, 'open')
+  assert.deepEqual(x.participants, ['kyu'])
+  assert.equal(x.turns, 1)
+  // 同人同短语重复提起＝幂等更新（不重置参与方/轮数）
+  const r1b = topicOpenState(home, now(60000), 'kyu', '那盆花')
+  assert.equal(r1b.opened, false)
+  assert.equal(r1b.key, r1.key)
+  assert.deepEqual(x.participants, ['kyu'])
+  assert.equal(x.turns, 2)
+  // 墨璃带 about 接话 → join
+  const r2 = topicResolveSay(home, now(120000), 'moli', '那盆花')
+  assert.equal(r2.verdict, 'join')
+  assert.equal(r2.joined, true)
+  assert.deepEqual(x.participants, ['kyu', 'moli'])
+  assert.equal(x.turns, 3)
+  // 参与方续谈：轮数 +1，无新行
+  const r3 = topicResolveSay(home, now(180000), 'moli', '那盆花')
+  assert.equal(r3.verdict, null)
+  assert.equal(r3.matched, true)
+  assert.equal(x.turns, 4)
+  // 小玖提议收掉 → closing（endedBy=提议人）
+  const r4 = topicEndState(home, now(240000), 'kyu', '那盆花')
+  assert.equal(r4.verdict, 'propose')
+  assert.equal(x.status, 'closing')
+  assert.equal(x.endedBy, 'kyu')
+  // 墨璃（另一参与方）说解析到 X 的话 → 否决回 open（reopen）
+  const r5 = topicResolveSay(home, now(300000), 'moli', '那盆花')
+  assert.equal(r5.verdict, 'reopen')
+  assert.equal(x.status, 'open')
+  assert.equal(x.turns, 5, '1 开 + 1 幂等 + 1 加入 + 1 续谈 + 1 否决')
+  // 小玖再提收 → closing；墨璃去做事（非说话动作）→ 裁决接受 ended
+  topicEndState(home, now(360000), 'kyu', '那盆花')
+  assert.equal(x.status, 'closing')
+  const r6 = topicResolveAction(home, now(420000), 'moli')
+  assert.equal(r6.accepted.length, 1)
+  assert.equal(x.status, 'ended')
+  assert.equal(x.endedBy, 'moli')
+  // 沉默自动收：新话题 10 分钟无 mention → endedBy='silence'
+  const r7 = topicOpenState(home, now(480000), 'kyu', '今晚吃什么')
+  const y = home.topics[r7.key]
+  const early = topicExpire(home, now(480000 + 9 * 60000))
+  assert.equal(early.length, 0, '9 分钟未到不收')
+  const expired = topicExpire(home, now(480000 + 11 * 60000))
+  assert.equal(expired.length, 1)
+  assert.equal(expired[0].about, '今晚吃什么')
+  assert.equal(expired[0].endedBy, 'silence')
+  assert.equal(y.status, 'ended')
+})
+
+test('matchTopic：完全相等优先；room 唯一话题且参与方带 about 才解析；双话题不解析', () => {
+  const home = {
+    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+    characters: {
+      kyu: { id: 'kyu', name: '小玖', room: 'living' },
+      moli: { id: 'moli', name: '墨璃', room: 'living' },
+    },
+    topics: {},
+  }
+  const r1 = topicOpenState(home, FIXED, 'kyu', '那盆花')
+  // 完全相等（未参与也命中：一句带 about 的接话即加入）
+  assert.equal(matchTopic(home, 'moli', '那盆花'), home.topics[r1.key])
+  // 不等且墨璃未参与：room 唯一但非参与方 → 不解析
+  assert.equal(matchTopic(home, 'moli', '花'), null)
+  // 墨璃加入后再带泛化短语：room 唯一 + 参与方 → 解析
+  topicResolveSay(home, FIXED, 'moli', '那盆花')
+  assert.equal(matchTopic(home, 'moli', '花'), home.topics[r1.key])
+  // 同房两个话题：不唯一 → 泛化短语不解析
+  const r2 = topicOpenState(home, FIXED, 'moli', '月亮')
+  assert.equal(matchTopic(home, 'kyu', '花'), null)
+  assert.equal(home.topics[r2.key].about, '月亮')
+})
+
+test('topic 裁决边界：提议人自己说话不算裁决；双收直接 ended；非参与方不能收', () => {
+  const now = (ms) => new Date(FIXED.getTime() + ms)
+  const home = {
+    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+    characters: {
+      kyu: { id: 'kyu', name: '小玖', room: 'living' },
+      moli: { id: 'moli', name: '墨璃', room: 'living' },
+    },
+    topics: {},
+  }
+  const r1 = topicOpenState(home, now(0), 'kyu', '那盆花')
+  const x = home.topics[r1.key]
+  topicResolveSay(home, now(60000), 'moli', '那盆花') // 墨璃加入
+  topicEndState(home, now(120000), 'kyu', '那盆花') // kyu 提议收
+  // 提议人自己再说解析 X 的话：不算裁决，维持 closing
+  const r2 = topicResolveSay(home, now(180000), 'kyu', '那盆花')
+  assert.equal(r2.verdict, null)
+  assert.equal(x.status, 'closing')
+  // 非参与方 end_topic：拒绝（没参与）
+  const r3 = topicEndState(home, now(240000), 'kyu', '月亮') // 没这话题
+  assert.equal(r3.key, null)
+  // 双收：墨璃也 end → 直接 ended
+  const r4 = topicEndState(home, now(300000), 'moli', '那盆花')
+  assert.equal(r4.verdict, 'accepted')
+  assert.equal(x.status, 'ended')
+  assert.equal(x.endedBy, 'moli')
+})
+
+test('home v3：默认账本带 topics/activityPaused/lastAmbientAt；旧账本迁移补齐', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    const h1 = await nest.home()
+    assert.equal(h1.version, HOME_VERSION)
+    assert.deepEqual(h1.topics, {})
+    for (const ch of Object.values(h1.characters)) {
+      assert.equal(ch.activityPaused, null)
+      assert.equal(ch.lastAmbientAt, null)
+    }
+    // 旧账本（v2 无新字段）迁移补齐，用户数据不丢
+    // 注意：ensure 的迁移只在进程首次执行（in-flight 缓存）；用新实例模拟真实启动
+    const custom = {
+      version: 2,
+      rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+      characters: {
+        kyu: { id: 'kyu', name: '小玖', room: 'kitchen', activity: '做饭', activityEndsAt: null, activityLeftMs: null, mood: null, conditions: [], hear: [] },
+      },
+      hearThresholds: { ...HEAR_THRESHOLDS },
+      master: { atHome: true, room: 'living' },
+    }
+    await writeFile(join(dir, 'home.json'), JSON.stringify(custom))
+    const nest3 = new CatNest(dir, { now: fixedNow })
+    const h2 = await nest3.home()
+    assert.equal(h2.version, HOME_VERSION)
+    assert.deepEqual(h2.topics, {})
+    assert.equal(h2.characters.kyu.activity, '做饭', '已有数据不丢')
+    assert.equal(h2.characters.kyu.activityPaused, null)
+    assert.equal(h2.characters.kyu.lastAmbientAt, null)
+    assert.equal(h2.master.room, 'living')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('话题片内作用域：open 清空旧话题；片内进程重启（不开片）留存', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    const r = await nest.openTopic('kyu', '那盆花', '你看那盆花开了')
+    assert.equal(r.opened, true)
+    assert.ok((await nest.home()).topics[topicKey('kyu', '那盆花')])
+    // 片内重启：新实例读同一目录，话题留存（进程在片内重启不丢）
+    const nest2 = new CatNest(dir, { now: fixedNow })
+    assert.ok((await nest2.home()).topics[topicKey('kyu', '那盆花')], '片内重启话题留存')
+    await nest2.close()
+    // 新片 open：话题清空
+    const opened = await nest.open()
+    assert.deepEqual((await nest.home()).topics, {}, 'open 新片清空话题（对话不跨片）')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('pause_activity：暂停=不忙；暂停中再暂停拒绝；回灶解冻续计时；close 清暂停活动', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.setActivity('moli', '做饭', 30)
+    const p = await nest.pauseActivity('moli')
+    assert.equal(p.activity, '做饭')
+    assert.equal(p.activityPaused, true)
+    const ch1 = (await nest.home()).characters.moli
+    assert.equal(ch1.activityEndsAt, null, '暂停：endsAt 冻结')
+    assert.ok(ch1.activityLeftMs > 0, '剩余毫秒存 leftMs')
+    assert.equal(isBusy(ch1, nest.now()), false, '暂停=不忙（可被叫/可接话/可被轻推）')
+    await assert.rejects(() => nest.pauseActivity('moli'), /暂停中/)
+    // 回灶：同名 do_activity → 解冻续计时（endsAt 恢复，leftMs 清空）
+    const r2 = await nest.setActivity('moli', '做饭', 30)
+    assert.equal(r2.resumed, true)
+    const ch2 = (await nest.home()).characters.moli
+    assert.equal(ch2.activityPaused, null)
+    assert.equal(ch2.activityLeftMs, null)
+    assert.ok(ch2.activityEndsAt, '回灶恢复 endsAt')
+    assert.equal(ch2.activityEndsAt, new Date(FIXED.getTime() + 30 * 60000).toISOString(), '剩余 30 分钟原样续上')
+    assert.equal(isBusy(ch2, nest.now()), true, '回灶后重新在忙')
+    // 不同名活动 = 放弃暂停、正常开新
+    await nest.setActivity('moli', '读书', 30)
+    const ch3 = (await nest.home()).characters.moli
+    assert.equal(ch3.activity, '读书')
+    assert.equal(ch3.activityPaused, null)
+    // close 清暂停活动（片内瞬态不跨片；快照保留现场）
+    await nest.setActivity('moli', '做饭', 30)
+    await nest.pauseActivity('moli')
+    const sliceId = (await nest.status()).sliceId
+    await nest.close()
+    const ch4 = (await nest.home()).characters.moli
+    assert.equal(ch4.activity, null)
+    assert.equal(ch4.activityPaused, null)
+    assert.equal(ch4.activityLeftMs, null)
+    const snap = JSON.parse(await readFile(join(dir, 'slices', sliceId, 'close.snapshot.json'), 'utf8'))
+    assert.equal(snap.home.characters.moli.activity, '做饭')
+    assert.equal(snap.home.characters.moli.activityPaused, true, '快照保留暂停现场（片内最终状态）')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('活动隔墙动静（§9.5）：开始时相邻房攒一条；同房不攒；每 10min tick 补一条去重', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('kyu', 'kitchen') // 厨房与客厅相邻
+    await nest.setActivity('moli', '做饭', 60) // 墨璃在客厅做饭
+    const kyuHear = await nest.hear('kyu')
+    assert.equal(kyuHear.buffer.length, 1, '开始时相邻房攒一条')
+    assert.equal(kyuHear.buffer[0].from, 'moli')
+    assert.ok(kyuHear.buffer[0].text.includes('客厅传来做饭的动静'), kyuHear.buffer[0].text)
+    assert.equal((await nest.hear('moli')).buffer.length, 0, '同房不攒自己')
+    // 未到 10 分钟：不补
+    nest.now = () => new Date(FIXED.getTime() + 9 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 1)
+    // 过 10 分钟：补一条（同窗去重）
+    nest.now = () => new Date(FIXED.getTime() + 11 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 2)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 2, '刚补过不重复')
+    // 活动停止后不再补
+    await nest.setActivity('moli', null)
+    nest.now = () => new Date(FIXED.getTime() + 22 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 2)
+    // 暂停的活动不补（暂停=没在做）：重新开始时打一条开始条，tick 不再补
+    nest.now = () => new Date(FIXED.getTime() + 33 * 60000)
+    await nest.setActivity('moli', '做饭', 60) // 新开始条（缓冲 3，lastAmbientAt=33min）
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 3, '恢复后按新 lastAmbientAt 计窗，不补')
+    await nest.pauseActivity('moli')
+    nest.now = () => new Date(FIXED.getTime() + 44 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('kyu')).buffer.length, 3, '暂停期间不补')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('openTopic/endTopic/resolveTopicSay 方法：账本行与状态一致（含 say 带 about）', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    const r1 = await nest.openTopic('kyu', '那盆花', '你看那盆花开了')
+    assert.equal(r1.opened, true)
+    let t = await nest.transcript()
+    assert.ok(t.lines.some((l) => l.type === 'topic-open' && l.about === '那盆花' && l.char === 'kyu'), 'topic-open 行入账')
+    const say1 = t.lines.find((l) => l.type === 'say' && l.who === 'kyu')
+    assert.equal(say1.about, '那盆花', '开场白 say 带 about')
+    // 墨璃接话（带 about）→ join + topic-join 行
+    await nest.say('moli', '我也想看', undefined, '那盆花')
+    const r2 = await nest.resolveTopicSay('moli', '那盆花')
+    assert.equal(r2.verdict, 'join')
+    t = await nest.transcript()
+    assert.ok(t.lines.some((l) => l.type === 'topic-join' && l.char === 'moli' && l.about === '那盆花'))
+    // 小玖收话题（带收尾句）→ topic-end 行 + 带 about 的收尾 say
+    const r3 = await nest.endTopic('kyu', '那盆花', '那先聊到这')
+    assert.equal(r3.verdict, 'propose')
+    const x = (await nest.home()).topics[topicKey('kyu', '那盆花')]
+    assert.equal(x.status, 'closing')
+    t = await nest.transcript()
+    assert.ok(t.lines.some((l) => l.type === 'topic-end' && l.about === '那盆花'))
+    const sayEnd = t.lines.find((l) => l.type === 'say' && l.who === 'kyu' && l.rawText === '那先聊到这')
+    assert.equal(sayEnd.about, '那盆花')
+    // 墨璃否决（带 about 接 X）→ topic-reopen 行 + 状态回 open
+    await nest.say('moli', '等等还没说完', undefined, '那盆花')
+    const r4 = await nest.resolveTopicSay('moli', '那盆花')
+    assert.equal(r4.verdict, 'reopen')
+    assert.equal((await nest.home()).topics[topicKey('kyu', '那盆花')].status, 'open')
+    t = await nest.transcript()
+    assert.ok(t.lines.some((l) => l.type === 'topic-reopen' && l.char === 'moli'))
+    // 再收 → 墨璃非说话动作 → 接受 ended
+    await nest.endTopic('kyu', '那盆花')
+    const r5 = await nest.resolveTopicAction('moli')
+    assert.equal(r5.accepted.length, 1)
+    assert.equal((await nest.home()).topics[topicKey('kyu', '那盆花')].status, 'ended')
+    // expireTopics：无 closing/open 话题时静默
+    const r6 = await nest.expireTopics()
+    assert.deepEqual(r6.expired, [])
+  } finally {
+    await cleanup()
+  }
+})
+
+test('sliceEventsText：topic 行 + say.about 渲染进家史', () => {
+  const home = {
+    characters: {
+      kyu: { id: 'kyu', name: '小玖' },
+      moli: { id: 'moli', name: '墨璃' },
+    },
+  }
+  const log = [
+    { t: 't1', type: 'topic-open', char: 'kyu', about: '那盆花' },
+    { t: 't2', type: 'say', who: 'kyu', text: '你看那盆花开了', about: '那盆花' },
+    { t: 't3', type: 'topic-join', char: 'moli', about: '那盆花' },
+    { t: 't4', type: 'topic-end', char: 'kyu', about: '那盆花' },
+    { t: 't5', type: 'topic-reopen', char: 'moli', about: '那盆花' },
+    { t: 't6', type: 'activity-pause', char: 'moli', activity: '做饭' },
+  ]
+    .map((e) => JSON.stringify(e))
+    .join('\n')
+  const lines = sliceEventsText(home, log)
+  assert.ok(lines.some((l) => l === '小玖提起话题：那盆花'), lines.join('|'))
+  assert.ok(lines.some((l) => l === '小玖（聊那盆花）：你看那盆花开了'), lines.join('|'))
+  assert.ok(lines.some((l) => l === '墨璃加入了话题：那盆花'), lines.join('|'))
+  assert.ok(lines.some((l) => l === '小玖提议收掉话题：那盆花'), lines.join('|'))
+  assert.ok(lines.some((l) => l === '墨璃：这个还要聊'), lines.join('|'))
+  assert.ok(lines.some((l) => l === '墨璃放下了手里的活（做饭）'), lines.join('|'))
+})

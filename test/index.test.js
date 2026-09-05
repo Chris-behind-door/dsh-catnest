@@ -1661,6 +1661,13 @@ const readLog = async (dir, sliceId) => {
   return raw.trim().split('\n').map((l) => JSON.parse(l))
 }
 
+// 工具层便捷断言：角色此刻是否在忙（读家状态；暂停=不忙）
+const isBusyOf = async (svc, id) => {
+  const home = await svc.home()
+  const ch = home.characters[id]
+  return !!(ch && ch.activity && !ch.activityPaused)
+}
+
 test('notice 链路：私有只进本人时间线，公共原样进全员；私有不入他人 prompt', async () => {
   const dirN = await mkdtemp(join(tmpdir(), 'catnest-idx-notice-'))
   const wsN = webServerStub()
@@ -1769,6 +1776,8 @@ test('T2 唤醒：pending→active 翻转 → 私有 notice + 唤醒；notifiedA
     plugin.apply(ctxT2, { catnestDir: dirT2 })
     const svc = providedT2.catnest
     await svc.open()
+    // 主人在家：T6 自主轻推闸死（§9.1 触发闸=主人离家），T2 单向验证不被自主节奏污染
+    await svc.moveMaster('living')
     // 手工造一个「刚跨过 startAt 未确认」的状态（等价于 pending 跨点被 tick 捕获）
     const homeP = join(dirT2, 'home.json')
     const home0 = JSON.parse(await readFile(homeP, 'utf8'))
@@ -1831,6 +1840,8 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
       return hT3(fakeReq(method, url, body), r).then(() => r)
     }
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    // 主人在家：T6 自主轻推闸死，T3 单向验证不被自主节奏污染
+    await svc.moveMaster('living')
     await svc.setActivity('moli', '读书', 30)
     // 把 activityEndsAt 拨到过去（等价于 30 分钟到期）
     const homeP = join(dirT3, 'home.json')
@@ -1864,3 +1875,170 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
     await rmSafe(dirT3)
   }
 })
+
+// ── 路 B §9（2026-09-05 三轮定稿）：topic 套件 / 放下锅铲 / T6 自主节奏 ──
+
+test('open_topic 工具接线：开话题 → topic-open 账本行 + 开场白 say 带 about + topics 状态', async () => {
+  const n = await setupNest(toolOnceStub('open_topic', { about: '那盆花', text: '你看那盆花开了' }))
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖，我出门逛逛' })),
+      fakeRes(),
+    )
+    await until(async () => {
+      const topics = (await n.svc.home()).topics || {}
+      return topics['kyu|那盆花'] !== undefined
+    })
+    await until(async () => {
+      const st = await n.svc.status()
+      const log = await readLog(n.dir, st.sliceId)
+      return log.some((e) => e.type === 'topic-open' && e.char === 'kyu')
+    })
+    const topics = (await n.svc.home()).topics
+    assert.equal(topics['kyu|那盆花'].openedBy, 'kyu')
+    assert.equal(topics['kyu|那盆花'].status, 'open')
+    assert.deepEqual(topics['kyu|那盆花'].participants, ['kyu'])
+    const st = await n.svc.status()
+    const log = await readLog(n.dir, st.sliceId)
+    const sayLine = log.find((e) => e.type === 'say' && e.who === 'kyu')
+    assert.equal(sayLine.about, '那盆花', '开场白 say 带 about')
+    assert.ok(log.some((e) => e.type === 'topic-open' && e.about === '那盆花'))
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('end_topic 工具接线：收话题 → topic-end 账本行 + 状态 closing；无参与话题报错', async () => {
+  const n = await setupNest(toolOnceStub('end_topic', { about: '那盆花', text: '那先聊到这' }))
+  try {
+    // 先手动建立话题并让墨璃加入
+    await n.svc.openTopic('kyu', '那盆花', '你看那盆花开了')
+    await n.svc.say('moli', '我想看看', undefined, '那盆花')
+    await n.svc.resolveTopicSay('moli', '那盆花')
+    // 主人说话 → kyu 回合调 end_topic
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我回来啦，聊什么呢' })),
+      fakeRes(),
+    )
+    await until(async () => {
+      const x = ((await n.svc.home()).topics || {})['kyu|那盆花']
+      return x && x.status === 'closing'
+    })
+    const st = await n.svc.status()
+    const log = await readLog(n.dir, st.sliceId)
+    const endLine = log.find((e) => e.type === 'topic-end' && e.about === '那盆花')
+    assert.ok(endLine, 'topic-end 行入账')
+    const endSay = log.find((e) => e.type === 'say' && e.who === 'kyu' && e.text === '那先聊到这')
+    assert.equal(endSay.about, '那盆花', '收尾句带 about')
+    // 不存在的收话题：拒绝（lib 层抛错；execTool 兜底成 fail）
+    await assert.rejects(() => n.svc.endTopic('kyu', '月亮'), /没有你参与的/)
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('pause_activity 工具接线：放下锅铲 → activityPaused + activity-pause 账本行 + isBusy 变不忙', async () => {
+  const n = await setupNest(toolOnceStub('pause_activity', {}))
+  try {
+    await n.svc.setActivity('kyu', '做饭', 30)
+    assert.equal(await isBusyOf(n.svc, 'kyu'), true, '做事中=忙')
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖你先歇会儿' })),
+      fakeRes(),
+    )
+    await until(async () => (await n.svc.home()).characters.kyu.activityPaused === true)
+    const home = await n.svc.home()
+    assert.equal(home.characters.kyu.activity, '做饭')
+    assert.equal(home.characters.kyu.activityEndsAt, null, '暂停=endsAt 冻结')
+    assert.equal(await isBusyOf(n.svc, 'kyu'), false, '暂停=不忙')
+    const st = await n.svc.status()
+    const log = await readLog(n.dir, st.sliceId)
+    assert.ok(log.some((e) => e.type === 'activity-pause' && e.char === 'kyu' && e.activity === '做饭'))
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('say.about 渲染 + 【当前话题】presence：话题内发言带标记，常驻动态窗口', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-top1-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
+    await call('/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.openTopic('kyu', '那盆花', '你看那盆花开了')
+    await svc.say('moli', '我想看看', undefined, '那盆花')
+    await svc.resolveTopicSay('moli', '那盆花')
+    await call('/catnest/api/action', JSON.stringify({ op: 'say', text: '那盆花长势如何' }))
+    await until(() => prompts.length >= 2)
+    const kyuP = prompts.find((p) => p.system.includes('你是"猫窝"家里的成员小玖'))
+    const moliP = prompts.find((p) => p.system.includes('你是"猫窝"家里的成员墨璃'))
+    assert.ok(kyuP && moliP, '两个角色的回合都有')
+    assert.ok(kyuP.user.includes('墨璃（聊那盆花）：我想看看'), '话题内发言带（聊X）渲染')
+    assert.ok(moliP.user.includes('小玖（聊那盆花）：你看那盆花开了'), 'moli 视角开场白带标记')
+    assert.ok(moliP.user.includes('【当前话题】'), '话题常驻动态窗口')
+    assert.ok(moliP.user.includes('那盆花（小玖发起，已聊 2 轮）'), moliP.user)
+    assert.ok(moliP.user.includes('现在是 '), '时钟行在场')
+    assert.ok(moliP.user.includes('小玖（聊那盆花）：你看那盆花开了'), 'moli 视角开场白带标记')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('T6 门控：离家轻推（每 tick 至多一只）；睡觉/忙/刚说过不推；主人在家闸死', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-t6-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const st0 = await svc.open()
+    // 1) 主人从未交互（atHome=false 默认、无任何 master 行）→ tick 轻推
+    //    （串行队列：同 tick 至多一只，队列忙则跳过、下次 tick 重评）
+    await svc.tick()
+    await until(() => prompts.length >= 1)
+    await new Promise((r) => setTimeout(r, 150))
+    const t6Prompts = prompts.filter((p) => p.user.includes('家里很安静，你闲下来了'))
+    assert.equal(t6Prompts.length, 1, '每 tick 至多一只')
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    const t6Notices = log.filter((e) => e.type === 'notice' && e.text === '家里很安静，你闲下来了')
+    assert.equal(t6Notices.length, 1, 'notice 只在成功排回合时入账')
+    assert.equal(t6Notices[0].source, 'self')
+    assert.equal(t6Notices[0].private, true)
+    // 2) 小玖睡觉 → 下次 tick 推墨璃（睡着的猫不被「安静」叫醒）
+    await svc.setCondition('kyu', { name: '睡觉' })
+    const n0 = prompts.length
+    await svc.tick()
+    await until(() => prompts.length >= n0 + 1)
+    await new Promise((r) => setTimeout(r, 150))
+    const moliTurn = prompts.slice(n0).find((p) => p.system.includes('你是"猫窝"家里的成员墨璃'))
+    assert.ok(moliTurn, '睡觉的小玖被排除，推的是墨璃')
+    assert.ok(!prompts.slice(n0).some((p) => p.system.includes('成员小玖')), '小玖不被推')
+    // 3) 小玖起床并在忙；墨璃刚说过话（5min 冷却）→ tick 无人被推
+    await svc.setCondition('kyu', { name: '睡觉', lastsDays: 0 })
+    await svc.setActivity('kyu', '读书', 60)
+    await svc.say('moli', '喵')
+    const n1 = prompts.length
+    await svc.tick()
+    await new Promise((r) => setTimeout(r, 250))
+    assert.equal(prompts.length, n1, '忙的不推、冷却期的不推')
+    // 4) 主人在家：闸死（T6 触发闸=atHome===false）
+    await svc.moveMaster('living')
+    const n2 = prompts.length
+    await svc.tick()
+    await new Promise((r) => setTimeout(r, 250))
+    assert.equal(prompts.length, n2, '主人在家 T6 不触发')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
