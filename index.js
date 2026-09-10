@@ -50,7 +50,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, isBusy, humanInterval } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, isBusy, humanInterval, checkTopicAbout, detectMoveIntent } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -481,10 +481,12 @@ export default {
         const act = typeof l.action === 'string' ? l.action.trim() : ''
         // 话题短语（§9.2）：带 about 的发言渲染「（聊那盆花）」前缀；隔墙只闻声不见形，
         // 话题标记与 action 一样是视觉/语境信息，faint 不展示
-        const aboutTxt = typeof l.about === 'string' && l.about && level !== 'faint' ? '（聊' + l.about + '）' : ''
+        // 话题短语是内容层面的信息（不是形态），隔墙也带上：否则对方听见了内容，
+        // 却不知道这是在聊哪条线，也就接不上（§9.2 开完不限房间）
+        const aboutTxt = typeof l.about === 'string' && l.about ? '（聊' + l.about + '）' : ''
         if (level === 'faint') {
-          // 隔墙只闻声不见形：action 是视觉信息，不入听者的时间线
-          out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + '的声音：）' + l.rawText)
+          // 隔墙只闻声不见形：action 是视觉信息，不入听者的时间线；话题标记跟着内容走
+          out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + '的声音：）' + aboutTxt + l.rawText)
         } else {
           out.push(nameOf(who) + (act ? '（' + act + '）' : '') + aboutTxt + '：' + l.rawText)
         }
@@ -524,8 +526,9 @@ export default {
             about: {
               type: 'string',
               description:
-                '可选：话题短语（几个字，如「那盆花」）。在某个话题里的发言带上它，' +
-                '对方才好确认你接的是哪条线；接别人的话题会算加入那个话题。轻飘飘的一句不用带。',
+                '可选：你正在聊的话题短语（几个字，如「那盆花」）。' +
+                '必须和这个房间里一条还开着的话题完全一致，否则这句话说不出去。' +
+                '想开新的话题用 open_topic；跟主人说话、随口一句都不用带。',
             },
           },
           required: ['text'],
@@ -558,13 +561,15 @@ export default {
         name: 'open_topic',
         description:
           '提起一个话题并说开场白（一次完成「开启+开场」，像打个招呼把话头递出去）。' +
-          '想正经开聊时用它；对方用带同一话题短语的 say 接话就是加入，' +
-          '聊透了用 end_topic 收掉。轻飘飘的一句话不用开话题。',
+          '这是你和姐妹聊天的工具：提的时候必须在同一个房间里（房间里没有别的猫娘就开不起来），' +
+          '开起来之后就算走到别的房间也还能接着聊这条线。和主人说话不用开话题，直接 say 就行。' +
+          '同一个话题全屋只有一条：已经在聊就直接带 about 说话接上，已经收掉的可以重新开；' +
+          '想挽留一个正被收掉的话题，也用 open_topic 再提一次。聊透了用 end_topic 收掉。',
         parameters: {
           type: 'object',
           properties: {
             about: { type: 'string', description: '话题短语（几个字，如：那盆花 / 今晚吃什么）' },
-            to: { type: 'string', description: '可选：定向邀请的对象（名字或角色 id）。缺省=对房间，同房者皆可加入。' },
+            to: { type: 'string', description: '可选：指定房间里的某位姐妹（名字或 id）。缺省=房间里的姐妹都能接。' },
             text: { type: 'string', description: '开场白（要说的话，会作为 say 入账并带话题标记）' },
           },
           required: ['about', 'text'],
@@ -573,8 +578,10 @@ export default {
       {
         name: 'end_topic',
         description:
-          '提议收掉一个话题（「这个先聊到这」）。' +
-          '对方接同一话题的话=否决（还想聊，话题接着开）；对方不接/去忙别的=接受（聊完了）。',
+          '提议收掉一个话题（「这个先聊到这」）。只有参与的姐妹能收。' +
+          '你提议之后：对方就在身边的话，她说别的话、或去忙别的，就算同意收掉；' +
+          '对方用 open_topic 再提一次同名话题，就是还想聊，话题继续；' +
+          '对方不在身边（在别的房间，或者屋里没别人），或者一直没动静，就直接收掉。',
         parameters: {
           type: 'object',
           properties: {
@@ -777,8 +784,13 @@ export default {
           if (!text.trim()) return fail('say 需要非空 text')
           const action = typeof args.action === 'string' ? args.action.trim() : ''
           const about = typeof args.about === 'string' ? args.about.trim() : ''
+          if (about) {
+            // 话题硬校验（§9.2）：about 非空必须是「这个房间里一条还开着的话题」
+            const chk = checkTopicAbout(await nest.home(), charId, about)
+            if (chk.error) return fail('say：' + chk.error)
+          }
           await nest.say(charId, text, action || undefined, about || undefined)
-          // 话题账（§9.2）：带 about=解析话题（加入/续谈/否决）；不带 about 也是裁决动作
+          // 话题账（§9.2）：带 about=解析话题（加入/续谈/裁决接受）；不带 about 也是裁决动作
           await nest.resolveTopicSay(charId, about || null)
           scheduleSnapshot()
           return { ok: true, result: '已说出口。', effect: { tool: 'say', text, ...(action ? { action } : {}), ...(about ? { about } : {}) } }
@@ -791,7 +803,15 @@ export default {
           const r = await nest.openTopic(charId, about, text, args.to)
           await nest.resolveTopicAction(charId)
           scheduleSnapshot()
-          return { ok: true, result: '已提起话题「' + about + '」并说了开场白。', effect: { tool: 'open_topic', about, to: r.to || null } }
+          return {
+            ok: true,
+            result: r.reopened
+              ? '话题「' + about + '」聊回来了，继续。'
+              : r.opened
+                ? '已提起话题「' + about + '」并说了开场白。'
+                : '话题「' + about + '」已经在聊了，你接上了。',
+            effect: { tool: 'open_topic', about, to: r.to || null },
+          }
         }
         if (name === 'end_topic') {
           const about = typeof args.about === 'string' ? args.about.trim() : ''
@@ -802,7 +822,12 @@ export default {
           scheduleSnapshot()
           return {
             ok: true,
-            result: r.verdict === 'accepted' ? '话题「' + about + '」聊完了。' : '已提议收掉话题「' + about + '」。',
+            result:
+              r.verdict === 'accepted'
+                ? '话题「' + about + '」聊完了。'
+                : r.verdict === 'solo'
+                  ? '话题「' + about + '」收掉了。'
+                  : '已提议收掉话题「' + about + '」，看姐妹接不接。',
             effect: { tool: 'end_topic', about, verdict: r.verdict },
           }
         }
@@ -930,6 +955,18 @@ export default {
 
     // 角色 agent 回合：多步工具循环。返回 { said, error, actions }：
     // said=是否通过 say 工具说了话（已入账）；error=非空表示 llm 缺席/异常。
+    // 回合末自查用：这一轮说出口的话里有没有「去别的房间」的意图，而整轮一个 move_to
+    // 都没调。只看本轮自己 say 的 text/action（已落账的动作清单 = 本轮的既成事实）。
+    const pendingMoveIntent = (turnActions, home, charId) => {
+      if ((turnActions || []).some((a) => a && a.tool === 'move_to')) return null
+      for (const a of turnActions || []) {
+        if (!a || a.tool !== 'say') continue
+        const hit = detectMoveIntent(a.text, a.action, home, charId)
+        if (hit) return hit
+      }
+      return null
+    }
+
     const agentTurn = async (charId) => {
       const home = await nest.home()
       const ch = home.characters && home.characters[charId]
@@ -995,13 +1032,17 @@ export default {
         '想走动就调用 move_to；想做事就调用 do_activity；' +
         '想记住什么就调用 remember；心情/状态变化时用 set_condition 设置身体状态（发情/生病/受伤…，可带倒计时）；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
+        '同一轮里可以调用多个工具，也该把这一轮要做的事一次调完（比如一边说话一边走去别的房间，就把 say 和 move_to 放在同一轮里调）。' +
         '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
         '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。\n\n' +
         '【家里的分寸（路 B §9.6）】\n' +
         '· 家人正忙着各自的事时，可以轻飘飘地说一句（分享见闻、打招呼），别追着聊；重要的事才停一下手里的。\n' +
         '· 轻飘飘的话对方不接也正常，不接也是回应，不用追着问。\n' +
-        '· 想正经开聊就用 open_topic 带个话题（传开场白）；对方接了同一话题就是加入；聊透了用 end_topic 收掉，' +
-        '或带个新的；对方不接就别追着聊。轻飘飘的一句不用开话题。\n' +
+        '· 话题（open_topic / end_topic / say 的 about）是你和姐妹聊天的工具：提起来的时候' +
+        '必须是当面提（房间里没有别的猫娘就开不起话题），开起来之后走到别的房间也还能接着聊；' +
+        '主人那边不需要话题，跟主人说话直接 say。\n' +
+        '· 想跟姐妹认真聊一件事就用 open_topic 提起它（顺带说开场白），聊透了用 end_topic 收掉；' +
+        '随口一句、打招呼、应答都不用开话题。\n' +
         '· 想暂时放下手里的活，用 pause_activity（计时继续走，之后同名 do_activity 可以接回来）；做完了用 do_activity 传空字符串。\n' +
         '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题，或继续安静待着。'
 
@@ -1057,6 +1098,7 @@ export default {
       const messages = [{ role: 'user', content: [{ type: 'text', text: user }] }]
       const actions = []
       let said = false
+      let selfChecked = false
       for (let step = 0; step < MAX_STEPS; step++) {
         // 打字机直播：本步 say 的 text 片段 → deltaStart/…/delta；步结束（含超时）发
         // deltaEnd。超时后后台残留的流片段用 live 闸拦掉，不许步外补帧（时序错乱）。
@@ -1082,6 +1124,8 @@ export default {
         const content = []
         if (text && text.trim()) content.push({ type: 'text', text })
         for (const c of toolCalls) content.push({ type: 'tool-call', id: c.id, name: c.name, arguments: c.arguments })
+        // 自查退回时这一步后面还要接着问模型，assistant 段不能是空数组（有些 provider 会拒）
+        if (content.length === 0) content.push({ type: 'text', text: '（沉默）' })
         messages.push({ role: 'assistant', content })
         if (toolCalls.length === 0) {
           // 诊断：本步未调工具。有文本=模型「直接说话」了（听不见、不入账）；无文本=纯沉默。
@@ -1091,12 +1135,45 @@ export default {
             dbgSlice,
             t0 ? '本步未调工具，只有文本（家人听不见）：' + t0.slice(0, 150) : '本步未调工具，纯沉默',
           )
+          // ── 回合末统一自查（2026-09-10 主人定案）──
+          // 查的是整轮：说出口的位移意图 vs 真调过的工具。不通过就把整轮退回给模型补齐。
+          // 这是判定意义上的驳回，不撤已落账的动作——账本 append-only，台词本身没错，
+          // 撤了反而连坐掉最贵的信息（家人什么都没听见）。一次性触发，补不齐就按沉默收尾。
+          const miss = selfChecked || step >= MAX_STEPS - 1 ? null : pendingMoveIntent(actions, home, charId)
+          if (miss) {
+            selfChecked = true
+            void agentDebug(charId, dbgSlice, '自查未通过：说了要去' + miss.name + '但这一轮没有 move_to，退回补齐')
+            messages.push({
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    '（自查：你刚才说了要去' + miss.name + '，但这一轮没有调用 move_to，你的位置没有变。' +
+                    '要过去就在这一轮里把 move_to 调掉，说话和移动可以放在同一步一起调；' +
+                    '如果你只是随口说说、并不打算过去，那就不用调。）',
+                },
+              ],
+            })
+            continue
+          }
           break // 模型收手（只出文本也算沉默）
         }
         for (const c of toolCalls) {
           let args = {}
           try { args = c.arguments ? JSON.parse(c.arguments) : {} } catch { args = { raw: c.arguments } }
-          const outcome = await execTool(charId, c.name, args)
+          let outcome
+          try {
+            outcome = await execTool(charId, c.name, args)
+          } catch (error) {
+            // 工具异常（参数不合法、门禁拦截等）转成模型可读的失败回执：
+            // 当轮就能看见并纠正，而不是炸掉整个回合
+            outcome = {
+              ok: false,
+              result: 'Error: ' + (error && error.message ? error.message : String(error)),
+              effect: null,
+            }
+          }
           if (outcome.effect) {
             actions.push(outcome.effect)
             if (outcome.effect.tool === 'say') said = true
@@ -1746,7 +1823,6 @@ export default {
               if (op === 'say') {
                 const text = String(body.text || '').trim()
                 if (!text) return json(res, 400, { error: 'text required' })
-                if (text.length > 500) return json(res, 400, { error: '一次最多说 500 字喵' })
                 return json(res, 200, await masterSay(text))
               }
               if (op === 'selectModel') {
@@ -1813,7 +1889,9 @@ export {
   HEAR_THRESHOLDS,
   TURN_ORDER,
   topicKey,
+  topicPeers,
   matchTopic,
+  checkTopicAbout,
   topicOpenState,
   topicResolveSay,
   topicResolveAction,

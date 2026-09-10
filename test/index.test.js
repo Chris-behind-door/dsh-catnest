@@ -98,6 +98,46 @@ const toolOnceStub = (name, args) => ({
   },
 })
 
+// 角色限定工具桩：只有指定角色的回合调一次该工具，其余角色沉默。
+// 同房多角色场景（话题只在同房间开得起来）下用来精确控制「谁调工具」。
+const toolOnceForStub = (who, name, args) => ({
+  stream: (opts) => {
+    const mine = typeof opts.system === 'string' && opts.system.includes('家里的成员' + who)
+    const stop = !mine || hasAssistantToolCall(opts.messages)
+    return (async function* () {
+      if (stop) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_c', name }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify(args) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
+// 捕获桩：记录每次 llm.stream 的 system/messages，同时按角色限定调一次工具。
+// 用来验证「工具失败 → 回执真的回到模型手里」。
+const captureToolStub = (captured, who, name, args) => ({
+  stream: (opts) => {
+    captured.push({
+      system: typeof opts.system === 'string' ? opts.system : '',
+      messages: (Array.isArray(opts.messages) ? opts.messages : []).map((m) => ({ ...m })),
+    })
+    const mine = typeof opts.system === 'string' && opts.system.includes('家里的成员' + who)
+    const stop = !mine || hasAssistantToolCall(opts.messages)
+    return (async function* () {
+      if (stop) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_c', name }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify(args) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
 const PERSONAS_STUB = {
   list: async () => [
     { id: 'kyu', name: '小玖', description: '', companion: true },
@@ -1618,6 +1658,45 @@ test('say action：动作随台词入账、dialogue 透传、时间线同房可�
   }
 })
 
+test('隔墙话题：开完之后不限房间——卧室的墨璃看得见话题标记，也接得上', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-top3-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
+    await call('/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'living')
+    // 当面开话题（开门门禁要求同房间）
+    await svc.openTopic('kyu', '那盆花', '你看那盆花开了')
+    // 墨璃走回卧室（与客厅相邻）；小玖在客厅继续说这条线 → 墨璃只闻声
+    await svc.moveCharacter('moli', 'bedroom')
+    await svc.say('kyu', '花开得真好', undefined, '那盆花')
+    await svc.resolveTopicSay('kyu', '那盆花')
+    // 主人去卧室说话 → 墨璃被询问，她时间线里客厅那条线 = 闻声 + 话题标记
+    await svc.moveMaster('bedroom')
+    await call('/catnest/api/action', JSON.stringify({ op: 'say', text: '墨璃，过来一下' }))
+    await until(() => prompts.some((p) => p.system.includes('成员墨璃')))
+    const moliP = prompts.find((p) => p.system.includes('成员墨璃'))
+    assert.ok(
+      moliP.user.includes('（客厅传来小玖的声音：）（聊那盆花）花开得真好'),
+      '隔墙闻声也要带话题标记（否则接不上）: ' + moliP.user,
+    )
+    // 隔墙照样能接上这条线（开完不限房间）
+    await svc.say('moli', '我在卧室也听见了', undefined, '那盆花')
+    assert.equal((await svc.resolveTopicSay('moli', '那盆花')).matched, true)
+    assert.equal((await svc.home()).topics['那盆花'].turns, 3, '1 开 + 1 小玖续谈 + 1 墨璃隔墙接话')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
 // ── 调度层（SCHEDULING_DESIGN.md v1）──
 
 // 沉默桩（带 prompt 捕获）：记录每回合第一步的 system + 完整 user 文本（上下文断言用）
@@ -1879,15 +1958,16 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
 // ── 路 B §9（2026-09-05 三轮定稿）：topic 套件 / 放下锅铲 / T6 自主节奏 ──
 
 test('open_topic 工具接线：开话题 → topic-open 账本行 + 开场白 say 带 about + topics 状态', async () => {
-  const n = await setupNest(toolOnceStub('open_topic', { about: '那盆花', text: '你看那盆花开了' }))
+  const n = await setupNest(toolOnceForStub('小玖', 'open_topic', { about: '那盆花', text: '你看那盆花开了' }))
   try {
+    await n.svc.moveCharacter('moli', 'living') // 话题是姐妹之间同房间的工具，得让墨璃在场
     await n.h(
       fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖，我出门逛逛' })),
       fakeRes(),
     )
     await until(async () => {
       const topics = (await n.svc.home()).topics || {}
-      return topics['kyu|那盆花'] !== undefined
+      return topics['那盆花'] !== undefined
     })
     await until(async () => {
       const st = await n.svc.status()
@@ -1895,9 +1975,9 @@ test('open_topic 工具接线：开话题 → topic-open 账本行 + 开场白 s
       return log.some((e) => e.type === 'topic-open' && e.char === 'kyu')
     })
     const topics = (await n.svc.home()).topics
-    assert.equal(topics['kyu|那盆花'].openedBy, 'kyu')
-    assert.equal(topics['kyu|那盆花'].status, 'open')
-    assert.deepEqual(topics['kyu|那盆花'].participants, ['kyu'])
+    assert.equal(topics['那盆花'].openedBy, 'kyu')
+    assert.equal(topics['那盆花'].status, 'open')
+    assert.deepEqual(topics['那盆花'].participants, ['kyu', 'moli'], '同房间在场即参与')
     const st = await n.svc.status()
     const log = await readLog(n.dir, st.sliceId)
     const sayLine = log.find((e) => e.type === 'say' && e.who === 'kyu')
@@ -1909,19 +1989,20 @@ test('open_topic 工具接线：开话题 → topic-open 账本行 + 开场白 s
 })
 
 test('end_topic 工具接线：收话题 → topic-end 账本行 + 状态 closing；无参与话题报错', async () => {
-  const n = await setupNest(toolOnceStub('end_topic', { about: '那盆花', text: '那先聊到这' }))
+  const n = await setupNest(toolOnceForStub('小玖', 'end_topic', { about: '那盆花', text: '那先聊到这' }))
   try {
-    // 先手动建立话题并让墨璃加入
+    await n.svc.moveCharacter('moli', 'living')
+    // 先手动建立话题（墨璃在同房，开得起来；同房在场即参与，不需要再接话）
     await n.svc.openTopic('kyu', '那盆花', '你看那盆花开了')
     await n.svc.say('moli', '我想看看', undefined, '那盆花')
     await n.svc.resolveTopicSay('moli', '那盆花')
-    // 主人说话 → kyu 回合调 end_topic
+    // 主人说话 → 只有小玖的回合调 end_topic（墨璃的桩沉默，不跟着收）
     await n.h(
       fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我回来啦，聊什么呢' })),
       fakeRes(),
     )
     await until(async () => {
-      const x = ((await n.svc.home()).topics || {})['kyu|那盆花']
+      const x = ((await n.svc.home()).topics || {})['那盆花']
       return x && x.status === 'closing'
     })
     const st = await n.svc.status()
@@ -1932,6 +2013,55 @@ test('end_topic 工具接线：收话题 → topic-end 账本行 + 状态 closin
     assert.equal(endSay.about, '那盆花', '收尾句带 about')
     // 不存在的收话题：拒绝（lib 层抛错；execTool 兜底成 fail）
     await assert.rejects(() => n.svc.endTopic('kyu', '月亮'), /没有你参与的/)
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('say.about 硬校验：话题不存在 → 工具失败（回执带 Error 回到模型）、台词不入账', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-top2-'))
+  const ws = webServerStub()
+  const captured = []
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    llm: captureToolStub(captured, '小玖', 'say', { text: '那盆花开了', about: '不存在的线' }),
+  })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
+    await call('/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'bedroom')
+    await call('/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖在吗' }))
+    await until(() => captured.filter((c) => c.system.includes('成员小玖')).length >= 2)
+    const kyuSteps = captured.filter((c) => c.system.includes('成员小玖'))
+    const toolResult = JSON.stringify(kyuSteps[1].messages)
+    assert.ok(toolResult.includes('Error'), '失败回执回填给模型，当轮可纠正')
+    assert.ok(toolResult.includes('不存在的线'), toolResult.slice(0, 400))
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    assert.equal(log.some((e) => e.type === 'say' && e.who === 'kyu'), false, '非法 about 的台词不入账')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('open_topic 范围门禁：房间里没有别的猫娘 / to 指向不在同房的姐妹 → 都拒绝', async () => {
+  const n = await setupNest(silentStub)
+  try {
+    await n.svc.moveCharacter('kyu', 'living')
+    await n.svc.moveCharacter('moli', 'bedroom')
+    await assert.rejects(() => n.svc.openTopic('kyu', '那盆花', '你看那盆花开了'), /没有别的猫娘/)
+    await assert.rejects(() => n.svc.openTopic('kyu', '那盆花', '你看那盆花开了', 'moli'), /不在你所在的房间/)
+    // 墨璃回到同房：开得起来，to 指定的人进参与者
+    await n.svc.moveCharacter('moli', 'living')
+    const r = await n.svc.openTopic('kyu', '那盆花', '你看那盆花开了', '墨璃')
+    assert.equal(r.opened, true)
+    assert.deepEqual((await n.svc.home()).topics['那盆花'].participants, ['kyu', 'moli'])
   } finally {
     await rmSafe(n.dir)
   }
@@ -2042,3 +2172,110 @@ test('T6 门控：离家轻推（每 tick 至多一只）；睡觉/忙/刚说过
   }
 })
 
+
+// ── 回合末统一自查（2026-09-10 主人定案）──
+// 桩：第一步 say 一句「我先去书房…」，第二步沉默（模型把位移当台词说掉就收手），
+// 只有收到自查退回（messages 里出现「自查」）才补一次 move_to。
+const selfCheckMoveStub = (sayText, room) => {
+  let moved = false
+  return {
+    stream: (opts) => {
+      const msgs = (opts && opts.messages) || []
+      const called = hasAssistantToolCall(msgs)
+      const nudged = msgs.some(
+        (m) =>
+          Array.isArray(m.content) &&
+          m.content.some((b) => b.type === 'text' && typeof b.text === 'string' && b.text.includes('自查')),
+      )
+      return (async function* () {
+        if (!called) {
+          yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: sayText }) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        if (nudged && !moved) {
+          moved = true
+          yield { type: 'tool-call-delta', index: 0, id: 'call_2', name: 'move_to' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ room }) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+}
+
+test('回合末自查：说了去书房却没调 move_to → 退回补齐（已在账上的台词不撤）', async () => {
+  const n = await setupNest(selfCheckMoveStub('嗯嗯，姐姐慢慢说喵～小玖去书房把代码清干净，弄好了就回来！', '书房'))
+  try {
+    assert.equal((await n.svc.home()).characters.kyu.room, 'living')
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖先去书房等我吧' })),
+      fakeRes(),
+    )
+    await until(async () => (await n.svc.home()).characters.kyu.room === 'study')
+    const st = await n.svc.status()
+    const log = await readLog(n.dir, st.sliceId)
+    assert.equal(log.filter((e) => e.type === 'say' && e.who === 'kyu').length, 1, '台词只入账一次')
+    // setupNest 建场时也写过一条 move（living→living），这里只看真的挪去书房的那条
+    assert.equal(
+      log.filter((e) => e.type === 'move' && e.char === 'kyu' && e.to === 'study').length,
+      1,
+      '自查后补上一次移动去书房',
+    )
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('回合末自查：对别人说「你去书房」（无自称）不误伤，不退回不补步', async () => {
+  let calls = 0
+  const stub = {
+    stream: (opts) => {
+      calls++
+      const called = hasAssistantToolCall((opts && opts.messages) || [])
+      return (async function* () {
+        if (!called) {
+          yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+          yield {
+            type: 'tool-call-delta',
+            index: 0,
+            argumentsDelta: JSON.stringify({ text: '主人你去书房看看吧，那儿安静' }),
+          }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const n = await setupNest(stub)
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖在吗' })),
+      fakeRes(),
+    )
+    await until(async () => calls >= 2)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(calls, 2, 'say 一步 + 收手一步，没有第三条自查退回')
+    assert.equal((await n.svc.home()).characters.kyu.room, 'living', '位置不变')
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('主人说话不再有 500 字上限（2026-09-10 定案下掉）', async () => {
+  const n = await setupNest(silentStub)
+  try {
+    const long = '喵'.repeat(1200)
+    const res = fakeRes()
+    await n.h(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: long })), res)
+    assert.equal(res.code, 200, '超长消息照常入账：' + String(res.body))
+    const t = await n.svc.transcript()
+    assert.ok(t.lines.some((l) => l.type === 'say' && l.who === 'master' && l.rawText === long))
+  } finally {
+    await rmSafe(n.dir)
+  }
+})

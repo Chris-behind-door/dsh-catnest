@@ -32,13 +32,16 @@ import {
   advanceConditions,
   CONDITION_TYPES,
   topicKey,
+  topicPeers,
   matchTopic,
+  checkTopicAbout,
   topicOpenState,
   topicResolveSay,
   topicResolveAction,
   topicEndState,
   topicExpire,
   TOPIC_SILENCE_TIMEOUT_MS,
+  detectMoveIntent,
 } from '../lib.js'
 
 const FIXED = new Date('2026-08-22T11:00:00+08:00')
@@ -996,7 +999,7 @@ function dir0(nest) {
 
 // ── 路 B §9：话题 / 放下锅铲 / 隔墙动静（2026-09-05 三轮定稿）──
 
-test('topic 纯函数：open→幂等→join→续谈→propose→否决(reopen)→动作接受→沉默自动收', () => {
+test('topic 纯函数：open（在场即参与）→幂等→续谈→propose→显式否决→动作接受→沉默自动收', () => {
   const now = (ms) => new Date(FIXED.getTime() + ms)
   const home = {
     rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
@@ -1006,41 +1009,42 @@ test('topic 纯函数：open→幂等→join→续谈→propose→否决(reopen)
     },
     topics: {},
   }
-  // 小玖开启「那盆花」
+  // 小玖开启「那盆花」：身份＝房间|短语，同房间的姐妹在场即参与
   const r1 = topicOpenState(home, now(0), 'kyu', '那盆花')
   assert.equal(r1.opened, true)
-  assert.equal(r1.key, topicKey('kyu', '那盆花'))
-  let x = home.topics[r1.key]
+  assert.equal(r1.reopened, false)
+  assert.equal(r1.key, topicKey('那盆花'))
+  const x = home.topics[r1.key]
   assert.equal(x.status, 'open')
-  assert.deepEqual(x.participants, ['kyu'])
+  assert.deepEqual(x.participants, ['kyu', 'moli'], '在场即参与')
   assert.equal(x.turns, 1)
-  // 同人同短语重复提起＝幂等更新（不重置参与方/轮数）
+  // 同人同短语重复提起＝幂等续谈（不重置参与方，轮数 +1）
   const r1b = topicOpenState(home, now(60000), 'kyu', '那盆花')
   assert.equal(r1b.opened, false)
-  assert.equal(r1b.key, r1.key)
-  assert.deepEqual(x.participants, ['kyu'])
-  assert.equal(x.turns, 2)
-  // 墨璃带 about 接话 → join
-  const r2 = topicResolveSay(home, now(120000), 'moli', '那盆花')
-  assert.equal(r2.verdict, 'join')
-  assert.equal(r2.joined, true)
+  assert.equal(r1b.reopened, false)
   assert.deepEqual(x.participants, ['kyu', 'moli'])
+  assert.equal(x.turns, 2)
+  // 参与方续谈：轮数 +1（在场即参与，所以不是 join）
+  const r2 = topicResolveSay(home, now(120000), 'moli', '那盆花')
+  assert.equal(r2.verdict, null)
+  assert.equal(r2.joined, false)
   assert.equal(x.turns, 3)
-  // 参与方续谈：轮数 +1，无新行
-  const r3 = topicResolveSay(home, now(180000), 'moli', '那盆花')
-  assert.equal(r3.verdict, null)
-  assert.equal(r3.matched, true)
-  assert.equal(x.turns, 4)
   // 小玖提议收掉 → closing（endedBy=提议人）
-  const r4 = topicEndState(home, now(240000), 'kyu', '那盆花')
-  assert.equal(r4.verdict, 'propose')
+  const r3 = topicEndState(home, now(180000), 'kyu', '那盆花')
+  assert.equal(r3.verdict, 'propose')
   assert.equal(x.status, 'closing')
   assert.equal(x.endedBy, 'kyu')
-  // 墨璃（另一参与方）说解析到 X 的话 → 否决回 open（reopen）
-  const r5 = topicResolveSay(home, now(300000), 'moli', '那盆花')
-  assert.equal(r5.verdict, 'reopen')
+  // 墨璃继续说这条线：只算续谈，不再当否决（状态保持 closing）
+  const r4 = topicResolveSay(home, now(240000), 'moli', '那盆花')
+  assert.equal(r4.verdict, null)
+  assert.equal(x.status, 'closing')
+  assert.equal(x.turns, 4)
+  // 显式否决：墨璃用 open_topic 重提同名 → 拉回 open
+  const r5 = topicOpenState(home, now(300000), 'moli', '那盆花')
+  assert.equal(r5.opened, false)
+  assert.equal(r5.reopened, true)
   assert.equal(x.status, 'open')
-  assert.equal(x.turns, 5, '1 开 + 1 幂等 + 1 加入 + 1 续谈 + 1 否决')
+  assert.equal(x.endedBy, undefined)
   // 小玖再提收 → closing；墨璃去做事（非说话动作）→ 裁决接受 ended
   topicEndState(home, now(360000), 'kyu', '那盆花')
   assert.equal(x.status, 'closing')
@@ -1048,19 +1052,88 @@ test('topic 纯函数：open→幂等→join→续谈→propose→否决(reopen)
   assert.equal(r6.accepted.length, 1)
   assert.equal(x.status, 'ended')
   assert.equal(x.endedBy, 'moli')
+  // 已 ended 的同名话题再开：新生命周期（重置轮次，不复用旧壳）
+  const r7 = topicOpenState(home, now(480000), 'kyu', '那盆花')
+  assert.equal(r7.opened, true)
+  assert.equal(r7.topic.turns, 1)
+  assert.notEqual(r7.topic, x, 'ended 的旧壳不复用')
+  assert.equal(x.status, 'ended', '旧壳仍是 ended')
   // 沉默自动收：新话题 10 分钟无 mention → endedBy='silence'
-  const r7 = topicOpenState(home, now(480000), 'kyu', '今晚吃什么')
-  const y = home.topics[r7.key]
-  const early = topicExpire(home, now(480000 + 9 * 60000))
+  const r8 = topicOpenState(home, now(540000), 'kyu', '今晚吃什么')
+  const y = home.topics[r8.key]
+  const early = topicExpire(home, now(540000 + 9 * 60000))
   assert.equal(early.length, 0, '9 分钟未到不收')
-  const expired = topicExpire(home, now(480000 + 11 * 60000))
-  assert.equal(expired.length, 1)
-  assert.equal(expired[0].about, '今晚吃什么')
-  assert.equal(expired[0].endedBy, 'silence')
+  const expired = topicExpire(home, now(540000 + 11 * 60000))
+  assert.ok(expired.some((e) => e.about === '今晚吃什么'))
   assert.equal(y.status, 'ended')
+  assert.equal(y.endedBy, 'silence')
 })
 
-test('matchTopic：完全相等优先；room 唯一话题且参与方带 about 才解析；双话题不解析', () => {
+test('topic 门禁（2026-09-10）：开门要当面；开完不限房间；对方不在身边就直收；硬校验', () => {
+  const now = (ms) => new Date(FIXED.getTime() + ms)
+  const mkHome = (moliRoom = 'living') => ({
+    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+    characters: {
+      kyu: { id: 'kyu', name: '小玖', room: 'living' },
+      moli: { id: 'moli', name: '墨璃', room: moliRoom },
+    },
+    topics: {},
+  })
+
+  // ① 身边没人时收话题：直接 ended（solo），不挂 closing 干等
+  const solo = mkHome('bedroom')
+  const s1 = topicOpenState(solo, now(0), 'kyu', '自言自语') // 纯函数不拦，服务层拦「开门要当面」
+  assert.deepEqual(solo.topics[s1.key].participants, ['kyu'])
+  assert.equal(topicEndState(solo, now(60000), 'kyu', '自言自语').verdict, 'solo')
+  assert.equal(solo.topics[s1.key].status, 'ended')
+
+  // ② 开完之后不限房间：墨璃走到厨房照样能接话
+  const h = mkHome()
+  topicOpenState(h, now(0), 'kyu', '那盆花')
+  h.characters.moli.room = 'kitchen'
+  assert.ok(matchTopic(h, 'moli', '那盆花'), '开完不限房间：照样匹配')
+  assert.ok(checkTopicAbout(h, 'moli', '那盆花').topic, '开完不限房间：照样合法')
+  assert.equal(topicResolveSay(h, now(60000), 'moli', '那盆花').matched, true)
+  assert.equal(h.topics[topicKey('那盆花')].turns, 2, '隔墙续谈也计轮次')
+  // 但收话题：对方不在身边（小玖在客厅、墨璃在厨房）→ 小玖提收直接 ended
+  assert.equal(topicEndState(h, now(120000), 'kyu', '那盆花').verdict, 'solo')
+  assert.equal(h.topics[topicKey('那盆花')].status, 'ended')
+
+  // ③ 裁决要求当面：提议人走到别的房间时，对方的动作不算裁决
+  const h2 = mkHome()
+  topicOpenState(h2, now(0), 'kyu', '那盆花')
+  assert.equal(topicEndState(h2, now(60000), 'kyu', '那盆花').verdict, 'propose', '墨璃在身边 → closing')
+  assert.equal(h2.topics[topicKey('那盆花')].status, 'closing')
+  h2.characters.kyu.room = 'study' // 提议人走开
+  assert.equal(topicResolveAction(h2, now(120000), 'moli').accepted.length, 0, '提议人不在身边，动作不算裁决')
+  h2.characters.kyu.room = 'living' // 提议人回来
+  assert.equal(topicResolveAction(h2, now(180000), 'moli').accepted.length, 1, '当面才裁决')
+  assert.equal(h2.topics[topicKey('那盆花')].status, 'ended')
+
+  // ④ checkTopicAbout：不存在 / 已收掉
+  assert.match(checkTopicAbout(h2, 'kyu', '月亮').error, /不存在/)
+  assert.match(checkTopicAbout(h2, 'kyu', '那盆花').error, /不存在/, 'ended 的话题不再合法')
+
+  // ⑤ 全屋同名唯一：两边谁提都是同一条线
+  const h3 = mkHome()
+  const a1 = topicOpenState(h3, now(0), 'kyu', '那盆花')
+  h3.characters.kyu.room = 'kitchen'
+  const a2 = topicOpenState(h3, now(60000), 'moli', '那盆花')
+  assert.equal(a2.key, a1.key, '全屋同名唯一')
+  assert.equal(Object.keys(h3.topics).length, 1)
+  topicOpenState(h3, now(120000), 'moli', '月亮')
+  assert.equal(Object.keys(h3.topics).length, 2)
+
+  // ⑥ topicPeers：同房间的姐妹；to 指定时只取那一位
+  h3.characters.kyu.room = 'living'
+  assert.deepEqual(topicPeers(h3, 'moli', null), ['kyu'])
+  assert.deepEqual(topicPeers(h3, 'moli', 'kyu'), ['kyu'])
+  assert.deepEqual(topicPeers(h3, 'moli', 'zhua'), [])
+  h3.characters.kyu.room = 'kitchen'
+  assert.deepEqual(topicPeers(h3, 'moli', null), [], '不在同一个房间 → 没有 peer')
+})
+
+test('matchTopic：全屋唯一 + 短语完全相等（不限房间；旧「房间唯一话题吸附」兜底已删）', () => {
   const home = {
     rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
     characters: {
@@ -1070,17 +1143,17 @@ test('matchTopic：完全相等优先；room 唯一话题且参与方带 about �
     topics: {},
   }
   const r1 = topicOpenState(home, FIXED, 'kyu', '那盆花')
-  // 完全相等（未参与也命中：一句带 about 的接话即加入）
+  // 完全相等 → 命中（未参与也命中：一句带 about 的接话即加入）
   assert.equal(matchTopic(home, 'moli', '那盆花'), home.topics[r1.key])
-  // 不等且墨璃未参与：room 唯一但非参与方 → 不解析
+  // 不等短语：不再按「房间唯一话题」吸附
   assert.equal(matchTopic(home, 'moli', '花'), null)
-  // 墨璃加入后再带泛化短语：room 唯一 + 参与方 → 解析
-  topicResolveSay(home, FIXED, 'moli', '那盆花')
-  assert.equal(matchTopic(home, 'moli', '花'), home.topics[r1.key])
-  // 同房两个话题：不唯一 → 泛化短语不解析
-  const r2 = topicOpenState(home, FIXED, 'moli', '月亮')
-  assert.equal(matchTopic(home, 'kyu', '花'), null)
-  assert.equal(home.topics[r2.key].about, '月亮')
+  assert.equal(matchTopic(home, 'moli', '月亮'), null)
+  // 开完之后不限房间：人走到别处照样匹配
+  home.characters.moli.room = 'bedroom'
+  assert.equal(matchTopic(home, 'moli', '那盆花'), home.topics[r1.key])
+  // 收掉的话题不再匹配
+  home.topics[r1.key].status = 'ended'
+  assert.equal(matchTopic(home, 'kyu', '那盆花'), null)
 })
 
 test('topic 裁决边界：提议人自己说话不算裁决；双收直接 ended；非参与方不能收', () => {
@@ -1152,10 +1225,10 @@ test('话题片内作用域：open 清空旧话题；片内进程重启（不开
     await nest.open()
     const r = await nest.openTopic('kyu', '那盆花', '你看那盆花开了')
     assert.equal(r.opened, true)
-    assert.ok((await nest.home()).topics[topicKey('kyu', '那盆花')])
+    assert.ok((await nest.home()).topics[topicKey('那盆花')])
     // 片内重启：新实例读同一目录，话题留存（进程在片内重启不丢）
     const nest2 = new CatNest(dir, { now: fixedNow })
-    assert.ok((await nest2.home()).topics[topicKey('kyu', '那盆花')], '片内重启话题留存')
+    assert.ok((await nest2.home()).topics[topicKey('那盆花')], '片内重启话题留存')
     await nest2.close()
     // 新片 open：话题清空
     const opened = await nest.open()
@@ -1253,42 +1326,55 @@ test('openTopic/endTopic/resolveTopicSay 方法：账本行与状态一致（含
   const { nest, cleanup } = await mk()
   try {
     await nest.open()
+    const KEY = topicKey('那盆花')
     const r1 = await nest.openTopic('kyu', '那盆花', '你看那盆花开了')
     assert.equal(r1.opened, true)
+    assert.equal(r1.reopened, false)
     let t = await nest.transcript()
     assert.ok(t.lines.some((l) => l.type === 'topic-open' && l.about === '那盆花' && l.char === 'kyu'), 'topic-open 行入账')
     const say1 = t.lines.find((l) => l.type === 'say' && l.who === 'kyu')
     assert.equal(say1.about, '那盆花', '开场白 say 带 about')
-    // 墨璃接话（带 about）→ join + topic-join 行
+    assert.deepEqual((await nest.home()).topics[KEY].participants, ['kyu', 'moli'], '同房间在场即参与')
+    // 墨璃带 about 接话：她已在参与方里 → 续谈（不再产生 topic-join）
     await nest.say('moli', '我也想看', undefined, '那盆花')
     const r2 = await nest.resolveTopicSay('moli', '那盆花')
-    assert.equal(r2.verdict, 'join')
-    t = await nest.transcript()
-    assert.ok(t.lines.some((l) => l.type === 'topic-join' && l.char === 'moli' && l.about === '那盆花'))
+    assert.equal(r2.verdict, null)
+    assert.equal((await nest.home()).topics[KEY].turns, 2)
     // 小玖收话题（带收尾句）→ topic-end 行 + 带 about 的收尾 say
     const r3 = await nest.endTopic('kyu', '那盆花', '那先聊到这')
     assert.equal(r3.verdict, 'propose')
-    const x = (await nest.home()).topics[topicKey('kyu', '那盆花')]
-    assert.equal(x.status, 'closing')
+    assert.equal((await nest.home()).topics[KEY].status, 'closing')
     t = await nest.transcript()
     assert.ok(t.lines.some((l) => l.type === 'topic-end' && l.about === '那盆花'))
     const sayEnd = t.lines.find((l) => l.type === 'say' && l.who === 'kyu' && l.rawText === '那先聊到这')
     assert.equal(sayEnd.about, '那盆花')
-    // 墨璃否决（带 about 接 X）→ topic-reopen 行 + 状态回 open
+    // 墨璃继续说这条线：只算续谈，状态保持 closing（否决必须显式）
     await nest.say('moli', '等等还没说完', undefined, '那盆花')
     const r4 = await nest.resolveTopicSay('moli', '那盆花')
-    assert.equal(r4.verdict, 'reopen')
-    assert.equal((await nest.home()).topics[topicKey('kyu', '那盆花')].status, 'open')
+    assert.equal(r4.verdict, null)
+    assert.equal((await nest.home()).topics[KEY].status, 'closing')
+    // 显式否决：墨璃用 open_topic 重提同名 → topic-reopen 行 + 状态回 open
+    const r5 = await nest.openTopic('moli', '那盆花', '等等，我还没说完呢')
+    assert.equal(r5.reopened, true)
+    assert.equal(r5.opened, false)
+    assert.equal((await nest.home()).topics[KEY].status, 'open')
     t = await nest.transcript()
-    assert.ok(t.lines.some((l) => l.type === 'topic-reopen' && l.char === 'moli'))
+    assert.ok(t.lines.some((l) => l.type === 'topic-reopen' && l.char === 'moli'), 'topic-reopen 行入账')
     // 再收 → 墨璃非说话动作 → 接受 ended
     await nest.endTopic('kyu', '那盆花')
-    const r5 = await nest.resolveTopicAction('moli')
-    assert.equal(r5.accepted.length, 1)
-    assert.equal((await nest.home()).topics[topicKey('kyu', '那盆花')].status, 'ended')
+    const r6 = await nest.resolveTopicAction('moli')
+    assert.equal(r6.accepted.length, 1)
+    assert.equal((await nest.home()).topics[KEY].status, 'ended')
     // expireTopics：无 closing/open 话题时静默
-    const r6 = await nest.expireTopics()
-    assert.deepEqual(r6.expired, [])
+    const r7 = await nest.expireTopics()
+    assert.deepEqual(r7.expired, [])
+    // 服务层 about 硬校验：游离短语进不了账本（工具层之外的第二道闸）
+    await assert.rejects(() => nest.say('moli', '嗯', undefined, '窗外那棵树'), /不存在/)
+    const before = (await nest.transcript()).lines.filter((l) => l.type === 'say').length
+    await assert.rejects(() => nest.say('moli', '嗯', undefined, '窗外那棵树'), /不存在/)
+    assert.equal((await nest.transcript()).lines.filter((l) => l.type === 'say').length, before, '被拒的 say 不入账')
+    // 已收掉的话题也不能再带
+    await assert.rejects(() => nest.say('moli', '嗯', undefined, '那盆花'), /不存在/)
   } finally {
     await cleanup()
   }
@@ -1318,4 +1404,31 @@ test('sliceEventsText：topic 行 + say.about 渲染进家史', () => {
   assert.ok(lines.some((l) => l === '小玖提议收掉话题：那盆花'), lines.join('|'))
   assert.ok(lines.some((l) => l === '墨璃：这个还要聊'), lines.join('|'))
   assert.ok(lines.some((l) => l === '墨璃放下了手里的活（做饭）'), lines.join('|'))
+})
+
+test('detectMoveIntent：认出台词里的位移意图，且不误伤对别人说的话', () => {
+  const home = {
+    rooms: DEFAULT_ROOMS,
+    characters: { kyu: { id: 'kyu', name: '小玖', room: 'bedroom' } },
+  }
+  const hit = (text, action, h = home) => {
+    const r = detectMoveIntent(text, action, h, 'kyu')
+    return r ? r.name : null
+  }
+  // 命中：自称 + 紧邻房间名的去向动词（2026-09-10 片里三次漏网的同款句子）
+  assert.equal(hit('主人你等下，小玖去书房把那个代码清干净，弄好了再回来陪你俩！'), '书房')
+  assert.equal(hit('好啦好啦，小玖去书房把代码清干净了就来！'), '书房')
+  assert.equal(hit('那我先回客厅了喵'), '客厅')
+  assert.equal(hit('', '从床上蹦起来，我去厨房看看'), '厨房', 'action 里的位移同样算')
+  // 漏网也无妨的反例：不是第一人称、动词不紧邻房间名、已经在那个房间
+  assert.equal(hit('主人你去书房看看吧，那儿安静'), null, '对别人说不算自己的位移')
+  assert.equal(hit('我去给你拿书房里的那本书'), null, '动词不紧邻房间名不算')
+  assert.equal(hit('我回卧室了'), null, '已经在的房间不算「去」')
+  assert.equal(hit('书房里好安静'), null, '没动词不算')
+  // 房间列表来自 home（主人手改 home.json 增删房间也跟着走）
+  const custom = {
+    rooms: [{ id: 'attic', name: '阁楼' }],
+    characters: { kyu: { id: 'kyu', name: '小玖', room: 'bedroom' } },
+  }
+  assert.equal(hit('我去阁楼找找看', null, custom), '阁楼')
 })

@@ -308,89 +308,155 @@ export function charName(home, id) {
   return (home.characters && home.characters[id] && home.characters[id].name) || CHARACTER_NAMES[id] || String(id)
 }
 
-// ── 话题（topic）状态纯函数（路 B §9.2，2026-09-05 三轮定稿）──
-// home.topics = { [openedBy + '|' + about]: { about, room, openedBy, to?, participants,
+// ── 回合末一致性自查：台词里的位移意图（2026-09-10 主人定案）──
+// 病：模型常把「我这就去书房」当台词说掉，move_to 一次没调，于是账本里她走了、
+// 家里她还在原地（2026-09-10 片里三次全中）。这里只做一件事：从本轮自己说出口的
+// text/action 里认出「我要去某个别的房间」的意图，交给工具循环退回补齐。
+// 判定：房间名 + 紧邻它之前的去向动词 + 同一小窗口里的自称。「主人你去书房吧」
+// 不中（无自称），「我去给你拿书房里的书」不中（动词不紧邻房间名）。残余误判长这样：
+// 「我把书放回书房了」（放回，不是过去）——由退回文案里的「随口说说就不用调」兜住，
+// 代价是一次多余的模型步；反过来漏判的代价是人在原地却说走了，比误判贵。
+const MOVE_TAIL_RE = /(去|回|进|走去|过去|跑去|冲去|走过去|挪)(了|到|来)?$/
+const SELF_WORDS = ['我', '自己', '人家', '咱']
+export function detectMoveIntent(text, action, home, selfId) {
+  const t = typeof text === 'string' ? text : ''
+  const a = typeof action === 'string' ? action : ''
+  const blob = (t + ' ' + a).trim()
+  if (!blob) return null
+  const rooms = home && Array.isArray(home.rooms) ? home.rooms : []
+  const ch = (home && home.characters && home.characters[selfId]) || {}
+  const selfWords = SELF_WORDS.concat([ch.name, selfId].filter(Boolean))
+  for (const room of rooms) {
+    if (!room || !room.name || room.id === ch.room) continue // 已经在的房间不算「去」
+    let idx = blob.indexOf(room.name)
+    while (idx >= 0) {
+      const tail = blob.slice(Math.max(0, idx - 8), idx)
+      if (MOVE_TAIL_RE.test(tail) && selfWords.some((w) => tail.includes(w))) return room
+      idx = blob.indexOf(room.name, idx + 1)
+    }
+  }
+  return null
+}
+
+// ── 话题（topic）状态纯函数（路 B §9.2；2026-09-10 门禁收紧）──
+// 范围：姐妹之间的辅助工具，全屋唯一一条线（主人不走话题）。开话题必须在同一个房间里
+// 当面提（开场白要被对方真切听到）；开完之后不再限制房间，走去别的房间照样能接话。
+// home.topics = { [about]: { about, room, openedBy, to?, participants,
 //   openedAt, lastTurnAt, turns, status: 'open'|'closing'|'ended', endedBy?, endedAt? } }
-// status 流转：open →（end_topic 提议）closing →（另一参与方裁决 / 沉默兜底）ended；
-// 裁决否决（对方继续说 X）回 open。话题是片内作用域（nest.open 清空；片内进程重启不丢）。
-// 一轮 = 一条解析到 X 的 say；账本行只记 open/join/end/reopen，接受/沉默收尾无独立行。
+// room 只记「在哪儿聊起来的」（信息字段，不参与门禁）。status 流转：open →（end_topic 提议）
+// closing →（另一参与方当面裁决 / 沉默兜底）ended；closing 中对方用 open_topic 重提同名
+// ＝否决回 open（显式动作，不再靠「继续说」推断）。话题是片内作用域（nest.open 清空；
+// 片内进程重启不丢）。一轮 = 一条解析到 X 的 say；账本行只记 open/join/end/reopen。
 
 // 收话题沉默超时（tick 兜底）：自最后一条 mention 起 10 分钟无人对 X 说话 → 沉默自动收
 export const TOPIC_SILENCE_TIMEOUT_MS = 10 * 60000
 // 活动隔墙动静「持续中」补条间隔（§9.5）：每 10min tick 补一条，同窗不重复
 export const AMBIENT_REPEAT_MS = 10 * 60000
 
-export function topicKey(charId, about) {
-  return charId + '|' + about
+export function topicKey(about) {
+  return String(about)
 }
 
-// 匹配规则（「解析到 X」）：about 完全相等优先；否则 X 是 X.room 里唯一话题 且
-// 说话人是参与方 且这次 say 带 about。拿不准按不解析（保守，可用精确短语消歧）。
+// 话题的天然参与方（§9.2 开门门禁）：同一个房间里的其他猫娘；to 指定时只取那一位。
+// 开话题必须当面提——房间里没有别的猫娘时开不起来（服务层拦截）。
+export function topicPeers(home, charId, to) {
+  const me = home && home.characters ? home.characters[charId] : null
+  const room = me ? me.room : null
+  if (!room) return []
+  const out = []
+  for (const [id, ch] of Object.entries((home && home.characters) || {})) {
+    if (!ch || id === charId) continue
+    if (ch.room !== room) continue
+    if (to && id !== to) continue
+    out.push(id)
+  }
+  return out
+}
+
+// 匹配规则（§9.2 硬校验版）：全屋唯一，短语完全相等即命中（不限房间：开完就不限）。
+// 旧版的「房间唯一话题就吸附」兜底已删除：它会把不相干的发言吸进陈年话题。
 export function matchTopic(home, charId, about) {
-  const topics = home && home.topics ? home.topics : {}
-  const list = Object.values(topics).filter((x) => x && x.status !== 'ended')
   const a = typeof about === 'string' ? about.trim() : ''
-  if (!a || list.length === 0) return null
-  const exact = list.filter((x) => x.about === a)
-  if (exact.length > 0) {
-    return exact.sort((p, q) => String(q.lastTurnAt || '').localeCompare(String(p.lastTurnAt || '')))[0]
-  }
-  const ch = home.characters && home.characters[charId]
-  const myRoom = ch ? ch.room : null
-  const inRoom = myRoom ? list.filter((x) => x.room === myRoom) : []
-  if (inRoom.length === 1) {
-    const x = inRoom[0]
-    if (Array.isArray(x.participants) && x.participants.includes(charId)) return x
-  }
-  return null
+  if (!a) return null
+  const x = (home && home.topics ? home.topics : {})[topicKey(a)]
+  if (!x || x.status === 'ended') return null
+  return x
 }
 
-// 开启话题（幂等）：同人同短语重复提起＝幂等更新（不重置参与方/轮次，只刷新现场）。
-// 返回 { key, opened, topic }；opened=false 表示更新的是既有话题。
+// 带 about 的 say 硬校验（§9.2）：话题必须存在且未收掉。
+// 返回 { topic } 合法；{ error } 不合法，error 是人话原因（进工具回执，供模型当轮纠正）。
+export function checkTopicAbout(home, charId, about) {
+  const a = typeof about === 'string' ? about.trim() : ''
+  if (!a) return { topic: null }
+  const x = (home && home.topics ? home.topics : {})[topicKey(a)]
+  if (!x || x.status === 'ended') {
+    return { error: '话题「' + a + '」不存在。想聊新的用 open_topic；随口一句不用带 about。' }
+  }
+  return { topic: x }
+}
+
+// 开启话题（§9.2 门禁表）：全屋同名唯一。
+//   · 不存在 / 已 ended → 新建（ended 的旧壳不复用，重置开启时间与轮次）
+//   · 已 open           → 幂等续谈（合并参与方、刷新轮次）
+//   · 已 closing        → 拉回 open（显式否决：「还想聊」）
+// 返回 { key, opened, reopened, topic }。
 export function topicOpenState(home, now, charId, about, to) {
   const topics = home.topics || (home.topics = {})
   const a = String(about).trim()
-  const key = topicKey(charId, a)
   const t = now instanceof Date ? now.getTime() : Date.now()
-  const ch = home.characters && home.characters[charId]
-  const room = ch ? ch.room : null
+  const me = home.characters && home.characters[charId]
+  const room = me ? me.room : null
+  const key = topicKey(a)
+  const roster = [charId, ...topicPeers(home, charId, to || null)]
   const existing = topics[key]
-  if (existing) {
-    existing.room = room
+  if (existing && existing.status !== 'ended') {
+    const wasClosing = existing.status === 'closing'
+    existing.status = 'open'
+    delete existing.endedBy
+    delete existing.endedAt
     existing.lastTurnAt = new Date(t).toISOString()
     existing.turns = (existing.turns || 0) + 1
-    return { key, opened: false, topic: existing }
+    const parts = Array.isArray(existing.participants) ? existing.participants.slice() : []
+    for (const id of roster) if (!parts.includes(id)) parts.push(id)
+    existing.participants = parts
+    return { key, opened: false, reopened: wasClosing, topic: existing }
   }
   const topic = {
     about: a,
     room,
     openedBy: charId,
     ...(to ? { to } : {}),
-    participants: [charId],
+    participants: [...new Set(roster)],
     openedAt: new Date(t).toISOString(),
     lastTurnAt: new Date(t).toISOString(),
     turns: 1,
     status: 'open',
   }
   topics[key] = topic
-  return { key, opened: true, topic }
+  return { key, opened: true, reopened: false, topic }
 }
 
-// 一次 say 后的话题账：裁决（closing 中另一参与方说话→否决，其他动作/不解析→接受）+
-// 加入（open 中非参与方第一条解析到 X 的 say）+ 续谈（参与方轮数 +1）。
-// 返回 { matched, key, verdict: null|'reopen'|'join', joined, accepted:[话题] }
+// 一次 say 后的话题账（§9.2 硬校验版）：裁决接受 + 加入 + 续谈。
+// 否决不再由「继续说」推断：想挽留的人用 open_topic 重提同名（见 topicOpenState）。
+// 只处理「说话人当前所在房间」的话题：离场即够不着，不裁决别处的线。
+// 返回 { matched, key, verdict: null|'join', joined, accepted:[话题] }
 // accepted=本次说话顺带裁决收掉的话题（无独立账本行，仅状态，供测试观察）。
 export function topicResolveSay(home, now, charId, about) {
   const topics = home.topics || {}
   const t = now instanceof Date ? now.getTime() : Date.now()
+  const me = home.characters && home.characters[charId]
+  const myRoom = me ? me.room : null
   const accepted = []
   const mx = matchTopic(home, charId, about)
-  // 1) 裁决接受：参与中的 closing 话题，除解析到 X 的（→ 下面否决），其余接受收掉
+  // 1) 裁决接受：参与中的 closing 话题，除解析到 X 的（她还在说这条线），其余收掉。
+  //    要求提议人就在我身边：当面才能回应，隔着墙的动作不算裁决。
   for (const x of Object.values(topics)) {
     if (!x || x.status !== 'closing') continue
     if (x.endedBy === charId) continue // 提议人自己不动自己的话题
     if (!Array.isArray(x.participants) || !x.participants.includes(charId)) continue
-    if (mx === x) continue // 说得正起劲 → 否决，算继续聊
+    if (mx === x) continue // 还在说这条线 → 不算接受（话题继续挂着，等沉默收）
+    const proposer = x.endedBy ? home.characters && home.characters[x.endedBy] : null
+    if (!proposer || proposer.room !== myRoom) continue // 提议人不在我这儿，谈不上当面回应
     x.status = 'ended'
     x.endedBy = charId
     x.endedAt = new Date(t).toISOString()
@@ -398,21 +464,14 @@ export function topicResolveSay(home, now, charId, about) {
   }
   if (!mx) return { matched: false, key: null, verdict: null, joined: false, accepted }
   const key = Object.keys(topics).find((k) => topics[k] === mx)
-  // 2) 否决：另一参与方在 closing 中说了解析到 X 的内容 → 回 open（reopen 账本行）
-  if (mx.status === 'closing' && mx.endedBy !== charId && Array.isArray(mx.participants) && mx.participants.includes(charId)) {
-    mx.status = 'open'
-    mx.turns = (mx.turns || 0) + 1
-    mx.lastTurnAt = new Date(t).toISOString()
-    return { matched: true, key, verdict: 'reopen', joined: false, accepted }
-  }
-  // 3) 加入：open 话题里非参与方第一条解析到 X 的 say（topic-join 账本行）
+  // 2) 加入：open 话题里非参与方第一条解析到 X 的 say（topic-join 账本行）
   if (mx.status === 'open' && !(Array.isArray(mx.participants) && mx.participants.includes(charId))) {
     mx.participants = [...(mx.participants || []), charId]
     mx.turns = (mx.turns || 0) + 1
     mx.lastTurnAt = new Date(t).toISOString()
     return { matched: true, key, verdict: 'join', joined: true, accepted }
   }
-  // 4) 续谈：参与者（或 closing 中提议人自己再说）轮数 +1；非参与方提到不算
+  // 3) 续谈：参与方轮数 +1（closing 中说话也只是续谈，不改状态；挽留走 open_topic）
   if (Array.isArray(mx.participants) && mx.participants.includes(charId)) {
     mx.turns = (mx.turns || 0) + 1
     mx.lastTurnAt = new Date(t).toISOString()
@@ -422,14 +481,19 @@ export function topicResolveSay(home, now, charId, about) {
 
 // 一次非说话动作后的话题账：参与中的 closing 话题 → 裁决接受（ended）。
 // （B 做了 do_activity/move_to/set_condition 等 → 接受；无独立账本行，仅状态）
+// 同样要求提议人在身边：隔墙的动作不算当面回应。
 export function topicResolveAction(home, now, charId) {
   const topics = home.topics || {}
   const t = now instanceof Date ? now.getTime() : Date.now()
+  const me = home.characters && home.characters[charId]
+  const myRoom = me ? me.room : null
   const accepted = []
   for (const x of Object.values(topics)) {
     if (!x || x.status !== 'closing') continue
     if (x.endedBy === charId) continue
     if (!Array.isArray(x.participants) || !x.participants.includes(charId)) continue
+    const proposer = x.endedBy ? home.characters && home.characters[x.endedBy] : null
+    if (!proposer || proposer.room !== myRoom) continue // 提议人不在我这儿，谈不上当面回应
     x.status = 'ended'
     x.endedBy = charId
     x.endedAt = new Date(t).toISOString()
@@ -438,46 +502,47 @@ export function topicResolveAction(home, now, charId) {
   return { accepted }
 }
 
-// end_topic：open → closing（提议收掉）；另一参与方在 closing 中再 end → 双收（ended）。
-// 只允许话题参与方调用。end_topic 是精确动作（要收哪个说哪个）：只匹配 about 完全相等。
-// 返回 { key, verdict: 'propose'|'accepted'|null }；找不到返回 key:null。
+// end_topic：open → closing（提议收掉）；另一参与方在 closing 中再 end → 双收（ended）；
+// 身边没有别的参与方（一个人开的，或者对方走到别的房间去了）→ 直接 ended，不用等对方
+// 再说一轮（隔着墙的动静不算裁决）。只允许话题参与方调用，精确动作。
+// 返回 { key, verdict: 'propose'|'accepted'|'solo'|null }；找不到返回 key:null。
 export function topicEndState(home, now, charId, about) {
   const topics = home.topics || {}
   const a = typeof about === 'string' ? about.trim() : ''
   if (!a) return { key: null, verdict: null }
-  const cands = Object.entries(topics)
-    .map(([k, v]) => ({ k, v }))
-    .filter(
-      ({ v }) =>
-        v &&
-        v.status !== 'ended' &&
-        v.about === a &&
-        Array.isArray(v.participants) &&
-        v.participants.includes(charId),
-    )
-    .sort((p, q) => String(q.v.lastTurnAt || '').localeCompare(String(p.v.lastTurnAt || '')))
-  if (cands.length === 0) return { key: null, verdict: null }
-  const x = cands[0].v
-  const key = cands[0].k
+  const me = home.characters && home.characters[charId]
+  const myRoom = me ? me.room : null
+  const key = topicKey(a)
+  const x = topics[key]
+  if (!x || x.status === 'ended') return { key: null, verdict: null }
+  if (!Array.isArray(x.participants) || !x.participants.includes(charId)) return { key: null, verdict: null }
   const t = now instanceof Date ? now.getTime() : Date.now()
+  // 谁能在场裁决我：其他参与方里，此刻和我待在同一个房间的
+  const others = x.participants.filter(
+    (id) => id !== charId && home.characters && home.characters[id] && home.characters[id].room === myRoom,
+  )
+  if (others.length === 0) {
+    // 身边没有别的参与方：没人能当面裁决 → 直接收掉
+    x.status = 'ended'
+    x.endedBy = charId
+    x.endedAt = new Date(t).toISOString()
+    return { key, verdict: 'solo' }
+  }
+  if (x.status === 'closing' && x.endedBy !== charId) {
+    // 双收：对方也提收 → 直接 ended
+    x.status = 'ended'
+    x.endedBy = charId
+    x.endedAt = new Date(t).toISOString()
+    return { key, verdict: 'accepted' }
+  }
   if (x.status === 'closing') {
-    if (x.endedBy !== charId) {
-      // 双收：对方也提收 → 直接 ended
-      x.status = 'ended'
-      x.endedBy = charId
-      x.endedAt = new Date(t).toISOString()
-      return { key, verdict: 'accepted' }
-    }
     x.lastTurnAt = new Date(t).toISOString()
     return { key, verdict: 'propose' } // 自己再提：幂等保持 closing
   }
-  if (x.status === 'open') {
-    x.status = 'closing'
-    x.endedBy = charId
-    x.lastTurnAt = new Date(t).toISOString()
-    return { key, verdict: 'propose' }
-  }
-  return { key, verdict: null } // 已 ended
+  x.status = 'closing'
+  x.endedBy = charId
+  x.lastTurnAt = new Date(t).toISOString()
+  return { key, verdict: 'propose' }
 }
 
 // tick 兜底：status!=ended 且超时（默认 10 分钟）无人说话 → 沉默自动收（endedBy='silence'）
@@ -1222,6 +1287,12 @@ export class CatNest {
       const act = typeof action === 'string' ? action.trim() : ''
       const ab = typeof about === 'string' ? about.trim() : ''
       const home = await this.home()
+      // about 硬校验（§9.2）落在服务层：任何入口（工具、接话链、后续新调用点）
+      // 都不能把游离短语写进账本。开场白走 _sayCore（openTopic 内），不受此限。
+      if (ab && who !== 'master') {
+        const chk = checkTopicAbout(home, who, ab)
+        if (chk.error) throw new Error(chk.error)
+      }
       return this._sayCore(home, who, text, act || undefined, ab || undefined)
     })
   }
@@ -1382,8 +1453,9 @@ export class CatNest {
   }
 
   // 话题：开启并说开场白（open_topic，§9.2）——一个调用完成「开启+开场」。
-  // 入账一条 topic-open 行 + 一条带 about 的 say 行（走正常 say 通道）。
-  // to：可选定向对象（角色 id 或名字），缺省=对房间（同房者皆可加入）。
+  // 入账一条 topic-open / topic-reopen 行 + 一条带 about 的 say 行（走正常 say 通道）。
+  // 范围门禁（§9.2）：话题是姐妹之间同房间聊天的工具——房间里没有别的猫娘就开不起来；
+  // to 指定的对象也必须在同一个房间。同名话题的开关门禁见 topicOpenState。
   async openTopic(charId, about, text, to) {
     return this.mutate(async () => {
       await this.requireOpen()
@@ -1402,10 +1474,23 @@ export class CatNest {
         if (!found) throw new Error('to 指向的角色不存在：' + toRaw)
         toId = found
       }
+      if (topicPeers(home, charId, toId).length === 0) {
+        const me = home.characters[charId]
+        throw new Error(
+          toId
+            ? '「' + charName(home, toId) + '」不在你所在的房间（' + (roomName(home, me.room) || me.room) + '），话题得当面提起来'
+            : '这个话题得当面跟姐妹提，可这个房间里没有别的猫娘；想说话直接 say 就行。',
+        )
+      }
       const r = topicOpenState(home, this.now(), charId, a, toId)
-      await this.log('topic-open', { char: charId, about: a, ...(toId ? { to: toId } : {}), room: r.topic.room })
+      await this.log(r.reopened ? 'topic-reopen' : 'topic-open', {
+        char: charId,
+        about: a,
+        ...(toId ? { to: toId } : {}),
+        room: r.topic.room,
+      })
       const said = await this._sayCore(home, charId, t0, undefined, a)
-      return { char: charId, about: a, to: toId, opened: r.opened, said }
+      return { char: charId, about: a, to: toId, opened: r.opened, reopened: r.reopened, said }
     })
   }
 
@@ -1462,7 +1547,7 @@ export class CatNest {
       const home = await this.home()
       const r = topicResolveSay(home, this.now(), charId, about)
       if (r.verdict === 'join') await this.log('topic-join', { char: charId, about: r.key ? r.key.split('|')[1] : String(about || '') })
-      else if (r.verdict === 'reopen') await this.log('topic-reopen', { char: charId, about: r.key ? r.key.split('|')[1] : String(about || '') })
+      // 否决（topic-reopen）不再由「继续说」产生：改由 open_topic 重提同名话题时入账（见 openTopic）
       await this.saveHome(home)
       return r
     })
