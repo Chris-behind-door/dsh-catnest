@@ -44,6 +44,12 @@ import {
   topicExpire,
   TOPIC_SILENCE_TIMEOUT_MS,
   detectMoveIntent,
+  TOPIC_SEED_CATEGORIES,
+  TOPIC_SEEDS,
+  pickTopicSeeds,
+  topicSeedsText,
+  activeTopicsOf,
+  recentTopicPhrases,
 } from '../lib.js'
 
 const FIXED = new Date('2026-08-22T11:00:00+08:00')
@@ -1560,4 +1566,83 @@ test('home v3→v4 迁移：旧账本补 autonomy 默认关，用户数据不丢
   } finally {
     await cleanup()
   }
+})
+
+// ── 参考话题池（§9.13）──
+
+test('话题池类目表：每个默认房间都有对应类目，每类 6 条', () => {
+  for (const c of TOPIC_SEED_CATEGORIES) {
+    assert.ok(Array.isArray(TOPIC_SEEDS[c.id]), '类目 ' + c.id + ' 有池子')
+    assert.equal(TOPIC_SEEDS[c.id].length, 6, c.id + ' 每类 6 条（只抽当前房间一类，条数不够会聊穷）')
+  }
+  for (const r of DEFAULT_ROOMS) {
+    assert.ok(
+      TOPIC_SEED_CATEGORIES.some((c) => c.kind === 'room' && c.room === r.id),
+      '房间 ' + r.id + ' 有「关于xx」类目',
+    )
+  }
+  assert.equal(TOPIC_SEED_CATEGORIES.filter((c) => c.kind === 'home').length, 4, '人物/家宅档 4 类')
+})
+
+test('pickTopicSeeds：场地档只认当前房间 + 人物档兜底；不同房间抽不同类', () => {
+  const home = { characters: { kyu: { id: 'kyu', room: 'study' }, moli: { id: 'moli', room: 'kitchen' } }, topics: {} }
+  const a = pickTopicSeeds(home, 'kyu', { rand: () => 0 })
+  assert.equal(a.room.id, 'study')
+  assert.equal(a.room.label, '关于书房')
+  assert.equal(a.room.items.length, 3, '场地 3 条')
+  assert.equal(a.other.items.length, 2, '人物/家宅 2 条')
+  assert.equal(a.other.id, 'master', 'rand=0 取第一档')
+  const b = pickTopicSeeds(home, 'moli', { rand: () => 0 })
+  assert.equal(b.room.id, 'kitchen', '在厨房就聊厨房，不抽相邻也不抽别处')
+})
+
+test('pickTopicSeeds：指定类目 5 条；未知类目回 error；未知房间只给人物档', () => {
+  const home = { characters: { kyu: { id: 'kyu', room: 'attic' } }, topics: {} }
+  const auto = pickTopicSeeds(home, 'kyu', { rand: () => 0 })
+  assert.equal(auto.room, null, '主人手加的房间没有类目 → 场地档空')
+  assert.ok(auto.other.items.length > 0, '仍给人物/家宅档')
+  const byCat = pickTopicSeeds(home, 'kyu', { category: '卧室', rand: () => 0 })
+  assert.equal(byCat.room.label, '关于卧室')
+  assert.equal(byCat.room.items.length, 5)
+  const bad = pickTopicSeeds(home, 'kyu', { category: '天台' })
+  assert.equal(bad.error, 'NO_CATEGORY')
+  assert.ok(bad.categories.includes('书房'))
+})
+
+test('pickTopicSeeds：排除最近聊过的话题（防复读）', () => {
+  const home = {
+    characters: { kyu: { id: 'kyu', room: 'study' } },
+    topics: {
+      '书桌那一角': { about: '书桌那一角', status: 'open', participants: ['kyu'], openedBy: 'kyu', lastTurnAt: '2026-09-13T10:00:00+08:00' },
+    },
+  }
+  const p = pickTopicSeeds(home, 'kyu', { rand: () => 0 })
+  assert.deepEqual(p.recent, ['书桌那一角'])
+  assert.ok(!p.room.items.some((t) => t.includes('书桌那一角')), '聊过的条目不重发')
+  assert.ok(p.room.items.length > 0, '池子够厚，排除后仍抽得满')
+})
+
+test('activeTopicsOf / recentTopicPhrases：本人挂着的未结束话题才算', () => {
+  const home = {
+    characters: {},
+    topics: {
+      A: { about: 'A', status: 'open', participants: ['kyu'], openedBy: 'kyu', lastTurnAt: '2026-09-13T10:00:00+08:00' },
+      B: { about: 'B', status: 'closing', participants: ['kyu', 'moli'], openedBy: 'moli', lastTurnAt: '2026-09-13T11:00:00+08:00' },
+      C: { about: 'C', status: 'ended', participants: ['kyu'], openedBy: 'kyu', endedAt: '2026-09-13T12:00:00+08:00' },
+      D: { about: 'D', status: 'open', participants: ['moli'], openedBy: 'moli', lastTurnAt: '2026-09-13T09:00:00+08:00' },
+    },
+  }
+  assert.deepEqual(activeTopicsOf(home, 'kyu').map((x) => x.about).sort(), ['A', 'B'], 'open 与 closing 都算挂着；ended 不算')
+  assert.deepEqual(activeTopicsOf(home, 'moli').map((x) => x.about).sort(), ['B', 'D'])
+  assert.deepEqual(recentTopicPhrases(home, 2), ['C', 'B'], '按最近动静排序（ended 用 endedAt）')
+})
+
+test('topicSeedsText：渲染两档 + 用法说明；空抽签返回空串', () => {
+  const home = { characters: { kyu: { id: 'kyu', room: 'balcony' } }, topics: {} }
+  const text = topicSeedsText(pickTopicSeeds(home, 'kyu', { rand: () => 0 }))
+  assert.ok(text.includes('【姐妹之间可以聊的（只是引子）】'))
+  assert.ok(text.includes('关于阳台：'))
+  assert.ok(text.includes('关于主人：'))
+  assert.ok(text.includes('不想聊就安静待着'))
+  assert.equal(topicSeedsText({ room: null, other: null }), '')
 })

@@ -53,7 +53,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -597,6 +597,23 @@ export default {
         },
       },
       {
+        name: 'pick_topic',
+        description:
+          '翻一翻姐妹之间的参考话题（想找话说又没头绪时用）。' +
+          '不传 category 就按你现在待的房间给几条；也可以点类目要：' +
+          TOPIC_SEED_CATEGORIES.map((c) => c.label.replace(/^关于/, '')).join(' / ') +
+          '。这些只是引子，不用照搬，更不用每条都聊；挑中哪条就顺着说，别把话题念出来。',
+        parameters: {
+          type: 'object',
+          properties: {
+            category: {
+              type: 'string',
+              description: '可选：类目名（如 书房 / 客厅 / 关于主人）。缺省=按当前房间自动给。',
+            },
+          },
+        },
+      },
+      {
         name: 'pause_activity',
         description:
           '暂时放下手里正在做的事（可以接回来）。暂停时计时照走，你不算在忙：' +
@@ -836,6 +853,23 @@ export default {
             effect: { tool: 'end_topic', about, verdict: r.verdict },
           }
         }
+        if (name === 'pick_topic') {
+          // 参考话题池（§9.13）：纯读，不说话不入账，也不算社交动作（不触发 closing 裁决）。
+          const home = await nest.home()
+          const want = typeof args.category === 'string' ? args.category.trim() : ''
+          const picked = pickTopicSeeds(home, charId, want ? { category: want, perOther: 5 } : {})
+          if (picked.error) return fail('没有这个类目。可选：' + (picked.categories || []).join(' / '))
+          const lines = [picked.room, picked.other]
+            .filter((g) => g && g.items && g.items.length > 0)
+            .map((g) => g.label + '：' + g.items.join('；'))
+          if (lines.length === 0) return fail('这次没翻到合适的引子，按自己的想法说就行')
+          return {
+            ok: true,
+            result:
+              lines.join('\n') + '\n（只是引子：挑中哪条就顺着往下说，别把话题念出来；不想聊就安静待着。）',
+            effect: { tool: 'pick_topic', category: want || 'auto' },
+          }
+        }
         if (name === 'pause_activity') {
           const r = await nest.pauseActivity(charId)
           await nest.resolveTopicAction(charId)
@@ -972,7 +1006,7 @@ export default {
       return null
     }
 
-    const agentTurn = async (charId) => {
+    const agentTurn = async (charId, opts = {}) => {
       const home = await nest.home()
       const ch = home.characters && home.characters[charId]
       const name = (ch && ch.name) || charId
@@ -1049,7 +1083,7 @@ export default {
         '· 想跟姐妹认真聊一件事就用 open_topic 提起它（顺带说开场白），聊透了用 end_topic 收掉；' +
         '随口一句、打招呼、应答都不用开话题。\n' +
         '· 想暂时放下手里的活，用 pause_activity（计时继续走，之后同名 do_activity 可以接回来）；做完了用 do_activity 传空字符串。\n' +
-        '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题，或继续安静待着。'
+        '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题（想不出聊什么就先用 pick_topic 翻翻），或继续安静待着。'
 
       // 关系段（易变）：构建逻辑不变，出口搬到 user 尾部动态窗口
       const relLines = []
@@ -1081,6 +1115,15 @@ export default {
       const heardText =
         heardLines.length > 0 ? '\n\n【最近听到的（隔墙动静）】\n' + heardLines.join('\n') : ''
 
+      // 参考话题引子（§9.13，主人 2026-09-13 定）：只在**姐妹自由聊天**的语境给，
+      // 且她本人没有还挂着的话题（正在聊一条线时塞新引子必然跑题）。
+      // 「自由聊天」= T6 自主轻推 / 听到姐妹的动静（opts.seeds === 'free'）；
+      // 主人说话的直接接话、听到主人的动静、状态与活动唤醒都不给。
+      let seedsText = ''
+      if (opts.seeds === 'free' && activeTopicsOf(home, charId).length === 0) {
+        seedsText = topicSeedsText(pickTopicSeeds(home, charId))
+      }
+
       // user：静态场景 + 片内时间线（全量不截断）+ 回忆 + 此刻动态窗口（位置/状态/听到的/关系）；
       // 末行即触发句。易变状态全部压到时间线之后：移动/调数值只重算末尾百 token。
       const user =
@@ -1092,6 +1135,7 @@ export default {
         selfCondText +
         heardText +
         relText +
+        seedsText +
         '\n\n——现在轮到你了：可以用工具行动，也可以保持安静什么都不做。'
 
       // 多步工具循环：每步带 tools 调 llm，收 tool-call → 执行 → 回填 → 再问；
@@ -1309,7 +1353,7 @@ export default {
       const name = (ch && ch.name) || charId
       let r
       try {
-        r = await agentTurn(charId)
+        r = await agentTurn(charId, opts)
         if (r && r.error === 'llm 服务不可用' && !opts.silentNoLlm) {
           broadcast({ kind: 'replyError', char: charId, name, reason: 'noLlm' })
         }
@@ -1361,8 +1405,8 @@ export default {
           return null
         }
         const ch = home.characters && home.characters[charId]
+        const last = ch && Array.isArray(ch.hear) && ch.hear.length > 0 ? ch.hear[ch.hear.length - 1] : null
         if (ch && !ch.hearNotified) {
-          const last = ch.hear && ch.hear.length > 0 ? ch.hear[ch.hear.length - 1] : null
           const from = last ? last.from : 'master'
           // 位置取「说那句话时的房间」（旧条目无 room 才回落到说话人此刻的房间）：
           // 墨璃在客厅说完再挪去卧室，小玖听到的仍是客厅的动静，别写成"隔壁卧室"。
@@ -1384,7 +1428,9 @@ export default {
         }
         if (turningChars.has(charId)) return null
         if (!force && turnPending > 0) return null
-        void enqueueTurn(charId, { silentNoLlm: true })
+        // 自由聊天语境（§9.13）：这批动静的最新一条来自姐妹 → 给参考引子；来自主人不给。
+        const seeds = last && last.from !== 'master' && COMPANION_IDS.includes(last.from) ? 'free' : null
+        void enqueueTurn(charId, { silentNoLlm: true, seeds })
         return { char: charId, woken: true }
       } catch (error) {
         console.log('[dsh-catnest] T1 唤醒失败（' + charId + '）: ' + (error && error.message ? error.message : String(error)))
@@ -1461,7 +1507,8 @@ export default {
         if (lastSayMs[id] && Date.now() - lastSayMs[id] <= T6_SAY_COOLDOWN_MS) continue
         if (turnPending > 0) continue // 队列忙则跳过（非 force），下次 tick 重评
         await nest.notice(id, 'self', '家里很安静，你闲下来了', true)
-        void enqueueTurn(id, { silentNoLlm: true })
+        // 自由聊天语境（§9.13）：T6 轻推是两只猫娘自己聊起来的主通道 → 给参考引子
+        void enqueueTurn(id, { silentNoLlm: true, seeds: 'free' })
       }
     }
 
@@ -1655,6 +1702,8 @@ export default {
         return { homeOn: !!(h.autonomy && h.autonomy.homeOn) }
       },
       dropStaleHear: (id) => nest.dropStaleHear(id),
+      // 参考话题池（§9.13）：诊断/调试用，看某个角色此刻会抽到什么引子
+      topicSeeds: async (id, opts) => pickTopicSeeds(await nest.home(), id, opts || {}),
       expireTopics: () => nest.expireTopics(),
       ambientTick: () => nest.ambientTick(),
       notice: (char, source, text, isPrivate) => nest.notice(char, source, text, isPrivate),
@@ -1935,4 +1984,10 @@ export {
   topicExpire,
   TOPIC_SILENCE_TIMEOUT_MS,
   AMBIENT_REPEAT_MS,
+  TOPIC_SEED_CATEGORIES,
+  TOPIC_SEEDS,
+  pickTopicSeeds,
+  topicSeedsText,
+  activeTopicsOf,
+  recentTopicPhrases,
 } from './lib.js'

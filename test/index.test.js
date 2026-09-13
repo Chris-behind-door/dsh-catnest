@@ -81,6 +81,60 @@ const silentStub = {
   },
 }
 
+// 角色限定工具桩 + 全量 messages 捕获（要看工具回执进下一轮的样子）。
+const toolOnceMessagesStub = (who, name, args, out) => ({
+  stream: (opts) => {
+    const mine = typeof opts.system === 'string' && opts.system.includes('家里的成员' + who)
+    const stop = !mine || hasAssistantToolCall(opts.messages)
+    if (mine) out.push({ system: opts.system, messages: opts.messages })
+    return (async function* () {
+      if (stop) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_x', name }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify(args) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
+// 给角色写一个"已到期"的活动（测试用）：tick 第 2 步会走 T3 到期并叫醒她。
+const expireActivity = async (dir, charId) => {
+  const file = join(dir, 'home.json')
+  const home = JSON.parse(await readFile(file, 'utf8'))
+  const ch = home.characters[charId]
+  ch.activity = '发呆'
+  ch.activityEndsAt = new Date(Date.now() - 1000).toISOString()
+  ch.lastAmbientAt = new Date(Date.now() - 1000).toISOString()
+  await writeFile(file, JSON.stringify(home, null, 2) + '\n')
+}
+
+// 捕获 prompt + 按队列说台词（§9.13 参考话题引子测试用）：先记录本轮 prompt，
+// 再决定说什么。队列耗尽即沉默（仍会记录 prompt）。
+const sayCaptureStub = (queue, out) => ({
+  stream: (opts) => {
+    const stop = hasAssistantToolCall(opts && opts.messages)
+    if (!stop && opts && Array.isArray(opts.messages)) {
+      out.push({ system: opts.system, user: captureUser(opts.messages[0]) })
+    }
+    return (async function* () {
+      if (stop) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      const text = queue.shift()
+      if (text === undefined) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text }) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
 // agent 化通用工具桩：第一轮调指定工具一次（arguments 原样下发），之后收手 stop。
 // 供 adjust_relation 等工具测试复用；hasAssistantToolCall 保证多步循环只调一次。
 const toolOnceStub = (name, args) => ({
@@ -2309,5 +2363,114 @@ test('在家自由互动开关：API 落盘 + state 暴露（离家那档不动�
     assert.deepEqual(await n.svc.autonomy(), { homeOn: true })
   } finally {
     await rmSafe(n.dir)
+  }
+})
+
+test('参考话题引子：姐妹自由聊天给、状态唤醒与主人接话都不给', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-seeds-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayCaptureStub([], prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
+    await call({ op: 'open' })
+    await svc.moveMaster('living')
+    await svc.moveCharacter('moli', 'living')
+    await svc.moveCharacter('kyu', 'study') // 与小玖相邻：隔墙攒动静
+    // 墨璃在客厅连说 3 句 → 小玖缓冲攒满（阈值 3），最后一条来自姐妹
+    await svc.say('moli', '铺垫一')
+    await svc.say('moli', '铺垫二')
+    await svc.say('moli', '铺垫三')
+    // 造一次回合：给墨璃写一个"已到期"的活动，tick（T3）把她叫醒；
+    // 她回合末的全屋复检再把攒满的小玖捞起来——这就是 T1 的正常路径
+    await expireActivity(dir, 'moli')
+    await svc.tick()
+    await until(() => prompts.some((p) => p.system.includes('成员小玖')))
+    const kyuP = prompts.find((p) => p.system.includes('成员小玖'))
+    assert.ok(kyuP.user.includes('姐妹之间可以聊的'), 'T1 姐妹动静唤醒 → 给引子')
+    assert.ok(kyuP.user.includes('关于书房'), '场地档只认她当前房间（书房）')
+    // 状态/活动类唤醒（T3）不给引子
+    const moliT3 = prompts.find((p) => p.system.includes('成员墨璃'))
+    assert.ok(moliT3, '墨璃被活动到期叫醒')
+    assert.ok(!moliT3.user.includes('姐妹之间可以聊的'), '状态/活动类唤醒不给引子')
+    // 主人说话后的直接接话不给引子
+    await call({ op: 'say', text: '你俩在聊什么' })
+    await until(() => prompts.some((p) => p.system.includes('成员墨璃') && p.user.includes('你俩在聊什么')))
+    const moliSay = prompts.find((p) => p.system.includes('成员墨璃') && p.user.includes('你俩在聊什么'))
+    assert.ok(!moliSay.user.includes('姐妹之间可以聊的'), '主人接话不给引子')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('参考话题引子：她本人还挂着话题时不注入', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-seeds2-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayCaptureStub([], prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
+    await call({ op: 'open' })
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'living')
+    // 当面开一条话题（小玖是参与方），随后小玖走开干活——话题还挂着
+    await svc.openTopic('kyu', '那盆花', '你看那盆花开了')
+    await svc.moveCharacter('kyu', 'study')
+    await svc.say('moli', '铺垫一')
+    await svc.say('moli', '铺垫二')
+    await svc.say('moli', '铺垫三')
+    await expireActivity(dir, 'moli')
+    await svc.tick()
+    await until(() => prompts.some((p) => p.system.includes('成员小玖')))
+    const kyuP = prompts.find((p) => p.system.includes('成员小玖'))
+    assert.ok(!kyuP.user.includes('姐妹之间可以聊的'), '正在聊一条线时不放新引子')
+    assert.ok(kyuP.user.includes('那盆花'), '她确实还挂在这条话题上（引子闸才有意义）')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('pick_topic 工具：按当前房间给引子，也能点类目', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-picktopic-'))
+  const ws = webServerStub()
+  const seen = []
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    llm: toolOnceMessagesStub('墨璃', 'pick_topic', { category: '书房' }, seen),
+  })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
+    await call({ op: 'open' })
+    await svc.moveMaster('kitchen')
+    await svc.moveCharacter('moli', 'kitchen')
+    await svc.moveCharacter('kyu', 'living')
+    await call({ op: 'say', text: '姐姐，找点话说' })
+    await until(() => seen.length > 1)
+    // 第二轮 messages 带回执：点了类目就按类目给，并带"只是引子"的用法说明
+    const flat = JSON.stringify(seen[seen.length - 1].messages)
+    assert.ok(flat.includes('关于书房'), '点了类目就按类目给: ' + flat.slice(-300))
+    assert.ok(flat.includes('别把话题念出来'), '回执带用法说明')
+    // 服务面：不指定类目就按当前房间（墨璃在厨房）
+    const auto = await svc.topicSeeds('moli')
+    assert.equal(auto.room.label, '关于厨房')
+    assert.equal(auto.room.items.length, 3)
+    assert.equal(auto.other.items.length, 2)
+    const bad = await svc.topicSeeds('moli', { category: '天台' })
+    assert.equal(bad.error, 'NO_CATEGORY')
+  } finally {
+    await rmSafe(dir)
   }
 })

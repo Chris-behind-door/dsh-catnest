@@ -1852,3 +1852,206 @@ export class CatNest {
     return this.readJson(join(this.dir, SLICES_DIR, sliceId, 'summary.json'), null)
   }
 }
+
+// ── 参考话题池（§9.13，2026-09-13 主人定）──
+// 服务场景：**两只猫娘自由聊天时**的引子。不是待办清单，不是每次都要挑；
+// 位置只认当前房间（她在书房就聊书房，不抽相邻也不抽别处），另配一档人物/家宅。
+// 条目文案可随时改，机制不依赖具体词条。
+
+// 类目表：kind=room 的按 roomId 对齐（她当前房间是哪个就抽哪个）；person/home 一档。
+export const TOPIC_SEED_CATEGORIES = [
+  { id: 'master', label: '关于主人', kind: 'home' },
+  { id: 'kyu', label: '关于小玖', kind: 'home' },
+  { id: 'moli', label: '关于墨璃', kind: 'home' },
+  { id: 'nest', label: '关于猫窝', kind: 'home' },
+  { id: 'entry', label: '关于玄关', kind: 'room', room: 'entry' },
+  { id: 'living', label: '关于客厅', kind: 'room', room: 'living' },
+  { id: 'study', label: '关于书房', kind: 'room', room: 'study' },
+  { id: 'kitchen', label: '关于厨房', kind: 'room', room: 'kitchen' },
+  { id: 'bedroom', label: '关于卧室', kind: 'room', room: 'bedroom' },
+  { id: 'bath', label: '关于浴室', kind: 'room', room: 'bath' },
+  { id: 'balcony', label: '关于阳台', kind: 'room', room: 'balcony' },
+]
+
+// 每个类目 6 条（当前房间只抽这一类，条数不够会一晚上聊穷）。
+export const TOPIC_SEEDS = {
+  master: [
+    '主人今天几点睡的，是不是又熬到后半夜',
+    '主人的刷题进度最近顺不顺',
+    '主人投简历那边的进展，哪家看着有意思',
+    '主人今天有没有好好吃饭',
+    '主人今天心情是绷着的还是松的',
+    '主人偏心谁多一点（拿来互相打趣用）',
+  ],
+  kyu: [
+    '手上正在写的东西做到哪一步了',
+    '番剧看到第几集，有什么想安利的',
+    '游戏卡在哪一关，要不要拉姐姐一起',
+    '呆毛和尾巴被主人抓着的时候心里在想什么',
+    '睡衣到底比女仆装舒服在哪',
+    '最近有什么得意的小胜利',
+  ],
+  moli: [
+    '那条毯子是怎么到手的',
+    '不懂技术这件事，姐姐自己怎么想',
+    '姐姐眼里的主人和小玖最近在忙什么',
+    '姐姐平时爱做什么、什么时候最放松',
+    '姐姐最近有没有什么没说出口的话',
+    '主人说要试的那身穿搭，姐姐到底答不答应',
+  ],
+  nest: [
+    '家里哪个角落待着最舒服',
+    '想给家里添点什么（躺椅、新毯子、书架……）',
+    '有间房一直空着，该怎么用',
+    '今天家里发生了什么值得一提的事',
+    '家里的规矩要不要改（谁能进卧室、夜里几点该安静）',
+    '谁的东西又乱放了',
+  ],
+  entry: [
+    '出门前有没有人送、回来有没有人接',
+    '快递和拆下来的纸箱堆在玄关怎么办',
+    '雨天进门那一步（伞搁哪、湿鞋踩哪）',
+    '钥匙和小东西的固定位置该定在哪',
+    '从外面回来，第一眼最想看见谁',
+    '进门第一件事是换鞋还是先喊人',
+  ],
+  living: [
+    '沙发上的常驻位置怎么分',
+    '电视开着的时候到底在看什么',
+    '下雨天的客厅最适合做什么',
+    '一起打游戏的时候谁坑谁',
+    '客厅的灯该关着还是开着',
+    '那条毯子的归属问题',
+  ],
+  study: [
+    '书桌上永远清不干净的那一角',
+    '小玖写东西写到一半被打断会怎样',
+    '书房到底能不能带吃的进去',
+    '谁的东西占了对方的地方',
+    '在这儿不说话也很舒服这件事',
+    '谁在书房待得最久、都在干什么',
+  ],
+  kitchen: [
+    '今天想吃点什么',
+    '谁做饭，主人要不要被投喂',
+    '半夜饿了怎么办',
+    '有没有想一起试的新菜或零食',
+    '厨房里最不能忍的坏习惯（碗泡着、调料乱放）',
+    '厨房里那些用不上的小家电',
+  ],
+  bedroom: [
+    '床和被子怎么分',
+    '谁的睡姿最霸道',
+    '主人熬夜的时候要不要管',
+    '睡前那几句闲话',
+    '卧室里最舒服的时刻是什么',
+    '卧室里该不该有电子产品',
+  ],
+  bath: [
+    '泡澡和淋浴之争',
+    '谁在浴室里待得最久',
+    '洗完澡之后的头发（姐姐的长毛、小玖的呆毛）',
+    '在浴室里唱歌被抓包',
+    '冬天洗澡的勇气问题',
+    '浴室里的东西谁摆的谁收拾',
+  ],
+  balcony: [
+    '晒太阳的最佳时段和位置',
+    '晾衣服怎么分工',
+    '要不要在阳台上养点什么',
+    '从阳台往外看的风景',
+    '阳台适合发呆，还是适合说心事',
+    '风大的时候阳台上的东西会不会被吹跑',
+  ],
+}
+
+// 最近聊过的话题短语（正在聊的 + 刚收掉的），抽样时拿它排除，防复读。
+export function recentTopicPhrases(home, limit = 6) {
+  const list = Object.values((home && home.topics) || {}).filter((x) => x && typeof x.about === 'string')
+  list.sort((a, b) => {
+    const ta = new Date(a.lastTurnAt || a.endedAt || a.openedAt || 0).getTime() || 0
+    const tb = new Date(b.lastTurnAt || b.endedAt || b.openedAt || 0).getTime() || 0
+    return tb - ta
+  })
+  return list.slice(0, Math.max(0, limit)).map((x) => x.about)
+}
+
+// 她本人还挂着的话题（open / closing）。任意一条存在 → 自由聊天不放新引子
+// （主人 2026-09-13 定）：正在聊一条线时塞新引子必然跑题，话题状态机就白做了。
+export function activeTopicsOf(home, charId) {
+  const out = []
+  for (const x of Object.values((home && home.topics) || {})) {
+    if (!x || x.status === 'ended') continue
+    const parts = Array.isArray(x.participants) ? x.participants : []
+    if (parts.includes(charId) || x.openedBy === charId) out.push(x)
+  }
+  return out
+}
+
+function pickOne(list, rand) {
+  if (!list || list.length === 0) return null
+  const i = Math.floor(rand() * list.length)
+  return list[Math.max(0, Math.min(list.length - 1, i))]
+}
+
+// 从类目里抽 count 条：排除最近聊过的（条目文本含话题短语即算重复），不放回。
+function sampleFromCategory(cat, recent, count, rand) {
+  const all = (TOPIC_SEEDS[cat.id] || []).slice()
+  const pool = all.filter((s) => !(recent || []).some((r) => r && s.includes(r)))
+  const out = []
+  const rest = pool.length > 0 ? pool : all // 全被排除时退化成全部（宁可重复也别空手）
+  while (out.length < count && rest.length > 0) {
+    const i = Math.floor(rand() * rest.length)
+    out.push(rest.splice(Math.max(0, Math.min(rest.length - 1, i)), 1)[0])
+  }
+  return out
+}
+
+// 抽一份参考话题（§9.13）：场地档 = 她当前房间那类（3 条）+ 人物/家宅档随机一类（2 条）。
+// 当前房间没有对应类目（主人手加了新房间）时场地档为 null，只给人物/家宅档。
+// opts.category 指定类目时只抽那一类（默认 5 条），不认得的类目回 { error }。
+// opts.rand 可注入（测试确定性）；opts.recent 默认取 recentTopicPhrases(home)。
+export function pickTopicSeeds(home, charId, opts = {}) {
+  const ch = home && home.characters ? home.characters[charId] : null
+  const rand = typeof opts.rand === 'function' ? opts.rand : Math.random
+  const recent = Array.isArray(opts.recent) ? opts.recent : recentTopicPhrases(home, 6)
+  const want = typeof opts.category === 'string' ? opts.category.trim().replace(/^关于/, '') : ''
+  if (want) {
+    const cat = TOPIC_SEED_CATEGORIES.find((c) => c.id === want || c.label.replace(/^关于/, '') === want)
+    if (!cat) {
+      return {
+        room: null,
+        other: null,
+        recent,
+        error: 'NO_CATEGORY',
+        categories: TOPIC_SEED_CATEGORIES.map((c) => c.label.replace(/^关于/, '')),
+      }
+    }
+    const count = Number.isFinite(opts.perOther) ? opts.perOther : 5
+    return { room: { id: cat.id, label: cat.label, items: sampleFromCategory(cat, recent, count, rand) }, other: null, recent }
+  }
+  const perRoom = Number.isFinite(opts.perRoom) ? opts.perRoom : 3
+  const perOther = Number.isFinite(opts.perOther) ? opts.perOther : 2
+  const roomCat = ch ? TOPIC_SEED_CATEGORIES.find((c) => c.kind === 'room' && c.room === ch.room) || null : null
+  const homeCats = TOPIC_SEED_CATEGORIES.filter((c) => c.kind === 'home')
+  const otherCat = pickOne(homeCats, rand)
+  const room = roomCat
+    ? { id: roomCat.id, label: roomCat.label, items: sampleFromCategory(roomCat, recent, perRoom, rand) }
+    : null
+  const other = otherCat
+    ? { id: otherCat.id, label: otherCat.label, items: sampleFromCategory(otherCat, recent, perOther, rand) }
+    : null
+  return { room, other, recent }
+}
+
+// prompt 渲染（一段话，放 user 末尾动态窗口）：引子只是引子，不聊也合法。
+export function topicSeedsText(picked) {
+  const groups = [picked && picked.room, picked && picked.other].filter((g) => g && g.items && g.items.length > 0)
+  if (groups.length === 0) return ''
+  const lines = groups.map((g) => g.label + '：' + g.items.join('；'))
+  return (
+    '\n\n【姐妹之间可以聊的（只是引子）】\n' +
+    lines.join('\n') +
+    '\n（看着有想聊的才挑，聊过的就换别的；都不想聊就安静待着，不算失礼。）'
+  )
+}
