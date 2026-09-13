@@ -1834,9 +1834,13 @@ test('T1 唤醒：缓冲攒满边沿触发 notice+唤醒；in-flight 不重复�
     assert.ok(moliPrompt.user.includes('【你注意到】') && moliPrompt.user.includes('的动静，已经几次了'), 'notice 触发句在时间线里')
     const kyuPrompts = prompts.filter((p) => p.system.includes('你是"猫窝"家里的成员小玖'))
     assert.equal(kyuPrompts.length, 2, '小玖两次接话（主人各一句）')
-    // 回合中攒下的新鲜动静（第二句「还在吗」）< 阈值 → 不触发再唤醒
+    // 回合中攒下的新鲜动静（第二句「还在吗」）< 阈值 → 不触发再唤醒。
+    // 注：「谁先到」取决于 moli 回合与第二句的微任务竞争——消费得早则缓冲空，
+    // 消费得晚则那句新鲜动静一起被弹走。两种都合法，关键是旧动静不会留着掀被子。
     const home = await svc.home()
-    assert.equal(home.characters.moli.hear.length, 1, '回合后缓冲只剩新鲜的一条，未达阈值不再醒')
+    const moliHear = home.characters.moli.hear
+    assert.ok(moliHear.length <= 1, '旧动静已被回合消费，不该留着再掀被子')
+    if (moliHear.length === 1) assert.equal(moliHear[0].text, '还在吗', '留下的只会是回合中新来的那条')
   } finally {
     await rmSafe(dirT1)
   }
@@ -2275,6 +2279,34 @@ test('主人说话不再有 500 字上限（2026-09-10 定案下掉）', async (
     assert.equal(res.code, 200, '超长消息照常入账：' + String(res.body))
     const t = await n.svc.transcript()
     assert.ok(t.lines.some((l) => l.type === 'say' && l.who === 'master' && l.rawText === long))
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('在家自由互动开关：API 落盘 + state 暴露（离家那档不动）', async () => {
+  const n = await setupNest(silentStub)
+  try {
+    const call = (method, url, body) => {
+      const res = fakeRes()
+      return n.h(fakeReq(method, url, body), res).then(() => res)
+    }
+    // 默认关：主人在家也不自动跑（省 API、不抢主人模型槽位）
+    let st = JSON.parse((await call('GET', '/catnest/api/state')).body)
+    assert.equal(st.autonomy.homeOn, false)
+    // 打开 → state 立刻反映（前端按钮点亮靠它）
+    const r = await call('POST', '/catnest/api/action', JSON.stringify({ op: 'autonomy', homeOn: true }))
+    assert.equal(JSON.parse(r.body).autonomy.homeOn, true)
+    st = JSON.parse((await call('GET', '/catnest/api/state')).body)
+    assert.equal(st.autonomy.homeOn, true)
+    // 关回去 → 落盘持久（v4 账本）
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'autonomy', homeOn: false }))
+    const homeJson = JSON.parse(await readFile(join(n.dir, 'home.json'), 'utf8'))
+    assert.equal(homeJson.autonomy.homeOn, false)
+    assert.equal(homeJson.version, 4)
+    // 服务面同口径
+    assert.deepEqual(await n.svc.setAutonomy({ homeOn: true }), { autonomy: { homeOn: true } })
+    assert.deepEqual(await n.svc.autonomy(), { homeOn: true })
   } finally {
     await rmSafe(n.dir)
   }

@@ -64,7 +64,9 @@ export function initialRelationsOf(companionId) {
 // ── 家物理常量（草案第四节）──
 // v2→v3（2026-09-05 §9）：home.topics 话题状态（片内作用域）+ 角色 activityPaused
 // （pause_activity 放下锅铲）+ lastAmbientAt（活动隔墙动静去重）
-export const HOME_VERSION = 3
+// v3→v4（2026-09-13）：home.autonomy 自主闸（在家自由互动开关）；hear 条目补 room
+// （说话时房间，供唤醒校验与位置描述）
+export const HOME_VERSION = 4
 // "听到"决策链阈值（草案：小玖3条/姐姐5条，待调——存 home.json 可改）
 export const HEAR_THRESHOLDS = { kyu: 3, moli: 5 }
 // 同房接话顺序：小玖活泼先抢，姐姐谦让（草案 4.5）
@@ -137,6 +139,9 @@ function defaultHome() {
     hearThresholds: { ...HEAR_THRESHOLDS },
     master: { atHome: false, room: null },
     topics: {}, // 话题状态（§9.2，片内作用域：open 时清空；跨片不延续）
+    // 自主闸：离家自动那档不变（主人不想跑就别待在离家状态）；homeOn 只管
+    // 「主人在家时要不要也跑 T6 自主节奏」，默认关（省 API、不抢主人模型槽位）
+    autonomy: { homeOn: false },
   }
 }
 
@@ -292,6 +297,41 @@ export function hearReadyOf(home, charId, now) {
   const threshold =
     (home.hearThresholds && home.hearThresholds[charId]) || HEAR_THRESHOLDS[charId] || 3
   return (ch.hear || []).length >= threshold
+}
+
+// 自主闸门控（纯函数，2026-09-13 主人定）：主人离家 → 照旧跑（不想要就直接待在
+// 离家状态的那个"主人出门"上别切回来）；主人在家 → 只有 homeOn 开关打开才跑。
+export function autonomyEnabled(home) {
+  const atHome = !!(home && home.master && home.master.atHome)
+  if (!atHome) return true
+  return !!(home && home.autonomy && home.autonomy.homeOn)
+}
+
+// 听到缓冲是否已"过时"（2026-09-13 修订）。攒满即唤醒是边沿触发，可队列忙时会被
+// 跳过，只能等下一个回合末尾的复检兜底——那可能是好几分钟后，人早聊别的去了，
+// 于是"回应了早就散场的那段对话"。两个判据任一成立即算过时：
+//   时间：最新一条动静距今超过 HEAR_STALE_MS（对话散场了）；
+//   空间：最新一条带 room 的动静，按「说话时房间 → 我此刻房间」（与 perceiveAround
+//         同向）已 far（人走远了，这句现在根本听不见）。
+// 旧数据无 room/t 则跳过对应判据，不误判。
+export const HEAR_STALE_MS = 3 * 60000
+
+export function hearStaleOf(home, charId, now) {
+  const ch = home.characters && home.characters[charId]
+  if (!ch || !Array.isArray(ch.hear) || ch.hear.length === 0) return false
+  const nowMs =
+    now === undefined ? Date.now() : now instanceof Date ? now.getTime() : Number(now)
+  const last = ch.hear[ch.hear.length - 1]
+  const lastT = last && last.t ? new Date(last.t).getTime() : null
+  if (lastT !== null && Number.isFinite(lastT) && Number.isFinite(nowMs) && nowMs - lastT > HEAR_STALE_MS) {
+    return true
+  }
+  for (let i = ch.hear.length - 1; i >= 0; i -= 1) {
+    const room = ch.hear[i] && ch.hear[i].room
+    if (!room) continue
+    return roomRelation(home, room, ch.room) === 'far'
+  }
+  return false
 }
 
 // 同一房间空闲角色按性格的接话顺序（小玖活泼先抢，墨璃谦让）
@@ -852,6 +892,14 @@ export class CatNest {
         home.topics = {}
         changed = true
       }
+      // v3 → v4 迁移：补自主闸；旧 hear 条目无 room 字段（按"可定位"处理，不失效）
+      if (!home.autonomy || typeof home.autonomy !== 'object') {
+        home.autonomy = { homeOn: false }
+        changed = true
+      } else if (home.autonomy.homeOn === undefined) {
+        home.autonomy.homeOn = false
+        changed = true
+      }
       if (!home.hearThresholds || typeof home.hearThresholds !== 'object') {
         home.hearThresholds = { ...HEAR_THRESHOLDS }
         changed = true
@@ -1329,13 +1377,17 @@ export class CatNest {
       const ch = home.characters && home.characters[id]
       if (!ch) continue
       ch.hear = ch.hear || []
-      // 缓冲只攒声音（text）：action 是视觉信息，隔墙看不见，不进缓冲
-      ch.hear.push({ t: this.now().toISOString(), from: who, text })
+      // 缓冲只攒声音（text）：action 是视觉信息，隔墙看不见，不进缓冲。
+      // room = 说话时房间（声源位置；人后来走开也不改，供唤醒校验与位置描述）
+      ch.hear.push({ t: this.now().toISOString(), from: who, room, text })
       buffered.push(id)
-      await this.log('hear', { char: id, from: who, text })
+      await this.log('hear', { char: id, from: who, room, text })
     }
     await this.saveHome(home)
-    const ready = Object.keys(home.characters || {}).filter((id) => hearReadyOf(home, id))
+    // ready 只报「本次声音真的传到、且攒满阈值」的人（2026-09-13 修订）：旧的
+    // 全屋扫描会把缓冲满但这次一句话都没听见的角色也列进来，害得它在
+    // 任意房间的任意一句话上被唤醒。漏掉的角色由回合末 recheckHear 兜底。
+    const ready = buffered.filter((id) => hearReadyOf(home, id))
     // direct 同房可对话；adjacent 相邻能听到（角色进缓冲，主人即时感知）；far 远处无感
     return {
       who,
@@ -1449,6 +1501,37 @@ export class CatNest {
       ch.lastAmbientAt = null
       await this.saveHome(home)
       return { char: id, from }
+    })
+  }
+
+  // 调度层：「过时动静」丢弃（2026-09-13 修订配套）。声音是瞬时的——人在隔壁说
+  // 的话你才听得见，人走远了这批动静就不该继续攒着掀被子。清空且不唤醒。
+  // 与 consumeHear 同理不要求打开的时间片（缓冲只在片内增长，清空无害）。
+  async dropStaleHear(charId) {
+    return this.mutate(async () => {
+      const home = await this.home()
+      const ch = home.characters && home.characters[charId]
+      const n = ch && Array.isArray(ch.hear) ? ch.hear.length : 0
+      if (!ch || n === 0) return { char: charId, dropped: 0 }
+      ch.hear = []
+      ch.hearNotified = false
+      await this.log('hear-stale', { char: charId, dropped: n })
+      await this.saveHome(home)
+      return { char: charId, dropped: n }
+    })
+  }
+
+  // 自主闸（2026-09-13 主人定）：离家自动那档不变；homeOn 只决定「主人在家时
+  // 要不要也跑 T6」。跨片保留（和 hearThresholds 同规格，不随 open 清空）。
+  async setAutonomy(patch) {
+    return this.mutate(async () => {
+      const home = await this.home()
+      const cur = home.autonomy && typeof home.autonomy === 'object' ? home.autonomy : {}
+      const next = { homeOn: !!cur.homeOn }
+      if (patch && patch.homeOn !== undefined) next.homeOn = !!patch.homeOn
+      home.autonomy = next
+      await this.saveHome(home)
+      return { autonomy: { ...next } }
     })
   }
 
@@ -1595,8 +1678,8 @@ export class CatNest {
           const ach = home.characters && home.characters[aid]
           if (!ach) continue
           ach.hear = ach.hear || []
-          ach.hear.push({ t: new Date(nowT).toISOString(), from: ch.id, text })
-          await this.log('hear', { char: aid, from: ch.id, text })
+          ach.hear.push({ t: new Date(nowT).toISOString(), from: ch.id, room: ch.room, text })
+          await this.log('hear', { char: aid, from: ch.id, room: ch.room, text })
         }
         ch.lastAmbientAt = new Date(nowT).toISOString()
         dropped.push(ch.id)

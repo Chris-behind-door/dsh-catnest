@@ -15,6 +15,8 @@ import {
   roomRelation,
   isBusy,
   hearReadyOf,
+  hearStaleOf,
+  autonomyEnabled,
   respondersOrder,
   charName,
   freezeActivities,
@@ -1431,4 +1433,131 @@ test('detectMoveIntent：认出台词里的位移意图，且不误伤对别人�
     characters: { kyu: { id: 'kyu', name: '小玖', room: 'bedroom' } },
   }
   assert.equal(hit('我去阁楼找找看', null, custom), '阁楼')
+})
+
+// ── 听到缓冲修订 + 自主闸（2026-09-13）──
+// 背景：书房攒满客厅的话，人散到卧室后才被复检捞起来 → 看起来像"回应了听不见的
+// 卧室"（2026-09-13 片里真实发生）。修法：缓冲条目带说话时房间 + 唤醒前校验过时。
+
+test('hear 条目带说话时房间：说话人后来挪走也不改', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('kyu', 'study')
+    await nest.moveCharacter('moli', 'living')
+    await nest.say('moli', '我先回卧室咯')
+    await nest.moveCharacter('moli', 'bedroom') // 说完才走
+    const h = await nest.hear('kyu')
+    assert.equal(h.buffer.length, 1)
+    assert.equal(h.buffer[0].room, 'living', '记的是说话那一刻的房间')
+    assert.equal(h.buffer[0].from, 'moli')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('say 的 hearReady 只报本次声音真的传到的角色（旧：全屋扫描会误报）', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('kyu', 'study')
+    await nest.moveCharacter('moli', 'living')
+    // 书房攒满客厅的 3 条（小玖阈值 3），一直没被消费
+    for (let i = 0; i < 3; i += 1) await nest.say('moli', '客厅动静' + i)
+    assert.equal(hearReadyOf(await nest.home(), 'kyu'), true)
+    // 小玖挪去浴室（与客厅不相邻）后，墨璃在客厅说话
+    await nest.moveCharacter('kyu', 'bath')
+    const r = await nest.say('moli', '客厅又一句')
+    assert.equal(r.buffered.includes('kyu'), false, '这次声音到不了她耳朵')
+    assert.equal(r.hearReady.includes('kyu'), false, '没听到就不该报 ready')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('过时动静：对话散场/人走远都不再掀被子（hearStaleOf / dropStaleHear）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    const opened = await nest.open()
+    await nest.moveCharacter('kyu', 'study')
+    await nest.moveCharacter('moli', 'living')
+    for (let i = 0; i < 3; i += 1) await nest.say('moli', '客厅动静' + i)
+    // 攒满那一刻：客厅与书房相邻、对话正新鲜 → 照常唤醒（行为不变）
+    assert.equal(hearStaleOf(await nest.home(), 'kyu', nest.now()), false)
+    // 时间维度：一句之后过了 5 分钟（> HEAR_STALE_MS），那段对话早散场了
+    const later = new Date(nest.now().getTime() + 5 * 60000)
+    assert.equal(hearStaleOf(await nest.home(), 'kyu', later), true)
+    // 空间维度：小玖挪去浴室（声源客厅 → 浴室 far）
+    await nest.moveCharacter('kyu', 'bath')
+    assert.equal(hearStaleOf(await nest.home(), 'kyu', nest.now()), true)
+    assert.equal((await nest.dropStaleHear('kyu')).dropped, 3)
+    assert.equal((await nest.hear('kyu')).buffer.length, 0)
+    const logText = await readFile(join(dir, 'slices', opened.sliceId, 'log.jsonl'), 'utf8')
+    assert.ok(logText.includes('hear-stale'), '落一条诊断账（观察期看误唤醒有多频繁）')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('hearStaleOf：没有 room/t 的旧条目视为可定位，不误判过时', () => {
+  const home = {
+    rooms: DEFAULT_ROOMS,
+    characters: {
+      kyu: { id: 'kyu', room: 'bedroom', hear: [{ from: 'moli', text: '旧数据' }] },
+    },
+  }
+  assert.equal(hearStaleOf(home, 'kyu'), false)
+  home.characters.kyu.hear = []
+  assert.equal(hearStaleOf(home, 'kyu'), false, '空缓冲不算过时')
+})
+
+test('autonomyEnabled：离家照旧 / 在家看开关', () => {
+  const at = (atHome, homeOn) =>
+    autonomyEnabled({ master: { atHome }, ...(homeOn === undefined ? {} : { autonomy: { homeOn } }) })
+  assert.equal(at(false, undefined), true, '离家：自动那档不动')
+  assert.equal(at(false, false), true, '离家不受"在家开关"影响')
+  assert.equal(at(true, undefined), false, '在家默认关（省 API、不抢主人模型槽位）')
+  assert.equal(at(true, false), false)
+  assert.equal(at(true, true), true, '打开后才跑')
+})
+
+test('setAutonomy：默认关、落盘、跨片保留', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    assert.deepEqual((await nest.home()).autonomy, { homeOn: false })
+    assert.deepEqual(await nest.setAutonomy({ homeOn: true }), { autonomy: { homeOn: true } })
+    await nest.close()
+    await nest.open()
+    assert.equal((await nest.home()).autonomy.homeOn, true, '跨片保留（与阈值同规格）')
+    await nest.setAutonomy({ homeOn: false })
+    assert.equal((await nest.home()).autonomy.homeOn, false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('home v3→v4 迁移：旧账本补 autonomy 默认关，用户数据不丢', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await writeFile(
+      join(dir, 'home.json'),
+      JSON.stringify({
+        version: 3,
+        rooms: DEFAULT_ROOMS,
+        characters: { kyu: { id: 'kyu', name: '小玖', room: 'living' } },
+        master: { atHome: false, room: null },
+        topics: {},
+        hearThresholds: { kyu: 3 },
+      }),
+    )
+    await nest.ensure()
+    const home = await nest.home()
+    assert.equal(home.version, HOME_VERSION)
+    assert.deepEqual(home.autonomy, { homeOn: false })
+    assert.deepEqual(home.characters.kyu.hear, [])
+    assert.equal(home.characters.kyu.name, '小玖')
+  } finally {
+    await cleanup()
+  }
 })

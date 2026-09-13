@@ -19,6 +19,9 @@
 //   say(who, text)        说话：同房直接听到 / 相邻进"听到"缓冲 / 远处无感；
 //                          log 行带 positions 全员位置快照 + audience 听众名单
 //   hear(charId)          某角色"听到"缓冲 + 决策链状态（只读）
+//   dropStaleHear(charId) 丢弃"人已走远"的过时动静（清空缓冲，不唤醒）
+//   setAutonomy({homeOn}) 自主闸：主人在家时要不要也跑 T6 自由互动（离家那档不变）
+//   autonomy()            → {homeOn}
 //   resolveHear(charId, decision, text)   听到决策：shout（普通发声，声音按距离传播，
 //                         shout 类型已退役）/ ignore（清空）
 //   scene(who)            视角：直接听到 / 相邻 / 远处 + 听到缓冲（who 可为主人）
@@ -50,7 +53,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, isBusy, humanInterval, checkTopicAbout, detectMoveIntent } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -62,6 +65,8 @@ const avatarUrl = (id) => new URL('./assets/avatars/' + id + '.png', import.meta
 const LLM_TIMEOUT_MS = 150000
 // T6 自主节奏轻推（§9.1）：主人最后交互后留 10 分钟过渡；T6 自身 5 分钟说话冷却
 // （自循环保险丝：轻推→说句没做事→仍空闲→下个 tick 又轻推；非猫间闸）
+// 2026-09-13：离家那档照旧；主人在家时由 home.autonomy.homeOn 开关决定跑不跑，
+// 参数沿用同一套（怕烧 API / 抢主人本地模型槽位就不开）。
 const T6_MASTER_GAP_MS = 10 * 60000
 const T6_SAY_COOLDOWN_MS = 5 * 60000
 
@@ -1221,6 +1226,7 @@ export default {
           })),
         })),
         master: { atHome: !!(home.master && home.master.atHome), room: (home.master && home.master.room) || null },
+        autonomy: { homeOn: !!(home.autonomy && home.autonomy.homeOn) },
         relations: rel.pairs || {},
         recap: sum && typeof sum.text === 'string' ? sum.text : null,
         avatars: AVATAR_IDS,
@@ -1338,19 +1344,33 @@ export default {
     // 调度层 T1（hear 缓冲攒满 → 私有 notice → 唤醒）：边沿触发——say 时刻 hearReady
     // 满立即试 + 回合结束全屋复检；tick 不查缓冲。notice 每批动静只入账一次
     // （hearNotified 标记，consumeHear 随缓冲重置），防缓冲持续满员期间刷屏。
+    // 2026-09-13 修订：过时动静（对话早散场 / 人已走远）先丢弃不唤醒——
+    // 唤醒本该是"刚攒满就掀被子"，被队列忙跳过而拖到几分钟后就不该再掀。
+    // 判据见 hearStaleOf（时间 HEAR_STALE_MS + 空间）。
     const tryWakeHear = async (charId, force = false) => {
       try {
         const st = await nest.status()
         if (!st || !st.open) return null
         const home = await nest.home()
         if (!hearReadyOf(home, charId)) return null
+        if (hearStaleOf(home, charId, nest.now())) {
+          const stale = await nest.dropStaleHear(charId)
+          console.log(
+            '[dsh-catnest] T1 丢弃过时动静（' + charId + '）：' + (stale && stale.dropped ? stale.dropped : 0) + ' 条',
+          )
+          return null
+        }
         const ch = home.characters && home.characters[charId]
         if (ch && !ch.hearNotified) {
           const last = ch.hear && ch.hear.length > 0 ? ch.hear[ch.hear.length - 1] : null
           const from = last ? last.from : 'master'
-          let fromRoom = null
-          if (from === 'master') fromRoom = home.master && home.master.atHome ? home.master.room : null
-          else if (home.characters && home.characters[from]) fromRoom = home.characters[from].room
+          // 位置取「说那句话时的房间」（旧条目无 room 才回落到说话人此刻的房间）：
+          // 墨璃在客厅说完再挪去卧室，小玖听到的仍是客厅的动静，别写成"隔壁卧室"。
+          let fromRoom = (last && last.room) || null
+          if (!fromRoom) {
+            if (from === 'master') fromRoom = home.master && home.master.atHome ? home.master.room : null
+            else if (home.characters && home.characters[from]) fromRoom = home.characters[from].room
+          }
           const fromName = from === 'master' ? '主人' : charName(home, from) || from
           const roomTxt = fromRoom ? roomName(home, fromRoom) : ''
           // 动静是她的耳朵、她的感知（v1 拍板改私有）；台词内容不誊进家庭时间线
@@ -1405,8 +1425,9 @@ export default {
     // 空闲（无自主 activity；暂停=不忙可推）+ 未睡 + 自己 5 分钟说话冷却 + 非 in-flight
     // → 私有 notice「家里很安静，你闲下来了」+ 非 force 唤醒（队列忙则跳过，下次 tick 重评）。
     // notice 只在排上回合时入账（免刷屏，无需额外标记）；频率自节流（醒来通常挂活动→忙→闸住）。
+    // 2026-09-13：主人在家时多一道 home.autonomy.homeOn 开关（默认关）；离家那档不变。
     const maybeT6 = async (home) => {
-      if (!home.master || home.master.atHome) return
+      if (!autonomyEnabled(home)) return
       let lines = []
       try {
         const t = await nest.transcript()
@@ -1627,6 +1648,13 @@ export default {
       resolveTopicSay: (charId, about) => nest.resolveTopicSay(charId, about),
       resolveTopicAction: (charId) => nest.resolveTopicAction(charId),
       pauseActivity: (id) => nest.pauseActivity(id),
+      // 自主闸（在家自由互动开关）：{ homeOn: boolean }
+      setAutonomy: (patch) => nest.setAutonomy(patch),
+      autonomy: async () => {
+        const h = await nest.home()
+        return { homeOn: !!(h.autonomy && h.autonomy.homeOn) }
+      },
+      dropStaleHear: (id) => nest.dropStaleHear(id),
       expireTopics: () => nest.expireTopics(),
       ambientTick: () => nest.ambientTick(),
       notice: (char, source, text, isPrivate) => nest.notice(char, source, text, isPrivate),
@@ -1842,6 +1870,12 @@ export default {
                 if (!char) return json(res, 400, { error: 'char required' })
                 return json(res, 200, await interruptReaction(char, 'master'))
               }
+              if (op === 'autonomy') {
+                // 在家自由互动开关（离家那档不受影响）：body { homeOn: boolean }
+                const r = await nest.setAutonomy({ homeOn: !!body.homeOn })
+                scheduleSnapshot()
+                return json(res, 200, r)
+              }
               json(res, 400, { error: 'unknown op: ' + String(op) })
               return
             }
@@ -1871,6 +1905,8 @@ export {
   roomRelation,
   isBusy,
   hearReadyOf,
+  hearStaleOf,
+  autonomyEnabled,
   respondersOrder,
   charName,
   freezeActivities,
