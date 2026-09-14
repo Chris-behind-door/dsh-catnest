@@ -203,6 +203,20 @@ export function isBusy(ch, now) {
   return new Date(ch.activityEndsAt).getTime() > now.getTime()
 }
 
+// ── 活动时长（§9.14，主人 2026-09-14 定案）──
+// activity 必须带结束时间：期间静默（T6 不轻推）、到期由 T3 唤醒一次。
+// 缺省按 60 分钟兜底、上限 24 小时——模型漏参数时不至于留下"永久忙"的地雷
+// （旧行为：无 duration → activityEndsAt=null → isBusy 永远为真，卡在同一件事里出不来）。
+export const ACTIVITY_DEFAULT_MIN = 60
+export const ACTIVITY_MAX_MIN = 24 * 60
+
+// T6 无产出退避（§9.14）：连着轻推都没产出（没说也没做事）时，冷却按 2^n 拉长、封顶 capMs。
+// 清零由调用方负责（有产出 / 手上有活 / 家里出事）。
+export function t6BackoffMs(streak, baseMs, capMs) {
+  const s = Number.isFinite(streak) && streak > 0 ? Math.min(Math.floor(streak), 20) : 0
+  return Math.min(baseMs * Math.pow(2, s), capMs)
+}
+
 // ── 持久状态（conditions）纯函数 ──
 
 // 条件名 → 展示标签（收录表优先，未知状态名原样）
@@ -1105,12 +1119,23 @@ export class CatNest {
       // 新活动（若之前有暂停中的视为放弃）
       ch.activityPaused = null
       ch.activityLeftMs = null
-      let endsAt = null
+      // §9.14：活动必须带结束时间。缺省 60 分钟兜底、上限 24 小时，
+      // 返回 defaulted/clamped 供工具回执提示模型（免得它悄悄漏了参数）。
+      let minutes = ACTIVITY_DEFAULT_MIN
+      let defaulted = false
+      let clamped = false
       if (durationMin !== undefined && durationMin !== null) {
         const d = Number(durationMin)
         if (!Number.isFinite(d) || d <= 0) throw new Error('durationMin 需要是正数')
-        endsAt = new Date(this.now().getTime() + d * 60000).toISOString()
+        minutes = d
+      } else {
+        defaulted = true
       }
+      if (minutes > ACTIVITY_MAX_MIN) {
+        minutes = ACTIVITY_MAX_MIN
+        clamped = true
+      }
+      const endsAt = new Date(this.now().getTime() + minutes * 60000).toISOString()
       ch.activity = activity
       ch.activityEndsAt = endsAt
       // 活动隔墙动静（§9.5，切片 2）：开始时相邻房角色 hear 缓冲加一条（主体先于事件）
@@ -1128,7 +1153,7 @@ export class CatNest {
       ch.lastAmbientAt = this.now().toISOString()
       await this.saveHome(home)
       await this.log('activity', { char: id, activity, endsAt })
-      return { char: id, activity, activityEndsAt: endsAt }
+      return { char: id, activity, activityEndsAt: endsAt, minutes, defaulted, clamped }
     })
   }
 

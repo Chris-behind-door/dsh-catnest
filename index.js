@@ -46,6 +46,10 @@
 //   - 调度层（2026-09-01 v1）：60s 心跳只推状态（conditions 翻转/activity 到期，零成本）；
 //     事件驱动唤醒（T1 动静攒满/T2 状态开始/T3 做完了事）走 notice 事件行 +
 //     全局串行队列（与接话链共用），沉默一等公民；详见 SCHEDULING_DESIGN.md
+//   - §9.14 自主节奏修订（2026-09-14 主人定案）：activity 必须带结束时间（缺省 60 分钟、
+//     上限 24 小时）；静默闸只看 activity（condition 期间照旧可唤醒，「睡觉」归 activity 管）；
+//     T6 冷却从「上次轻推」起算 + 无产出退避（5/10/20/40/80 分钟，封顶 2 小时）；
+//     快照补 activityEndsAt/activityPaused，前端活动行显示剩余时间。
 //
 // 宿主服务取法：llm / memory / personas 一律调用点惰性 ctx.get（B 规范不 import
 // 宿主包；服务时序不假设——personas 缺席时名册回退默认，llm 缺席时生成回落规则化）。
@@ -53,7 +57,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -69,6 +73,9 @@ const LLM_TIMEOUT_MS = 150000
 // 参数沿用同一套（怕烧 API / 抢主人本地模型槽位就不开）。
 const T6_MASTER_GAP_MS = 10 * 60000
 const T6_SAY_COOLDOWN_MS = 5 * 60000
+// §9.14（2026-09-14 主人定案）：轻推冷却从「上次说话」改成「上次轻推」起算，并做无产出退避
+// （2^n 拉长、封顶 2 小时）。旧行为是「从不说话的猫每个 tick 都被推一次」——58h 片 429 次推的根因。
+const T6_BACKOFF_MAX_MS = 120 * 60000
 
 // 收尾蒸馏（2026-08-26 定案 #3/#4）：一次生成、按角色分段的条目式输出。
 // 【回顾】段=主人回来时的总述（写 summary.json/recap）；每角色段=该角色自己的记忆
@@ -557,7 +564,10 @@ export default {
           type: 'object',
           properties: {
             activity: { type: 'string', description: '活动名（空字符串=停下）' },
-            minutes: { type: 'number', description: '预计持续分钟数（可选）' },
+            minutes: {
+              type: 'number',
+              description: '预计持续分钟数（默认 60，最长 24 小时；到点自然结束，框架会叫醒你一次）',
+            },
           },
           required: ['activity'],
         },
@@ -890,12 +900,16 @@ export default {
         if (name === 'do_activity') {
           const activity = typeof args.activity === 'string' ? args.activity : ''
           const minutes = args.minutes
-          await nest.setActivity(charId, activity === '' ? null : activity, minutes)
+          const r = await nest.setActivity(charId, activity === '' ? null : activity, minutes)
           await nest.resolveTopicAction(charId)
           scheduleSnapshot()
+          // §9.14：活动必带结束时间。漏参数/超上限时把兜底结果回执给模型，让它自己纠正。
+          let tip = ''
+          if (r && r.defaulted) tip = '（没给时长，先按 60 分钟计）'
+          else if (r && r.clamped) tip = '（超过 24 小时上限，按 24 小时计）'
           return {
             ok: true,
-            result: activity === '' ? '已停下当前活动。' : '开始做：' + activity + '。',
+            result: activity === '' ? '已停下当前活动。' : '开始做：' + activity + tip + '。',
             effect: { tool: 'do_activity', activity },
           }
         }
@@ -1068,8 +1082,8 @@ export default {
         (familyCards.length > 0 ? '【家人】\n' + familyCards.join('\n') + '\n\n' : '') +
         '【主人】' + MASTER_PERSONA + '\n\n' +
         '你通过调用工具来行动：想说话就调用 say（说话时伴随的即时小动作放进 say 的 action，没有就别传）；' +
-        '想走动就调用 move_to；想做事就调用 do_activity；' +
-        '想记住什么就调用 remember；心情/状态变化时用 set_condition 设置身体状态（发情/生病/受伤…，可带倒计时）；' +
+        '想走动就调用 move_to；想做事就调用 do_activity（做事要说预计多久，见下面的分寸）；' +
+        '想记住什么就调用 remember；心情/身体状态（发情/生病/受伤…，可带倒计时）用 set_condition；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
         '同一轮里可以调用多个工具，也该把这一轮要做的事一次调完（比如一边说话一边走去别的房间，就把 say 和 move_to 放在同一轮里调）。' +
         '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
@@ -1083,6 +1097,9 @@ export default {
         '· 想跟姐妹认真聊一件事就用 open_topic 提起它（顺带说开场白），聊透了用 end_topic 收掉；' +
         '随口一句、打招呼、应答都不用开话题。\n' +
         '· 想暂时放下手里的活，用 pause_activity（计时继续走，之后同名 do_activity 可以接回来）；做完了用 do_activity 传空字符串。\n' +
+        '· 做事要给出预计时长（分钟）：做一会儿就给几十，睡一觉这种给足（比如 do_activity 传「睡觉」和 480）。到点框架会叫醒你一次。\n' +
+        '· 做事期间家里安静也不会来打扰你，所以想安静待着就找件事做（哪怕只是「发呆」）；反过来，什么都不做地闲着，过一阵会被问一句「闲下来了」。\n' +
+        '· 睡觉是「在做的事」，不是身体状态：想睡就用 do_activity 传「睡觉」，别用 set_condition（set_condition 留给生病、发情、受伤这类身体变化）。\n' +
         '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题（想不出聊什么就先用 pick_topic 翻翻），或继续安静待着。'
 
       // 关系段（易变）：构建逻辑不变，出口搬到 user 尾部动态窗口
@@ -1257,6 +1274,8 @@ export default {
           name: c.name,
           room: c.room,
           activity: c.activity || null,
+          activityEndsAt: c.activityEndsAt || null, // §9.14：前端显示活动剩余时间
+          activityPaused: !!c.activityPaused, // §9.14：前端标注「放下了，可以接回」
           mood: c.mood || null,
           conditions: (Array.isArray(c.conditions) ? c.conditions : []).map((x) => ({
             id: x.id,
@@ -1341,6 +1360,8 @@ export default {
 
     const turningChars = new Set() // in-flight 标记：同一角色不叠加唤醒
     let turnPending = 0 // 全局串行队列里的回合数（含正在跑的）
+    // T6 无产出退避状态（§9.14）：charId → { streak, nudgedAt }。内存态，重启即清零。
+    const t6Idle = new Map()
     let turnChain = Promise.resolve()
 
     // 单回合：in-flight 标记 + agentTurn + 统一结算广播（settle/replyError）。
@@ -1468,10 +1489,14 @@ export default {
     }
 
     // T6 自主节奏轻推（§9.1，tick 第 3 步）：主人离家 + 最后交互超 10 分钟过渡 + 角色
-    // 空闲（无自主 activity；暂停=不忙可推）+ 未睡 + 自己 5 分钟说话冷却 + 非 in-flight
+    // 空闲（无自主 activity；暂停=不忙可推）+ 非 in-flight + 冷却已过
     // → 私有 notice「家里很安静，你闲下来了」+ 非 force 唤醒（队列忙则跳过，下次 tick 重评）。
-    // notice 只在排上回合时入账（免刷屏，无需额外标记）；频率自节流（醒来通常挂活动→忙→闸住）。
+    // notice 只在排上回合时入账（免刷屏，无需额外标记）。
     // 2026-09-13：主人在家时多一道 home.autonomy.homeOn 开关（默认关）；离家那档不变。
+    // §9.14（2026-09-14 主人定案）：静默闸只看 activity —— condition 期间照旧可唤醒（生病/发情
+    // 是身体状态，不占用注意力，不是"没空"）；「睡觉」归 activity 管（do_activity('睡觉', 480)）。
+    // 另外冷却从「上次轻推」起算 + 无产出退避：连着推都没反应就把间隔 2^n 拉长（封顶 2 小时），
+    // 有产出 / 手上有活 / 家里有事才清零。
     const maybeT6 = async (home) => {
       if (!autonomyEnabled(home)) return
       let lines = []
@@ -1494,21 +1519,31 @@ export default {
         }
       }
       // 从未交互（家未开张）视为早过过渡期：主人长期不在，猫该有自己的生活
-      if (Date.now() - lastMasterMs <= T6_MASTER_GAP_MS) return
+      if (Date.now() - lastMasterMs <= T6_MASTER_GAP_MS) {
+        t6Idle.clear() // 主人刚有动静 → 退避清零，之后按新鲜状态重新算
+        return
+      }
       for (const id of Object.keys(home.characters || {})) {
         const ch = home.characters[id]
         if (!ch) continue
         if (turningChars.has(id)) continue
-        if (isBusy(ch, new Date())) continue // 有活动在忙（暂停=不忙，可以被轻推）
-        const sleeping = (Array.isArray(ch.conditions) ? ch.conditions : []).some(
-          (c) => c.name === '睡觉' && conditionPhase(c, new Date()) === 'active',
-        )
-        if (sleeping) continue // 睡着的猫不被「安静」叫醒
-        if (lastSayMs[id] && Date.now() - lastSayMs[id] <= T6_SAY_COOLDOWN_MS) continue
+        if (isBusy(ch, new Date())) {
+          t6Idle.delete(id) // 手上有活（含睡觉）→ 退避清零：它的自主性已经有着落，不用推
+          continue
+        }
+        const nowMs = Date.now()
+        const lastSay = lastSayMs[id] || 0
+        const idle = t6Idle.get(id)
+        if (idle && lastSay > idle.nudgedAt) t6Idle.delete(id) // 轻推之后说过话 = 有产出 → 退避清零
+        const streak = t6Idle.has(id) ? t6Idle.get(id).streak : 0
+        const coolMs = t6BackoffMs(streak, T6_SAY_COOLDOWN_MS, T6_BACKOFF_MAX_MS)
+        const lastTouch = Math.max(lastSay, idle ? idle.nudgedAt : 0)
+        if (lastTouch > 0 && nowMs - lastTouch <= coolMs) continue
         if (turnPending > 0) continue // 队列忙则跳过（非 force），下次 tick 重评
         await nest.notice(id, 'self', '家里很安静，你闲下来了', true)
         // 自由聊天语境（§9.13）：T6 轻推是两只猫娘自己聊起来的主通道 → 给参考引子
         void enqueueTurn(id, { silentNoLlm: true, seeds: 'free' })
+        t6Idle.set(id, { streak: streak + 1, nudgedAt: nowMs })
       }
     }
 
@@ -1529,6 +1564,7 @@ export default {
           const label = (cond && cond.label) || conditionLabel(e.condition)
           const remain = cond && cond.endAt ? '（还剩' + humanInterval(Date.now(), new Date(cond.endAt).getTime()) + '）' : ''
           await nest.notice(e.charId, 'body', '你感觉到身体变了：' + label + '开始了' + remain, true)
+          t6Idle.delete(e.charId) // §9.14：家里有事 → 退避清零
           await tryWake(e.charId, true)
         }
         // 2) activity 到期（T3）：静默清除（不落 activity 行）+「做完了事」公共 notice
@@ -1541,6 +1577,7 @@ export default {
           const actName = ch.activity
           await nest.clearActivity(ch.id)
           await nest.notice(ch.id, ch.id, (ch.name || ch.id) + '做完了' + actName, false)
+          t6Idle.delete(ch.id) // §9.14：活动做完是家里的事 → 退避清零，下次从头算
           await tryWake(ch.id, true)
         }
         // 3) 话题沉默自动收（状态机）+ 活动隔墙动静持续补条 + T6 自主节奏轻推

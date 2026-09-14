@@ -2202,17 +2202,16 @@ test('T6 门控：离家轻推（每 tick 至多一只）；睡觉/忙/刚说过
     assert.equal(t6Notices.length, 1, 'notice 只在成功排回合时入账')
     assert.equal(t6Notices[0].source, 'self')
     assert.equal(t6Notices[0].private, true)
-    // 2) 小玖睡觉 → 下次 tick 推墨璃（睡着的猫不被「安静」叫醒）
-    await svc.setCondition('kyu', { name: '睡觉' })
+    // 2) 小玖睡觉（§9.14：睡觉归 activity 管，不再是 condition）→ 下次 tick 推墨璃
+    await svc.setActivity('kyu', '睡觉', 480)
     const n0 = prompts.length
     await svc.tick()
     await until(() => prompts.length >= n0 + 1)
     await new Promise((r) => setTimeout(r, 150))
     const moliTurn = prompts.slice(n0).find((p) => p.system.includes('你是"猫窝"家里的成员墨璃'))
-    assert.ok(moliTurn, '睡觉的小玖被排除，推的是墨璃')
+    assert.ok(moliTurn, '在睡觉（activity）的小玖被排除，推的是墨璃')
     assert.ok(!prompts.slice(n0).some((p) => p.system.includes('成员小玖')), '小玖不被推')
     // 3) 小玖起床并在忙；墨璃刚说过话（5min 冷却）→ tick 无人被推
-    await svc.setCondition('kyu', { name: '睡觉', lastsDays: 0 })
     await svc.setActivity('kyu', '读书', 60)
     await svc.say('moli', '喵')
     const n1 = prompts.length
@@ -2225,6 +2224,58 @@ test('T6 门控：离家轻推（每 tick 至多一只）；睡觉/忙/刚说过
     await svc.tick()
     await new Promise((r) => setTimeout(r, 250))
     assert.equal(prompts.length, n2, '主人在家 T6 不触发')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('T6 静默闸只认 activity（§9.14）：生病等 condition 期间照旧被自主节奏唤醒', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-t6cond-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.setCondition('kyu', { name: '生病', lastsDays: 2 })
+    await svc.tick()
+    await until(() =>
+      prompts.some((p) => p.system.includes('成员小玖') && p.user.includes('家里很安静，你闲下来了')),
+    )
+    assert.ok(true, '生病不占注意力 → 照旧轻推（condition 不再参与静默闸）')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('T6 无产出退避（§9.14）：推过一次还没产出 → 同一只不重复推（冷却从上次轻推起算）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-t6back-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    await svc.open()
+    const kyuNudges = () =>
+      prompts.filter((p) => p.system.includes('成员小玖') && p.user.includes('家里很安静，你闲下来了')).length
+    await svc.tick()
+    await until(() => kyuNudges() >= 1)
+    await new Promise((r) => setTimeout(r, 150))
+    await svc.tick()
+    await new Promise((r) => setTimeout(r, 300))
+    await svc.tick()
+    await new Promise((r) => setTimeout(r, 300))
+    assert.equal(kyuNudges(), 1, '一个字没说（无产出）→ 退避生效，不重复推同一只')
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    const notices = log.filter(
+      (e) => e.type === 'notice' && e.text === '家里很安静，你闲下来了' && e.char === 'kyu',
+    )
+    assert.equal(notices.length, 1, 'notice 也只入账一次')
   } finally {
     await rmSafe(dir)
   }

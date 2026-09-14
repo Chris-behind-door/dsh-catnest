@@ -14,6 +14,7 @@ import {
   COMPANION_IDS,
   roomRelation,
   isBusy,
+  t6BackoffMs,
   hearReadyOf,
   hearStaleOf,
   autonomyEnabled,
@@ -154,6 +155,18 @@ test('setActivity：设置带时长 / 清除 / 非法参数', async () => {
     const r = await nest.setActivity('moli', '读书', 30)
     assert.equal(r.activity, '读书')
     assert.equal(r.activityEndsAt, new Date(FIXED.getTime() + 30 * 60000).toISOString())
+    assert.equal(r.minutes, 30)
+    assert.equal(r.defaulted, false)
+    // §9.14：活动必须带结束时间。缺省 60 分钟兜底、上限 24 小时
+    const def = await nest.setActivity('moli', '发呆')
+    assert.equal(def.defaulted, true)
+    assert.equal(def.minutes, 60)
+    assert.equal(def.activityEndsAt, new Date(FIXED.getTime() + 60 * 60000).toISOString())
+    const big = await nest.setActivity('moli', '长睡', 5000)
+    assert.equal(big.clamped, true)
+    assert.equal(big.minutes, 24 * 60)
+    assert.equal(big.activityEndsAt, new Date(FIXED.getTime() + 24 * 60 * 60000).toISOString())
+    await nest.setActivity('moli', '读书', 30)
     const home = await nest.home()
     assert.equal(home.characters.moli.activity, '读书')
     const cleared = await nest.setActivity('moli', null)
@@ -309,6 +322,17 @@ test('isBusy：无活动不忙 / 有活动到期不忙 / 无结束时间一直�
   assert.equal(isBusy({ activity: '发呆', activityEndsAt: null }, now), true)
 })
 
+test('t6BackoffMs：无产出退避 2^n 拉长、封顶（§9.14）', () => {
+  const base = 5 * 60000
+  const cap = 120 * 60000
+  assert.equal(t6BackoffMs(0, base, cap), base, '第一次轻推用基础冷却')
+  assert.equal(t6BackoffMs(1, base, cap), 10 * 60000)
+  assert.equal(t6BackoffMs(3, base, cap), 40 * 60000)
+  assert.equal(t6BackoffMs(99, base, cap), cap, '封顶 2 小时')
+  assert.equal(t6BackoffMs(-1, base, cap), base, '非法 streak 归零')
+  assert.equal(t6BackoffMs(undefined, base, cap), base)
+})
+
 test('hearReadyOf：缓冲区攒满阈值才 ready（小玖3 / 墨璃5）', () => {
   const home = {
     characters: {
@@ -382,18 +406,29 @@ test('活动时长模式外冻结：close 冻结剩余，open 解冻且片外时
   }
 })
 
-test('活动无结束时间不清除：close 保留 activity，activityLeftMs 不写', async () => {
+test('活动缺省时长按 60 分钟兜底（§9.14）：close 冻结成剩余毫秒，不再是「永久忙」', async () => {
   const { dir, nest, cleanup } = await mk()
   try {
     await nest.open()
-    await nest.setActivity('kyu', '发呆') // 无 duration
+    const r = await nest.setActivity('kyu', '发呆') // 无 duration → 兜底 60 分钟
+    assert.equal(r.defaulted, true)
     await nest.close()
     const home = await nest.home()
     assert.equal(home.characters.kyu.activity, '发呆')
-    assert.equal(home.characters.kyu.activityLeftMs, null)
+    assert.ok(
+      Number.isFinite(home.characters.kyu.activityLeftMs) && home.characters.kyu.activityLeftMs > 0,
+      '有结束时间 → close 换算成剩余毫秒（片外不流逝）',
+    )
   } finally {
     await cleanup()
   }
+})
+
+test('freezeActivities 旧账本遗留（无结束时间的活动）：保留 activity、不写 activityLeftMs', () => {
+  const home = { characters: { a: { id: 'a', activity: '发呆', activityEndsAt: null, activityLeftMs: null } } }
+  freezeActivities(home, FIXED)
+  assert.equal(home.characters.a.activity, '发呆')
+  assert.equal(home.characters.a.activityLeftMs, null)
 })
 
 // ── 家物理 · 对话流 ──
