@@ -53,7 +53,7 @@
 | 归一化 | `lib.js` `roomItems(home, roomId)` | → `[{ name, state\|null, count }]`，手写脏数据的容错面 |
 | 渲染 | `lib.js` `roomItemsText(home, roomId)` | → `沙发、电视（关着）`；空房间返回空串（不占 token） |
 | 角色注入 | `index.js` `buildPresenceView` | 位置行之后、当前话题之前加一行 `【屋里有什么】` |
-| 主人视角 | `index.js` `stateView` + `lib/client.js` `ThingsCard` | 房间随快照带 `items`，右侧栏角色卡下面列出全屋（胶囊化，✎ 就地编辑） |
+| 主人视角 | `index.js` `stateView` + `lib/client.js` `ThingsCard` | 房间随快照带 `items`，右侧栏角色卡下面列出全屋（对齐清单式，✎ 悬停现身、就地编辑） |
 | 迁移 | `lib.js` `doEnsure()` | v4 → v5，补字段不覆盖用户数据 |
 
 **测试**（`node --test`，125/125）：lib 新增 3 例（v4→v5 迁移三分支 / 默认家当形态 /
@@ -100,7 +100,7 @@
 | 写路径 | `lib.js` `CatNest.setRoomItems(roomId, items)` | 整表替换 + 校验；上限常量 `ITEMS_MAX` 等 |
 | HTTP | `index.js` `op: 'setItems'` | body `{ room, items }`；失败 500 + error 消息 |
 | 服务面 | `index.js` `ctx.catnest.setRoomItems` | 同口径，供脚本 / 测试调用 |
-| 面板 | `lib/client.js` `ThingsCard` | 右侧栏角色卡下面：一个房间一块（有人的底色点亮），物品做胶囊（名字 / ×数量 / 状态）；✎ 就地展开编辑，一件一张小块（名字一行、数量+状态一行）+ 保存 / 取消 / 加一件 / 删 |
+| 面板 | `lib/client.js` `ThingsCard` | 右侧栏角色卡下面：一房间一行，房间名左列（小点标记，有人的点亮起）+ 物品淡色右列（· 分隔，行间极淡分隔线）；✎ 悬停才现身，点开在该行下方展开编辑（一件一块：名字一行、数量+状态一行，虚线分隔不用外框）+ 保存 / 取消 / 加一件 / 删 |
 | 账本加固 | `lib.js` `readJsonDetailed` + `doEnsure` + `home()` | 损坏备份并报错，绝不静默重置 |
 
 **测试**（`node --test`，128/128）：lib 新增 2 例（`setRoomItems` 正常+清空+六种非法输入
