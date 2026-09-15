@@ -36,15 +36,25 @@ export const CHARACTER_BIOS = {
   moli: '墨璃：黑长直红瞳的姐姐，温柔沉静，说话轻声细语，最会照顾人。',
 }
 
-// 房间建议稿（草案第四节）；home.json 落盘后以文件为准，主人增删直接改文件
+// 房间建议稿（草案第四节）；home.json 落盘后以文件为准，主人增删直接改文件。
+// items（HOUSE_DESIGN §1 家当）：房间里的东西，`{ name, state? }`——房间内名字即标识（不带 id，
+// 主人手改 json 省事），state 是自由短语（「空的」「关着」），不带就没有状态。
+// 只读：不做拿放/使用（物品互动系统不在本期），状态由主人改文件维护。
 export const DEFAULT_ROOMS = [
-  { id: 'entry', name: '玄关', functions: ['迎接', '送别'], adjacent: ['living'] },
-  { id: 'living', name: '客厅', functions: ['读书', '聊天', '游戏', '看电视'], adjacent: ['entry', 'kitchen', 'balcony', 'study', 'bedroom'] },
-  { id: 'study', name: '书房', functions: ['安静看书', '发呆'], adjacent: ['living'] },
-  { id: 'kitchen', name: '厨房', functions: ['做饭', '吃东西', '投喂'], adjacent: ['living'] },
-  { id: 'bedroom', name: '卧室', functions: ['睡觉', '贴贴', '亲密'], adjacent: ['living'] },
-  { id: 'bath', name: '浴室', functions: ['洗漱', '泡澡'], adjacent: ['bedroom'] },
-  { id: 'balcony', name: '阳台', functions: ['晒太阳', '看风景', '晾衣服'], adjacent: ['living'] },
+  { id: 'entry', name: '玄关', functions: ['迎接', '送别'], adjacent: ['living'],
+    items: [{ name: '鞋柜' }, { name: '衣帽架' }, { name: '换鞋凳' }] },
+  { id: 'living', name: '客厅', functions: ['读书', '聊天', '游戏', '看电视'], adjacent: ['entry', 'kitchen', 'balcony', 'study', 'bedroom'],
+    items: [{ name: '沙发' }, { name: '茶几' }, { name: '电视', state: '关着' }, { name: '落地灯' }, { name: '地毯' }] },
+  { id: 'study', name: '书房', functions: ['安静看书', '发呆'], adjacent: ['living'],
+    items: [{ name: '书桌' }, { name: '书架' }, { name: '台灯' }, { name: '电脑' }] },
+  { id: 'kitchen', name: '厨房', functions: ['做饭', '吃东西', '投喂'], adjacent: ['living'],
+    items: [{ name: '灶台' }, { name: '冰箱' }, { name: '水壶', state: '空的' }, { name: '碗柜' }] },
+  { id: 'bedroom', name: '卧室', functions: ['睡觉', '贴贴', '亲密'], adjacent: ['living'],
+    items: [{ name: '床' }, { name: '衣柜' }, { name: '梳妆台' }, { name: '窗帘', state: '拉着' }] },
+  { id: 'bath', name: '浴室', functions: ['洗漱', '泡澡'], adjacent: ['bedroom'],
+    items: [{ name: '淋浴' }, { name: '浴缸' }, { name: '洗手台' }, { name: '毛巾架' }] },
+  { id: 'balcony', name: '阳台', functions: ['晒太阳', '看风景', '晾衣服'], adjacent: ['living'],
+    items: [{ name: '晾衣架' }, { name: '洗衣机' }, { name: '绿植' }, { name: '躺椅' }] },
 ]
 
 // 三对角色对（草案第六节：主人×姐姐、主人×小玖、姐姐×小玖）
@@ -66,7 +76,9 @@ export function initialRelationsOf(companionId) {
 // （pause_activity 放下锅铲）+ lastAmbientAt（活动隔墙动静去重）
 // v3→v4（2026-09-13）：home.autonomy 自主闸（在家自由互动开关）；hear 条目补 room
 // （说话时房间，供唤醒校验与位置描述）
-export const HOME_VERSION = 4
+// v4→v5（2026-09-16 HOUSE_DESIGN §1）：rooms[].items 家当（房间里的东西 + 可选状态）。迁移按
+// 房间 id 补默认稿（主人改 home.json 即可增删），不在默认表里的房间给空数组。
+export const HOME_VERSION = 5
 // "听到"决策链阈值（草案：小玖3条/姐姐5条，待调——存 home.json 可改）
 export const HEAR_THRESHOLDS = { kyu: 3, moli: 5 }
 // 同房接话顺序：小玖活泼先抢，姐姐谦让（草案 4.5）
@@ -117,7 +129,7 @@ const CLOSE_SNAP_FILE = 'close.snapshot.json'
 function defaultHome() {
   return {
     version: HOME_VERSION,
-    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent] })),
+    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent], items: r.items.map((it) => ({ ...it })) })),
     characters: Object.fromEntries(
       COMPANION_IDS.map((id) => [
         id,
@@ -182,6 +194,34 @@ async function pathExists(p) {
 export function roomName(home, roomId) {
   const r = (home.rooms || []).find((x) => x.id === roomId)
   return r ? r.name : String(roomId)
+}
+
+// 归一化房间物品（HOUSE_DESIGN §1 家当）：item 是 `{ name, state? }`，也容忍主人手写成纯字符串
+// 数组；state 归一成字符串或 null。场景注入与前端视角共用同一个口径。
+export function roomItems(home, roomId) {
+  const r = (home.rooms || []).find((x) => x && x.id === roomId)
+  const list = r && Array.isArray(r.items) ? r.items : []
+  const out = []
+  for (const it of list) {
+    if (typeof it === 'string') {
+      const name = it.trim()
+      if (name) out.push({ name, state: null })
+      continue
+    }
+    if (!it || typeof it !== 'object') continue
+    const name = typeof it.name === 'string' ? it.name.trim() : ''
+    if (!name) continue
+    const state = typeof it.state === 'string' && it.state.trim() ? it.state.trim() : null
+    out.push({ name, state })
+  }
+  return out
+}
+
+// 房间物品渲染文本（「沙发、电视（关着）」）；没有东西的房间返回空串（不占 token）
+export function roomItemsText(home, roomId) {
+  return roomItems(home, roomId)
+    .map((it) => (it.state ? it.name + '（' + it.state + '）' : it.name))
+    .join('、')
 }
 
 // ── 家物理 · 纯函数 ──
@@ -929,6 +969,15 @@ export class CatNest {
         }
         if (!Array.isArray(ch.conditions)) {
           ch.conditions = []
+          changed = true
+        }
+      }
+      // v4 → v5 迁移：房间补 items 家当（已知房间用默认稿，其余空数组；不猜主人的东西）
+      for (const r of home.rooms) {
+        if (!r || typeof r !== 'object') continue
+        if (!Array.isArray(r.items)) {
+          const def = DEFAULT_ROOMS.find((x) => x.id === r.id)
+          r.items = def && Array.isArray(def.items) ? def.items.map((it) => ({ ...it })) : []
           changed = true
         }
       }

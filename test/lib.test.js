@@ -20,6 +20,8 @@ import {
   autonomyEnabled,
   respondersOrder,
   charName,
+  roomItems,
+  roomItemsText,
   settleActivities,
   dialogueText,
   companionSync,
@@ -1619,6 +1621,84 @@ test('home v3→v4 迁移：旧账本补 autonomy 默认关，用户数据不丢
   } finally {
     await cleanup()
   }
+})
+
+test('home v4→v5 迁移：房间补 items 家当（已知房间默认稿，未知房间空数组，已有不动）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await writeFile(
+      join(dir, 'home.json'),
+      JSON.stringify({
+        version: 4,
+        rooms: [
+          { id: 'living', name: '客厅', functions: ['聊天'], adjacent: ['kitchen'] },
+          { id: 'attic', name: '阁楼', functions: [], adjacent: [] },
+          { id: 'study', name: '书房', functions: [], adjacent: ['living'], items: [{ name: '我自己的东西' }] },
+        ],
+        characters: { kyu: { id: 'kyu', name: '小玖', room: 'living' } },
+        master: { atHome: false, room: null },
+        topics: {},
+        autonomy: { homeOn: false },
+        hearThresholds: { kyu: 3 },
+      }),
+    )
+    await nest.ensure()
+    const home = await nest.home()
+    assert.equal(home.version, HOME_VERSION)
+    assert.equal(home.rooms[0].name, '客厅')
+    assert.deepEqual(home.rooms[0].adjacent, ['kitchen'], '用户数据不丢')
+    assert.ok(home.rooms[0].items.length > 0, '已知房间补默认家当')
+    assert.deepEqual(home.rooms[0].items[2], { name: '电视', state: '关着' })
+    assert.deepEqual(home.rooms[1].items, [], '默认表里没有的房间给空数组（不猜主人有什么）')
+    assert.deepEqual(home.rooms[2].items, [{ name: '我自己的东西' }], '已有 items 不被覆盖')
+  } finally {
+    await cleanup()
+  }
+})
+
+// ── 家当（HOUSE_DESIGN §1）──
+
+test('默认家当：每个默认房间都有东西，形态是 {name, state?}', () => {
+  for (const r of DEFAULT_ROOMS) {
+    assert.ok(Array.isArray(r.items) && r.items.length >= 2, r.id + ' 有家当')
+    for (const it of r.items) {
+      assert.equal(typeof it.name, 'string')
+      assert.ok(!('state' in it) || typeof it.state === 'string', it.name + ' 的 state 是字符串')
+    }
+  }
+})
+
+test('roomItems/roomItemsText：归一化手写脏数据，状态渲染成括号，空房间不占 token', () => {
+  const home = {
+    rooms: [
+      {
+        id: 'living',
+        name: '客厅',
+        // 容错面：纯字符串、多余空白、缺 name、非对象
+        items: [
+          { name: '沙发' },
+          { name: '电视', state: '关着' },
+          '茶几',
+          { name: ' 落地灯 ', state: '   ' },
+          { state: '孤儿' },
+          null,
+          42,
+        ],
+      },
+      { id: 'study', name: '书房', items: [] },
+      { id: 'bath', name: '浴室' },
+    ],
+  }
+  assert.deepEqual(roomItems(home, 'living'), [
+    { name: '沙发', state: null },
+    { name: '电视', state: '关着' },
+    { name: '茶几', state: null },
+    { name: '落地灯', state: null },
+  ])
+  assert.equal(roomItemsText(home, 'living'), '沙发、电视（关着）、茶几、落地灯')
+  assert.equal(roomItemsText(home, 'study'), '', '空房间返回空串')
+  assert.equal(roomItemsText(home, 'bath'), '', '缺 items 字段当空')
+  assert.deepEqual(roomItems(home, 'nowhere'), [])
 })
 
 // ── 参考话题池（§9.13）──

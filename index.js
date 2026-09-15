@@ -61,7 +61,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -408,7 +408,13 @@ export default {
               })
               .join('\n')
           : ''
-      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + topicsText
+      // HOUSE_DESIGN §1 家当：只给「此刻所在房间」的东西（与声音同一套可见性——隔壁有什么看不见）
+      const myRoom = home.characters && home.characters[charId] ? home.characters[charId].room : null
+      const things = myRoom ? roomItemsText(home, myRoom) : ''
+      const thingsText = things
+        ? '\n【屋里有什么】' + (roomName(home, myRoom) || myRoom) + '：' + things
+        : ''
+      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + thingsText + topicsText
     }
 
     // 片内时间线人话化：say 按 audience 名单查表渲染（同房真切/相邻弱化前缀/远处不入）；
@@ -1272,7 +1278,8 @@ export default {
       const sum = await nest.latestClosedSummary()
       return {
         status: st,
-        rooms: (home.rooms || []).map((r) => ({ id: r.id, name: r.name })),
+        // HOUSE_DESIGN §1 家当：房间带上物品（主人视角看全屋；角色视角走 roomItemsText，只给自己房间）
+        rooms: (home.rooms || []).map((r) => ({ id: r.id, name: r.name, items: roomItems(home, r.id) })),
         characters: Object.values(home.characters || {}).map((c) => ({
           id: c.id,
           name: c.name,

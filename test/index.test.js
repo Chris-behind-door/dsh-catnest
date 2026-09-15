@@ -6,6 +6,7 @@ import { mkdtemp, rm, readFile, writeFile } from 'node:fs/promises'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import plugin from '../index.js'
+import { HOME_VERSION } from '../lib.js'
 
 const mkCtx = (services = {}) => {
   const provided = {}
@@ -2404,11 +2405,11 @@ test('在家自由互动开关：API 落盘 + state 暴露（离家那档不动�
     assert.equal(JSON.parse(r.body).autonomy.homeOn, true)
     st = JSON.parse((await call('GET', '/catnest/api/state')).body)
     assert.equal(st.autonomy.homeOn, true)
-    // 关回去 → 落盘持久（v4 账本）
+    // 关回去 → 落盘持久（账本版本随 HOME_VERSION 走，别再硬编码）
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'autonomy', homeOn: false }))
     const homeJson = JSON.parse(await readFile(join(n.dir, 'home.json'), 'utf8'))
     assert.equal(homeJson.autonomy.homeOn, false)
-    assert.equal(homeJson.version, 4)
+    assert.equal(homeJson.version, HOME_VERSION)
     // 服务面同口径
     assert.deepEqual(await n.svc.setAutonomy({ homeOn: true }), { autonomy: { homeOn: true } })
     assert.deepEqual(await n.svc.autonomy(), { homeOn: true })
@@ -2521,6 +2522,67 @@ test('pick_topic 工具：按当前房间给引子，也能点类目', async () 
     assert.equal(auto.other.items.length, 2)
     const bad = await svc.topicSeeds('moli', { category: '天台' })
     assert.equal(bad.error, 'NO_CATEGORY')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('家当（HOUSE_DESIGN §1）：prompt 只注入自己所在房间的东西，挪房即换，隔壁看不见', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-things-'))
+  const ws = webServerStub()
+  const prompts = []
+  const llm = {
+    stream: (opts) => {
+      const stop = hasAssistantToolCall(opts.messages)
+      if (!stop) prompts.push({ system: opts.system, user: opts.messages[0].content[0].text })
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: '嗯' }) }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    const kyuPrompts = () => prompts.filter((p) => p.system.includes('成员小玖'))
+    const lastKyuUser = () => {
+      const list = kyuPrompts()
+      return list.length > 0 ? list[list.length - 1].user : null
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('study')
+    await svc.moveCharacter('kyu', 'study')
+
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在忙吗' }))
+    await until(() => kyuPrompts().length >= 1)
+    const u1 = lastKyuUser()
+    assert.ok(
+      u1.includes('【屋里有什么】书房：书桌、书架、台灯、电脑'),
+      '书房家当行: ' + u1.slice(-200),
+    )
+    assert.ok(!u1.includes('沙发'), '隔壁客厅有什么看不见')
+
+    // 挪去客厅：同一份 prompt 里家当行跟着换
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveMaster('living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '过来坐' }))
+    await until(() => kyuPrompts().length >= 2)
+    const u2 = lastKyuUser()
+    assert.ok(u2.includes('【屋里有什么】客厅：'), '挪房即换家当行')
+    assert.ok(u2.includes('电视（关着）'), '带状态的物品渲染成括号')
+    assert.ok(!u2.includes('书桌'), '离开书房后看不见书房的东西')
   } finally {
     await rmSafe(dir)
   }
