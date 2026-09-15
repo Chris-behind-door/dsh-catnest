@@ -22,6 +22,7 @@
 //   dropStaleHear(charId) 丢弃"人已走远"的过时动静（清空缓冲，不唤醒）
 //   setAutonomy({homeOn}) 自主闸：主人在家时要不要也跑 T6 自由互动（离家那档不变）
 //   autonomy()            → {homeOn}
+//   setRoomItems(room, items)  家当编辑（HOUSE_DESIGN §2）：整表替换房间里的东西（校验从严）
 //   resolveHear(charId, decision, text)   听到决策：shout（普通发声，声音按距离传播，
 //                         shout 类型已退役）/ ignore（清空）
 //   scene(who)            视角：直接听到 / 相邻 / 远处 + 听到缓冲（who 可为主人）
@@ -1749,6 +1750,8 @@ export default {
         const h = await nest.home()
         return { homeOn: !!(h.autonomy && h.autonomy.homeOn) }
       },
+      // 家当编辑（HOUSE_DESIGN §2）：整表替换一个房间的东西，校验从严
+      setRoomItems: (roomId, items) => nest.setRoomItems(roomId, items),
       dropStaleHear: (id) => nest.dropStaleHear(id),
       // 参考话题池（§9.13）：诊断/调试用，看某个角色此刻会抽到什么引子
       topicSeeds: async (id, opts) => pickTopicSeeds(await nest.home(), id, opts || {}),
@@ -1970,6 +1973,13 @@ export default {
               if (op === 'autonomy') {
                 // 在家自由互动开关（离家那档不受影响）：body { homeOn: boolean }
                 const r = await nest.setAutonomy({ homeOn: !!body.homeOn })
+                scheduleSnapshot()
+                return json(res, 200, r)
+              }
+              if (op === 'setItems') {
+                // 家当编辑（HOUSE_DESIGN §2）：body { room, items: [{name,count?,state?}] }
+                // 整表替换；校验失败抛错 → 500，前端把消息显示出来，账本不动
+                const r = await nest.setRoomItems(String(body.room || ''), body.items)
                 scheduleSnapshot()
                 return json(res, 200, r)
               }

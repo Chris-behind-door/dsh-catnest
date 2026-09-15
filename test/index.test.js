@@ -2587,3 +2587,47 @@ test('家当（HOUSE_DESIGN §1）：prompt 只注入自己所在房间的东西
     await rmSafe(dir)
   }
 })
+
+test('家当编辑接口（House §2）：setItems 整表替换 + 快照同步，校验失败报错且不改账本', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-items-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: llmStub('嗯') })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    assert.ok(provided.catnest, '服务面已提供')
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    const act = (payload) => call('POST', '/catnest/api/action', JSON.stringify(payload))
+
+    // 进货 50 个消婴器
+    const ok = await act({
+      op: 'setItems',
+      room: 'living',
+      items: [{ name: '沙发' }, { name: '消婴器', count: 50, state: '新的' }],
+    })
+    assert.equal(ok.code, 200)
+    // 主人视角快照立刻反映（面板卡片靠它）
+    let st = JSON.parse((await call('GET', '/catnest/api/state')).body)
+    assert.deepEqual(st.rooms.find((r) => r.id === 'living').items, [
+      { name: '沙发', state: null, count: 1 },
+      { name: '消婴器', state: '新的', count: 50 },
+    ])
+    // 服务面同口径
+    const svcItems = await provided.catnest.setRoomItems('study', [{ name: '台灯', state: '亮着' }])
+    assert.deepEqual(svcItems.items, [{ name: '台灯', state: '亮着', count: 1 }])
+    // 校验失败：500 + 消息，账本保持原样
+    const bad = await act({ op: 'setItems', room: 'living', items: [{ name: '椅子' }, { name: '椅子' }] })
+    assert.equal(bad.code, 500)
+    assert.ok(String(JSON.parse(bad.body).error).includes('同名'), '错误消息可读: ' + bad.body)
+    const noRoom = await act({ op: 'setItems', room: 'attic', items: [] })
+    assert.equal(noRoom.code, 500)
+    st = JSON.parse((await call('GET', '/catnest/api/state')).body)
+    assert.equal(st.rooms.find((r) => r.id === 'living').items.length, 2, '报错后账本没动')
+  } finally {
+    await rmSafe(dir)
+  }
+})

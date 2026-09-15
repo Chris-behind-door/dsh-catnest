@@ -1,7 +1,7 @@
 // dsh-catnest 测试：node --test
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile, stat } from 'node:fs/promises'
+import { mkdtemp, readFile, readdir, rm, writeFile, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -1668,18 +1668,22 @@ test('默认家当：每个默认房间都有东西，形态是 {name, state?}',
   }
 })
 
-test('roomItems/roomItemsText：归一化手写脏数据，状态渲染成括号，空房间不占 token', () => {
+test('roomItems/roomItemsText：归一化手写脏数据，数量与状态渲染，空房间不占 token', () => {
   const home = {
     rooms: [
       {
         id: 'living',
         name: '客厅',
-        // 容错面：纯字符串、多余空白、缺 name、非对象
+        // 容错面：纯字符串、多余空白、缺 name、非对象、数字字符串数量、非法数量
         items: [
           { name: '沙发' },
           { name: '电视', state: '关着' },
           '茶几',
           { name: ' 落地灯 ', state: '   ' },
+          { name: '消婴器', count: 50 },
+          { name: '电池', count: '12' },
+          { name: '垃圾袋', count: 0 },
+          { name: '椅子', count: 2.5 },
           { state: '孤儿' },
           null,
           42,
@@ -1690,15 +1694,93 @@ test('roomItems/roomItemsText：归一化手写脏数据，状态渲染成括号
     ],
   }
   assert.deepEqual(roomItems(home, 'living'), [
-    { name: '沙发', state: null },
-    { name: '电视', state: '关着' },
-    { name: '茶几', state: null },
-    { name: '落地灯', state: null },
+    { name: '沙发', state: null, count: 1 },
+    { name: '电视', state: '关着', count: 1 },
+    { name: '茶几', state: null, count: 1 },
+    { name: '落地灯', state: null, count: 1 },
+    { name: '消婴器', state: null, count: 50 },
+    { name: '电池', state: null, count: 12 },
+    { name: '垃圾袋', state: null, count: 1 },
+    { name: '椅子', state: null, count: 2 },
   ])
-  assert.equal(roomItemsText(home, 'living'), '沙发、电视（关着）、茶几、落地灯')
+  assert.equal(
+    roomItemsText(home, 'living'),
+    '沙发、电视（关着）、茶几、落地灯、消婴器×50、电池×12、垃圾袋、椅子×2',
+  )
   assert.equal(roomItemsText(home, 'study'), '', '空房间返回空串')
   assert.equal(roomItemsText(home, 'bath'), '', '缺 items 字段当空')
   assert.deepEqual(roomItems(home, 'nowhere'), [])
+})
+
+test('setRoomItems：整表替换、数量落盘、重名与非法值报错且不改盘', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    // 进货 50 个消婴器
+    const r = await nest.setRoomItems('living', [
+      { name: '沙发' },
+      { name: '消婴器', count: 50, state: '新的' },
+      { name: '水壶', count: 1 },
+    ])
+    assert.deepEqual(r.items, [
+      { name: '沙发', state: null, count: 1 },
+      { name: '消婴器', state: '新的', count: 50 },
+      { name: '水壶', state: null, count: 1 },
+    ])
+    // 落盘是精简形态：count=1 不写、没状态不写
+    const onDisk = JSON.parse(await readFile(join(dir, 'home.json'), 'utf8'))
+    assert.deepEqual(onDisk.rooms.find((x) => x.id === 'living').items, [
+      { name: '沙发' },
+      { name: '消婴器', count: 50, state: '新的' },
+      { name: '水壶' },
+    ])
+    // 数字字符串也认（前端输入框给的就是字符串）
+    const r2 = await nest.setRoomItems('living', [{ name: '电池', count: '12' }])
+    assert.equal(r2.items[0].count, 12)
+    // 清空
+    await nest.setRoomItems('living', [])
+    assert.deepEqual((await nest.home()).rooms.find((x) => x.id === 'living').items, [])
+    // 校验：报错，账本保持原样
+    await assert.rejects(() => nest.setRoomItems('living', [{ name: '椅子' }, { name: '椅子' }]), /同名/)
+    await assert.rejects(() => nest.setRoomItems('living', [{ name: '椅子', count: 0 }]), /数量/)
+    await assert.rejects(() => nest.setRoomItems('living', [{ name: '椅子', count: '好多' }]), /数量/)
+    await assert.rejects(() => nest.setRoomItems('living', [{ name: '  ' }]), /名字/)
+    await assert.rejects(() => nest.setRoomItems('living', [{ name: 'a'.repeat(25) }]), /太长/)
+    await assert.rejects(() => nest.setRoomItems('attic', []), /没有这个房间/)
+    assert.deepEqual((await nest.home()).rooms.find((x) => x.id === 'living').items, [], '报错后账本没动')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('账本损坏：备份原文件 + 报错，绝不静默写默认家覆盖', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.home() // 建默认账本
+    const p = join(dir, 'home.json')
+    const good = await readFile(p, 'utf8')
+    const broken = '{"version":5,"rooms":[{"id":"living"'
+    await writeFile(p, broken)
+    // 模拟重启：新实例重新 ensure
+    const nest2 = new CatNest(dir, { now: fixedNow })
+    await assert.rejects(() => nest2.ensure(), /读不出来/)
+    assert.equal(await readFile(p, 'utf8'), broken, '原文件原地保留（没被默认家覆盖）')
+    const baks = (await readdir(dir)).filter((f) => f.startsWith('home.json.corrupt-'))
+    assert.equal(baks.length, 1, '另存了一份损坏备份')
+    assert.equal(await readFile(join(dir, baks[0]), 'utf8'), broken)
+    // 结构不对（缺 characters）也算损坏，一样不覆盖
+    await writeFile(p, '{"version":5,"rooms":[]}')
+    const nest4 = new CatNest(dir, { now: fixedNow })
+    await assert.rejects(() => nest4.ensure(), /读不出来/)
+    assert.equal(await readFile(p, 'utf8'), '{"version":5,"rooms":[]}', '结构不对也不覆盖')
+    // 运行中读坏：抛错，不返回默认家
+    await writeFile(p, good)
+    const nest3 = new CatNest(dir, { now: fixedNow })
+    await nest3.ensure()
+    await writeFile(p, '{oops')
+    await assert.rejects(() => nest3.home(), /读不出来/)
+  } finally {
+    await cleanup()
+  }
 })
 
 // ── 参考话题池（§9.13）──

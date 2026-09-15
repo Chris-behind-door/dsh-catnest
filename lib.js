@@ -21,7 +21,7 @@
 //     时间片事件文本化（sliceEventsText，供收尾蒸馏 / LLM 回顾喂料）
 //   - 打断反应不穷举：物理层只产出规则与事件，反应由 index.js 调度层 AI 生成
 
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile, appendFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, rename, rm, stat, writeFile, appendFile, copyFile } from 'node:fs/promises'
 import { join } from 'node:path'
 
 // 猫窝角色名册（默认兜底）：正常运行时从 dsh-personas 的 companion 字段读取
@@ -56,6 +56,13 @@ export const DEFAULT_ROOMS = [
   { id: 'balcony', name: '阳台', functions: ['晒太阳', '看风景', '晾衣服'], adjacent: ['living'],
     items: [{ name: '晾衣架' }, { name: '洗衣机' }, { name: '绿植' }, { name: '躺椅' }] },
 ]
+
+// 家当编辑上限（HOUSE_DESIGN §2）：一个房间最多几件、名字/状态多长、数量多大。
+// 校验从严：主人手滑当场报错，脏数据别写进账本（账本坏了代价比报错大得多）。
+export const ITEMS_MAX = 50
+export const ITEM_NAME_MAX = 24
+export const ITEM_STATE_MAX = 24
+export const ITEM_COUNT_MAX = 99999
 
 // 三对角色对（草案第六节：主人×姐姐、主人×小玖、姐姐×小玖）
 export const RELATION_PAIRS = ['master:kyu', 'master:moli', 'moli:kyu']
@@ -196,8 +203,9 @@ export function roomName(home, roomId) {
   return r ? r.name : String(roomId)
 }
 
-// 归一化房间物品（HOUSE_DESIGN §1 家当）：item 是 `{ name, state? }`，也容忍主人手写成纯字符串
-// 数组；state 归一成字符串或 null。场景注入与前端视角共用同一个口径。
+// 归一化房间物品（HOUSE_DESIGN §1 家当）：item 是 `{ name, state?, count? }`，也容忍主人
+// 手写成纯字符串数组；state 归一成字符串或 null，count 归一成 ≥1 的整数（缺省 1，1 不显示）。
+// 场景注入与前端视角共用同一个口径。
 export function roomItems(home, roomId) {
   const r = (home.rooms || []).find((x) => x && x.id === roomId)
   const list = r && Array.isArray(r.items) ? r.items : []
@@ -205,22 +213,32 @@ export function roomItems(home, roomId) {
   for (const it of list) {
     if (typeof it === 'string') {
       const name = it.trim()
-      if (name) out.push({ name, state: null })
+      if (name) out.push({ name, state: null, count: 1 })
       continue
     }
     if (!it || typeof it !== 'object') continue
     const name = typeof it.name === 'string' ? it.name.trim() : ''
     if (!name) continue
     const state = typeof it.state === 'string' && it.state.trim() ? it.state.trim() : null
-    out.push({ name, state })
+    out.push({ name, state, count: itemCount(it.count) })
   }
   return out
 }
 
-// 房间物品渲染文本（「沙发、电视（关着）」）；没有东西的房间返回空串（不占 token）
+// 数量归一化（读路径，宽容）：认数字与数字字符串（手写 json 里 "50" 很常见）；
+// 非数/小于 1/缺省都算 1，小数向下取整。写路径（setRoomItems）对小数直接报错。
+function itemCount(v) {
+  const n = typeof v === 'string' ? Number(v.trim()) : v
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1
+}
+
+// 房间物品渲染文本（「沙发、消婴器×50（新的）」）；没有东西的房间返回空串（不占 token）
 export function roomItemsText(home, roomId) {
   return roomItems(home, roomId)
-    .map((it) => (it.state ? it.name + '（' + it.state + '）' : it.name))
+    .map((it) => {
+      const head = it.count > 1 ? it.name + '×' + it.count : it.name
+      return it.state ? head + '（' + it.state + '）' : head
+    })
     .join('、')
 }
 
@@ -902,6 +920,23 @@ export class CatNest {
     }
   }
 
+  // 细读：区分「文件不存在」/「解析失败」/「读到了」。账本损坏不能当成「没有账本」——
+  // 当成没有就会被默认家覆盖，主人攒的东西一次清空（HOUSE_DESIGN §2 的加固）。
+  async readJsonDetailed(path) {
+    let text
+    try {
+      text = await readFile(path, 'utf8')
+    } catch (e) {
+      if (e && e.code === 'ENOENT') return { missing: true }
+      throw e
+    }
+    try {
+      return { value: JSON.parse(text) }
+    } catch (e) {
+      return { corrupt: String(e && e.message ? e.message : e) }
+    }
+  }
+
   async writeJsonAtomic(path, value) {
     const tmp = `${path}.tmp`
     await writeFile(tmp, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 })
@@ -923,10 +958,29 @@ export class CatNest {
   async doEnsure() {
     await mkdir(join(this.dir, SLICES_DIR), { recursive: true, mode: 0o700 })
     const homePath = join(this.dir, HOME_FILE)
-    const home = await this.readJson(homePath, null)
-    if (!home || !Array.isArray(home.rooms) || typeof home.characters !== 'object') {
+    const read = await this.readJsonDetailed(homePath)
+    if (read.missing) {
+      // 头一次装：写默认家
       await this.writeJsonAtomic(homePath, defaultHome())
+    } else if (
+      read.corrupt ||
+      !read.value ||
+      !Array.isArray(read.value.rooms) ||
+      typeof read.value.characters !== 'object'
+    ) {
+      // 账本损坏：绝不静默重置（HOUSE_DESIGN §2）。旧行为是直接写默认家，主人攒的房间、
+      // 家当、角色位置一次清空。现在原地保留原文件 + 另存一份 + 报错，主人修好再启动。
+      const bak = homePath + '.corrupt-' + sliceIdOf(this.now())
+      await copyFile(homePath, bak)
+      throw new Error(
+        '家账本读不出来（' +
+          (read.corrupt || '结构不对：缺 rooms 或 characters') +
+          '）。原文件保留在原处，另存了一份到 ' +
+          bak +
+          '；修好后再启动猫窝。',
+      )
     } else {
+      const home = read.value
       // v2 → v3 迁移：补 topics / 暂停标记 / 隔墙动静去重，旧房间与角色保持原样
       let changed = false
       if (!home.topics || typeof home.topics !== 'object') {
@@ -1011,7 +1065,11 @@ export class CatNest {
   async home() {
     await this.ensure()
     const home = await this.readJson(this.homePath(), null)
-    return home && Array.isArray(home.rooms) ? home : defaultHome()
+    if (!home || !Array.isArray(home.rooms)) {
+      // 运行中被改坏（编辑器保存到一半那种也算）：报错，别默默换成默认家把账本写花
+      throw new Error('家账本读不出来：' + this.homePath() + '（JSON 解析失败或结构不对）')
+    }
+    return home
   }
 
   async relations() {
@@ -1592,6 +1650,51 @@ export class CatNest {
       home.autonomy = next
       await this.saveHome(home)
       return { autonomy: { ...next } }
+    })
+  }
+
+  // 家当编辑（HOUSE_DESIGN §2）：整表替换一个房间的东西。主人补货/清理走这条
+  // （面板 → API → 本方法），也可以继续手改 home.json。校验从严：报错即不改盘。
+  async setRoomItems(roomId, rawItems) {
+    return this.mutate(async () => {
+      const home = await this.home()
+      const room = (home.rooms || []).find((r) => r && r.id === roomId)
+      if (!room) throw new Error('没有这个房间：' + String(roomId))
+      if (!Array.isArray(rawItems)) throw new Error('items 需要是数组')
+      if (rawItems.length > ITEMS_MAX) throw new Error('一个房间最多 ' + ITEMS_MAX + ' 件东西')
+      const items = []
+      const seen = new Set()
+      for (const raw of rawItems) {
+        const src = typeof raw === 'string' ? { name: raw } : raw && typeof raw === 'object' ? raw : null
+        if (!src) throw new Error('物品条目格式不对')
+        const name = String(src.name == null ? '' : src.name).trim()
+        if (!name) throw new Error('每件东西都要有名字')
+        if (name.length > ITEM_NAME_MAX) {
+          throw new Error('物品名太长（最多 ' + ITEM_NAME_MAX + ' 字）：' + name)
+        }
+        if (seen.has(name)) throw new Error('同一个房间里不能有两件同名的东西：' + name)
+        seen.add(name)
+        const state = String(src.state == null ? '' : src.state).trim()
+        if (state.length > ITEM_STATE_MAX) {
+          throw new Error('状态太长（最多 ' + ITEM_STATE_MAX + ' 字）：' + name)
+        }
+        let count = 1
+        if (src.count !== undefined && src.count !== null && String(src.count).trim() !== '') {
+          const n = Number(String(src.count).trim())
+          if (!Number.isFinite(n) || n < 1 || Math.floor(n) !== n) {
+            throw new Error('数量要是 ≥1 的整数：' + name)
+          }
+          if (n > ITEM_COUNT_MAX) throw new Error('数量最多 ' + ITEM_COUNT_MAX + '：' + name)
+          count = n
+        }
+        const item = { name }
+        if (count > 1) item.count = count
+        if (state) item.state = state
+        items.push(item)
+      }
+      room.items = items
+      await this.saveHome(home)
+      return { room: roomId, items: roomItems(home, roomId) }
     })
   }
 

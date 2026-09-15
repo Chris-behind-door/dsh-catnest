@@ -5,7 +5,7 @@ DSH agent harness 上的**多角色家庭陪伴系统**：把「家」建成一�
 ## 能力一览
 
 - **家状态账本**：房间布局与家当 / 角色位置与活动 / 主人位置 / 听到缓冲，落盘 `~/.dsh/.catnest/`，跨时间片延续
-- **家当（房间里有什么）**：每个房间带一份东西（`{ name, state? }`，如「水壶（空的）」）。角色只看得见自己此刻所在房间，主人视角在面板左侧看全屋；本期只读，不做拿放
+- **家当（房间里有什么）**：每个房间带一份东西（`{ name, state?, count? }`，如「水壶（空的）」「消婴器×50」）。角色只看得见自己此刻所在房间，主人视角在面板左侧看全屋，点 ✎ 就能增删改（补货 / 清理不用碰 JSON）；不做拿放（物品互动不在本期）
 - **时间片生命周期**：开片对齐 companion 名册（新角色自动进家），关片触发分角色收尾蒸馏，写进各角色记忆域
 - **调度层（心跳 + 事件）**：60s tick 只推状态（conditions 翻转 / activity 到期，零成本）；动静边沿、状态翻转、活动到期才叫醒 LLM（付费、低频）；全局串行队列，沉默是一等公民（未调 `say` 即沉默）
 - **路 B 猫自主行动**：主人离家时 T6 自主节奏轻推；topic 完整工具套件（`open_topic`/`end_topic`/`say.about`，TCP 式生命周期，框架控质量）；「放下锅铲」`pause_activity`（暂停=不忙，同名 `do_activity` 回灶）；活动隔墙动静（真在做事才有锅铲声，进 hear 缓冲喂 T1）
@@ -40,7 +40,7 @@ dsh plugin --profile <your-profile> add dsh-catnest
 
 ## 数据与目录
 
-- `~/.dsh/.catnest/`：家账本（home.json / relations.json / slices/<片号>/）
+- `~/.dsh/.catnest/`：家账本（home.json / relations.json / slices/<片号>/）。`home.json` 解析失败或结构不对时**不会静默重置**：原地保留原文件 + 另存一份 `home.json.corrupt-<片号>` + 报错，修好再启动
 - `~/.dsh/.personas/`：角色人设卡（dsh-personas 维护；`companion: true` 的角色进家）
 - 数据目录可用 profile 配置 `catnestDir` 覆盖
 
