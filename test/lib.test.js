@@ -20,8 +20,7 @@ import {
   autonomyEnabled,
   respondersOrder,
   charName,
-  freezeActivities,
-  thawActivities,
+  settleActivities,
   dialogueText,
   companionSync,
   relationSync,
@@ -372,9 +371,9 @@ test('charName：主人 / 名册名 / 未知回显', () => {
   assert.equal(charName(home, 'nobody'), 'nobody')
 })
 
-// ── 家物理 · 活动冻结/解冻 ──
+// ── 家物理 · 活动持续计时（2026-09-15：close 不冻结，片外照流）──
 
-test('活动时长模式外冻结：close 冻结剩余，open 解冻且片外时间不计入', async () => {
+test('活动持续计时：close 不清 endsAt，片外时间照流，open 后早已到期 → 不忙', async () => {
   const { dir, nest, cleanup } = await mk()
   const t0 = FIXED.getTime()
   try {
@@ -382,31 +381,28 @@ test('活动时长模式外冻结：close 冻结剩余，open 解冻且片外时
     await nest.setActivity('moli', '读书', 30) // endsAt = t0+30min
     const h1 = await nest.home()
     assert.equal(typeof h1.characters.moli.activityEndsAt, 'string')
-    // 片内过 10 分钟 → close
+    // 片内过 10 分钟 → close：endsAt 原样保留（不再换算成 leftMs）
     nest.now = () => new Date(t0 + 10 * 60000)
     await nest.close()
     const h2 = await nest.home()
-    // 冻结：endsAt 清空，剩余 20 分钟存入 activityLeftMs
-    assert.equal(h2.characters.moli.activityEndsAt, null)
-    assert.equal(h2.characters.moli.activityLeftMs, 20 * 60000)
+    assert.equal(h2.characters.moli.activityEndsAt, new Date(t0 + 30 * 60000).toISOString())
+    assert.equal(h2.characters.moli.activityLeftMs, null)
     assert.equal(h2.characters.moli.activity, '读书')
-    // 模式外过 3 天 → open：剩余照旧 20 分钟（不是 20min-3day，即片外不计入）
+    // 模式外过 3 天 → open：endsAt 原样（片外时间已流逝，活动早已到期）
     nest.now = () => new Date(t0 + 10 * 60000 + 3 * 86400000)
-    const opened = await nest.open()
+    await nest.open()
     const h3 = await nest.home()
     assert.equal(h3.characters.moli.activityLeftMs, null)
-    assert.equal(h3.characters.moli.activityEndsAt, new Date(nest.now().getTime() + 20 * 60000).toISOString())
-    // 解冻后切到 21 分钟：活动到期 → isBusy false
-    nest.now = () => new Date(t0 + 10 * 60000 + 3 * 86400000 + 21 * 60000)
+    assert.equal(h3.characters.moli.activityEndsAt, new Date(t0 + 30 * 60000).toISOString())
     const ch = (await nest.home()).characters.moli
-    assert.equal(isBusy(ch, nest.now()), false)
+    assert.equal(isBusy(ch, nest.now()), false, '跨片到期 → isBusy false')
     await nest.close()
   } finally {
     await cleanup()
   }
 })
 
-test('活动缺省时长按 60 分钟兜底（§9.14）：close 冻结成剩余毫秒，不再是「永久忙」', async () => {
+test('活动缺省时长按 60 分钟兜底（§9.14）：close 保持绝对 endsAt，不再是「永久忙」', async () => {
   const { dir, nest, cleanup } = await mk()
   try {
     await nest.open()
@@ -415,20 +411,42 @@ test('活动缺省时长按 60 分钟兜底（§9.14）：close 冻结成剩余�
     await nest.close()
     const home = await nest.home()
     assert.equal(home.characters.kyu.activity, '发呆')
-    assert.ok(
-      Number.isFinite(home.characters.kyu.activityLeftMs) && home.characters.kyu.activityLeftMs > 0,
-      '有结束时间 → close 换算成剩余毫秒（片外不流逝）',
+    assert.equal(
+      typeof home.characters.kyu.activityEndsAt,
+      'string',
+      '有结束时间 → close 保持绝对 endsAt（片外持续计时）',
     )
+    assert.equal(home.characters.kyu.activityLeftMs, null)
   } finally {
     await cleanup()
   }
 })
 
-test('freezeActivities 旧账本遗留（无结束时间的活动）：保留 activity、不写 activityLeftMs', () => {
-  const home = { characters: { a: { id: 'a', activity: '发呆', activityEndsAt: null, activityLeftMs: null } } }
-  freezeActivities(home, FIXED)
-  assert.equal(home.characters.a.activity, '发呆')
-  assert.equal(home.characters.a.activityLeftMs, null)
+test('settleActivities：片内已到期 close 自然收尾；未到期保持 endsAt；旧账本遗留不写 leftMs', () => {
+  const home = {
+    characters: {
+      a: { id: 'a', activity: '发呆', activityEndsAt: null, activityLeftMs: null },
+      b: {
+        id: 'b',
+        activity: '睡觉',
+        activityEndsAt: new Date(FIXED.getTime() - 60000).toISOString(),
+        activityLeftMs: null,
+      },
+      c: {
+        id: 'c',
+        activity: '读书',
+        activityEndsAt: new Date(FIXED.getTime() + 60000).toISOString(),
+        activityLeftMs: null,
+      },
+    },
+  }
+  settleActivities(home, FIXED)
+  assert.equal(home.characters.a.activity, '发呆', '无结束时间的旧账本保留')
+  assert.equal(home.characters.a.activityLeftMs, null, '不写 leftMs')
+  assert.equal(home.characters.b.activity, null, '片内已到期 → close 自然收尾')
+  assert.equal(home.characters.b.activityEndsAt, null)
+  assert.equal(home.characters.c.activity, '读书', '未到期活动保留')
+  assert.equal(home.characters.c.activityEndsAt, new Date(FIXED.getTime() + 60000).toISOString())
 })
 
 // ── 家物理 · 对话流 ──

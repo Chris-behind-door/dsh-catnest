@@ -11,7 +11,7 @@
 //   home()                家状态（rooms / characters / master / 听到缓冲）
 //   relations()           角色对数值（intimacy / spice）
 //   moveCharacter(id, roomId)      角色移动（要求打开的时间片）
-//   setActivity(id, activity, durationMin?)  设置/清除活动（活动时长模式外冻结）
+//   setActivity(id, activity, durationMin?)  设置/清除活动（活动持续计时：endsAt 绝对时间戳跨片保留）
 //   moveMaster(roomId | null)      主人进房 / 离宅
 //   adjustRelation(pair, field, delta)  关系数值增减（0..100 钳制）
 //   recap()               最近一个已关闭时间片的规则化回顾（无则 null）
@@ -50,6 +50,10 @@
 //     上限 24 小时）；静默闸只看 activity（condition 期间照旧可唤醒，「睡觉」归 activity 管）；
 //     T6 冷却从「上次轻推」起算 + 无产出退避（5/10/20/40/80 分钟，封顶 2 小时）；
 //     快照补 activityEndsAt/activityPaused，前端活动行显示剩余时间。
+//   - 活动持续计时（2026-09-15 主人定案，替代里程碑二「模式外冻结」）：close 不再把
+//     endsAt 换算成剩余毫秒——片外时间照流，open 无需解冻；close 只把片内已到期的活动
+//     自然收尾（settleActivities）。pause_activity（放下锅铲）仍是片内计时冻结
+//     （activityLeftMs），close 照旧清掉暂停中的活动。
 //
 // 宿主服务取法：llm / memory / personas 一律调用点惰性 ctx.get（B 规范不 import
 // 宿主包；服务时序不假设——personas 缺席时名册回退默认，llm 缺席时生成回落规则化）。
@@ -1995,8 +1999,7 @@ export {
   autonomyEnabled,
   respondersOrder,
   charName,
-  freezeActivities,
-  thawActivities,
+  settleActivities,
   dialogueText,
   buildRecap,
   sliceEventsText,

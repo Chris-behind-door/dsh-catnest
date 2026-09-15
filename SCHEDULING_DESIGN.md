@@ -24,7 +24,7 @@
 > 上游依据：`猫窝改造-20260826讨论定案汇总.md` 挂起项「调度层」（#12 不设菜单 / #13 沉默合法）、
 > `AGENT_LOOP_DESIGN.md` 交付记录 7 遗留（方向一另文排期）。
 > 前置已完成：工具循环（say/move_to/do_activity/remember/set_condition/adjust_relation）、
-> 沉默语义（未调 say 即沉默）、hear 缓冲物理层、conditions 生命周期、activity 冻结/解冻。
+> 沉默语义（未调 say 即沉默）、hear 缓冲物理层、conditions 生命周期、activity 持续计时（2026-09-15 由冻结/解冻改）。
 
 ## v1 拍板记录（2026-08-31）
 
@@ -217,7 +217,9 @@ T5 管「别让家死寂」。共处时机 = 宽窗 × 各自 LLM 裁决 × 意�
     自主 move 走即视为「她有安排」，窗口翻篇才重新评估（天然防 60s tick 抖动写盘）；
   - 主人同房让位：应处位置评估前先查主人是否同房，在则跳过（不打断陪伴，段落聊完再送）；
   - 起床/回房不额外公共 notice：move 事件已入账（「小玖从卧室去了客厅」），克制原则，观察期看观感再定。
-- 模式外冻结：tick 只在片内跑（沿用 v1）。
+- 片外时间：tick 仍只在片内跑（沿用 v1），但活动持续计时（2026-09-15 主人定案，替代原「模式外冻结」）：
+  endsAt 是绝对时间戳，close 不冻结、open 不解冻，close 只把片内已到期的活动自然收尾（settleActivities）。
+  conditions 本来就是绝对时间戳（startAt/endAt 相位按墙钟推导），无需改动。
 
 ### 8.4 ambient 事件池
 
@@ -290,7 +292,7 @@ T5 管「别让家死寂」。共处时机 = 宽窗 × 各自 LLM 裁决 × 意�
 > - **D 纯自主睡眠**：系统不强制挂睡觉、不发睡前提醒；猫困了自己 set_condition（睡觉，可带倒计时）。
 > - **E 自主台词入账进片**：say 本来就进一本账，零新机制（确认项）。
 > - **第二轮修订（2026-09-05 夜，主人）**：① 撤 T1 全局冷却闸（lastSayAt 5min 闸）——量不重要、主人离家时显卡空闲，时间闸治不了复读；② 撤自我最近行（动态窗口列她最近动作/台词）——时间线已含全量，属重复信息，留作观察期备胎。T6 自身 5min 冷却保留（§9.1 第 5 条，T6 自循环保险丝，非猫间闸）。
-> - **第三轮定稿（2026-09-05 夜，主人）**：① topic 由 say.about 隐式字段**升为完整工具套件**（open_topic/end_topic + closing 状态机 + topic-open/topic-end/topic-join/topic-reopen 账本行 + home.topics 状态 + 【当前话题】动态窗口）——主人原话「加一整套相关 topic 的工具，像 TCP 握手那样（虽然可能不用那么多次）确认开启和结束一个话题，为了控制质量不跑偏」；接话即加入（对方解析到同一话题的 say，无独立工具）；收话题裁决归有意图的那方（D2，见 §9.2）；② **「放下锅铲」升一等公民**：新工具 pause_activity（计时冻结复用 freezeActivities 机制、新字段 activityPaused；同名 do_activity＝回灶续做；暂停＝不忙；close 清暂停活动，见 §9.9）；③ 主人开新 session 实现，§9 自包含（代码锚点见 §9.10）。
+> - **第三轮定稿（2026-09-05 夜，主人）**：① topic 由 say.about 隐式字段**升为完整工具套件**（open_topic/end_topic + closing 状态机 + topic-open/topic-end/topic-join/topic-reopen 账本行 + home.topics 状态 + 【当前话题】动态窗口）——主人原话「加一整套相关 topic 的工具，像 TCP 握手那样（虽然可能不用那么多次）确认开启和结束一个话题，为了控制质量不跑偏」；接话即加入（对方解析到同一话题的 say，无独立工具）；收话题裁决归有意图的那方（D2，见 §9.2）；② **「放下锅铲」升一等公民**：新工具 pause_activity（计时冻结用 activityLeftMs、新字段 activityPaused；同名 do_activity＝回灶续做；暂停＝不忙；close 清暂停活动，见 §9.9）；③ 主人开新 session 实现，§9 自包含（代码锚点见 §9.10）。
 > - **第四轮修订（2026-09-13 夜，主人）**：① **在家也可以自由互动**——新增 `home.autonomy.homeOn` 开关（默认关），只管「主人在家时要不要也跑 T6」；离家那档**原样不动**（不想要就干脆别切到"主人出门"状态），不加脉冲/一次性触发，不加 off 档。门控抽成纯函数 `autonomyEnabled(home)`。参数沿用同一套（10 分钟过渡 + 5 分钟冷却），代价自知：主人在家开着会与主人自己的 agent 抢本地模型槽位。UI 在顶栏「主人出门/回家」旁多一个两态按钮。② **T1 误唤醒修正**（同片实测暴露，见 §9.12）：hear 条目补 `room`（说话时房间）字段；`say` 返回的 `hearReady` 由全屋扫描收窄为「本次声音真的传到的角色」；唤醒前加 `hearStaleOf` 过时校验（时间 `HEAR_STALE_MS`=3min ＋ 空间 far），过时则 `dropStaleHear` 丢弃；notice 的位置改成"说那句话时的房间"。
 >
 > **直接继承 09-04 共识（不重议）**：事件驱动非接龙；事件从各自在干的活里长出（主体先于事件）；主人插话最高优先级（串行队列已保证）；被插话时话停事不停；轻分享不追、重的停一下；不接也是回应、沉默即结尾；聊完冷却几分钟（§9.2 机制化）。
@@ -414,7 +416,7 @@ system 静态段补（状态事实走 presence，指令走静态，prefix cache 
 
 **放下锅铲（pause_activity，一等公民）：**
 - 新工具（无参）：「暂时放下手里在做的事（可以接回来）。」
-- 执行：角色须有 active（未暂停）activity → activityEndsAt 转 activityLeftMs（同 freezeActivities 机制）+ `activityPaused=true`；入账 activity-pause 行 `{t, type:'activity-pause', char, activity}` → timeline「小玖放下了手里的活（做饭）」。
+- 执行：角色须有 active（未暂停）activity → activityEndsAt 转 activityLeftMs（leftMs 冻结）+ `activityPaused=true`；入账 activity-pause 行 `{t, type:'activity-pause', char, activity}` → timeline「小玖放下了手里的活（做饭）」。
 - 回灶＝`do_activity` 传同名活动：有同名暂停活动 → 解冻（activityLeftMs 换回 activityEndsAt）+ activityPaused=false（不记账本，presence 可见）；无暂停或名字不同 → 放弃暂停、正常开新活动。
 - stop＝do_activity('') 语义不变；若有暂停中的一并视为放弃（清除）。
 - **isBusy 修复**：`ch.activityPaused` → 返回 false（暂停＝不忙）——同房接话序（responders 排除忙的）与 T6 空闲闸都自动得到「暂停的猫可以被叫、可以接话、可以被轻推」。
@@ -536,3 +538,26 @@ system 静态段补（状态事实走 presence，指令走静态，prefix cache 
 **测试**：lib 新增 3 例（缺省/上限/非法时长、`t6BackoffMs`、`freezeActivities` 旧账本遗留分支），index 新增 2 例（condition 期间照旧轻推、无产出退避不重复推）+ 把「小玖睡觉」改写成 activity 表达。基线 **117/117 → 121/121**。
 
 **没做（留观察）**：睡觉词族兜底（condition 里冒出「睡觉」也不管）——主人定「模型不听话兜底兜不完，碰到非偶发再改」。
+
+### 9.15 活动持续计时（2026-09-15 主人定案：close 不再冻结，片外照流）
+
+**动因（两处别扭）**：① 同一份账本里两套时间观——activities 走「模式外冻结」（片外不流逝），conditions（生病/发情）本来就是绝对时间戳、相位按墙钟推导；② close 把 `activityEndsAt` 换算成 `activityLeftMs`、open 再换算回 `endsAt`，跨片反复进出要维持这条不变量，边界条件容易出错（本次修的正是这里）。
+
+**定案**：`activityEndsAt` 是**绝对时间戳**，跨片保留。close 不冻结、open 不解冻，片外时间照流；close 只把**片内已到期**的活动自然收尾。`pause_activity`（§9.9 放下锅铲）不受影响，它的 `activityLeftMs` 仍是**片内**计时冻结，close 照旧清掉暂停中的活动。
+
+**实现锚点**：
+
+| 点 | 位置 | 说明 |
+|---|---|---|
+| 关片结算 | `lib.js` `settleActivities(home, now)`（取代 `freezeActivities` / `thawActivities`） | 到期 → 清 `activity`/`activityEndsAt`/`activityLeftMs`/`activityPaused`/`lastAmbientAt`；未到期 → 原样保留绝对 `endsAt`；无结束时间的旧账本遗留 → 保留 `activity`、不写 `leftMs`（仍按忙） |
+| open | `lib.js` `open()` | 删掉 `thawActivities` 调用（无需解冻） |
+| close | `lib.js` `close()` | 关片快照先落片内最终状态（活动未结算），再把 `settleActivities` 的结果写回 `home.json` |
+| 导出 | `lib.js` / `index.js` | `freezeActivities` + `thawActivities` → `settleActivities`（无残留引用） |
+
+**行为对照（改前 → 改后）**：
+
+- 睡前关片、8 小时后回来：活动还剩 20 分钟（片外不计入）→ **早已到期**，`isBusy` false，人不必接着睡；
+- 长片跨天：`endsAt` 是墙钟时间，片内片外同一把尺；
+- 暂停中的活：语义不变（片内冻结、close 清掉）。
+
+**测试**：`test/lib.test.js` 改写 4 例（「活动持续计时」跨片到期、60 分钟兜底保持绝对 `endsAt`、`settleActivities` 三分支）。总数仍 **121/121** 全绿（例数未增，是断言换血）。

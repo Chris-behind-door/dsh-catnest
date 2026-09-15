@@ -127,7 +127,7 @@ function defaultHome() {
           room: 'living',
           activity: null,
           activityEndsAt: null,
-          activityLeftMs: null, // 模式外冻结时的剩余毫秒（close 时写入，open 时换回 endsAt）
+          activityLeftMs: null, // 暂停时冻结的剩余毫秒（pause_activity 写入，回灶换回 endsAt；close 不再冻结）
           activityPaused: null, // pause_activity「放下锅铲」：暂停中的活动标记（暂停=不忙）
           lastAmbientAt: null, // 活动隔墙动静上次入账时刻（§9.5，每 10min 补一条去重）
           mood: null, // 挂状态（心情/神态，字符串；空=无），瞬态随位置进场景动态窗口
@@ -617,31 +617,18 @@ export function topicExpire(home, now, timeoutMs) {
   return expired
 }
 
-// 模式外冻结：close 时把进行中的活动换算成剩余毫秒（模式外时间不流逝）
-export function freezeActivities(home, now) {
+// 关片结算（2026-09-15 主人定案：活动持续计时）：片外时间照流，activityEndsAt 是
+// 绝对时间戳、跨片保留不再冻结；只把片内已到期的活动自然收尾。
+export function settleActivities(home, now) {
   for (const ch of Object.values(home.characters || {})) {
-    if (ch.activity && typeof ch.activityEndsAt === 'string') {
-      const left = new Date(ch.activityEndsAt).getTime() - now.getTime()
-      if (left <= 0) {
-        // 片内已到期：活动自然结束
-        ch.activity = null
-        ch.activityEndsAt = null
-        ch.activityLeftMs = null
-      } else {
-        ch.activityLeftMs = left
-        ch.activityEndsAt = null
-      }
-    } else if (!ch.activity) {
+    if (ch.activity && typeof ch.activityEndsAt === 'string' && new Date(ch.activityEndsAt).getTime() <= now.getTime()) {
+      // 片内已到期：活动自然结束
+      ch.activity = null
+      ch.activityEndsAt = null
       ch.activityLeftMs = null
-    }
-  }
-}
-
-// 模式内解冻：open 时把剩余毫秒换回新的结束时间（片外流逝不计入）
-export function thawActivities(home, now) {
-  for (const ch of Object.values(home.characters || {})) {
-    if (ch.activity && !ch.activityEndsAt && Number.isFinite(ch.activityLeftMs) && ch.activityLeftMs > 0) {
-      ch.activityEndsAt = new Date(now.getTime() + ch.activityLeftMs).toISOString()
+      ch.activityPaused = null
+      ch.lastAmbientAt = null
+    } else if (!ch.activity) {
       ch.activityLeftMs = null
     }
   }
@@ -1005,9 +992,8 @@ export class CatNest {
     const dir = join(this.dir, SLICES_DIR, sliceId)
     await mkdir(dir, { recursive: true })
     const openedAt = this.now().toISOString()
-    // 解冻活动：片外流逝不计入（模式外家静止）
+    // 活动持续计时：activityEndsAt 是绝对时间戳，片外照流，open 无需解冻
     const home = await this.home()
-    thawActivities(home, this.now())
     // 话题是片内作用域：开新片清空全部旧话题（对话不跨片，回顾归蒸馏；片内进程重启则留存）
     home.topics = {}
     await this.saveHome(home)
@@ -1027,7 +1013,7 @@ export class CatNest {
     const dir = join(this.dir, SLICES_DIR, cur.sliceId)
     const closedAt = this.now().toISOString()
     const home = await this.home()
-    // 快照先落片内最终状态（活动未冻结）
+    // 快照先落片内最终状态（活动未结算）
     await this.writeJsonAtomic(join(dir, CLOSE_SNAP_FILE), {
       home,
       relations: await this.relations(),
@@ -1042,8 +1028,8 @@ export class CatNest {
         ch.lastAmbientAt = null
       }
     }
-    // 再冻结活动写入 home.json：剩余时长换算为毫秒，模式外不流逝
-    freezeActivities(home, this.now())
+    // 再结算活动写入 home.json：已到期自然收尾，未到期保持绝对 endsAt（片外持续计时）
+    settleActivities(home, this.now())
     await this.saveHome(home)
     const meta = (await this.readJson(join(dir, META_FILE), null)) || { sliceId: cur.sliceId, openedAt: cur.openedAt }
     await this.writeJsonAtomic(join(dir, META_FILE), { ...meta, closedAt })
@@ -1624,7 +1610,7 @@ export class CatNest {
   }
 
   // 「放下锅铲」（pause_activity，§9.9 一等公民）：暂停当前活动——计时冻结
-  // （activityEndsAt → activityLeftMs，同 freezeActivities 机制）+ activityPaused 标记。
+  // （activityEndsAt → activityLeftMs 冻结）+ activityPaused 标记。
   // 暂停=不忙；回灶＝同名 do_activity（setActivity 解冻）。入账 activity-pause 行。
   async pauseActivity(id) {
     return this.mutate(async () => {
