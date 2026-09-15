@@ -550,7 +550,8 @@ export default {
               type: 'string',
               description:
                 '可选：你正在聊的话题短语（几个字，如「那盆花」）。' +
-                '必须和这个房间里一条还开着的话题完全一致，否则这句话说不出去。' +
+                '要和这个房间里一条还开着的话题的短语完全一致（写错了或者那条线已经收了，' +
+                '这句话照样说得出去，只是不挂在那条线上，回执会告诉你）。' +
                 '想开新的话题用 open_topic；跟主人说话、随口一句都不用带。',
             },
           },
@@ -819,24 +820,40 @@ export default {
 
     // 执行一个工具调用：返回 { ok, result, effect }。
     // result=回填给模型的结果文本；effect=给上层汇总的动作描述（失败为 null）。
-    const execTool = async (charId, name, args) => {
+    const execTool = async (charId, name, args, dbgSlice) => {
       const fail = (msg) => ({ ok: false, result: 'Error: ' + msg, effect: null })
       try {
         if (name === 'say') {
           const text = typeof args.text === 'string' ? args.text : ''
           if (!text.trim()) return fail('say 需要非空 text')
           const action = typeof args.action === 'string' ? args.action.trim() : ''
-          const about = typeof args.about === 'string' ? args.about.trim() : ''
+          // 话题门禁降级（2026-09-15 主人定案）：about 指向不存在/已收掉的话题时，旧行为是
+          // 把整句台词吞掉（账本没有 say 行、前端打字机气泡随后被 settle 收走，主人只看到
+          // 「话说了又没了」）。台词本身没错，错的只是挂了个没了的话题名——所以降级成普通
+          // 说话照常入账，只在回执里告诉模型这条线已经收了。
+          const rawAbout = typeof args.about === 'string' ? args.about.trim() : ''
+          let about = rawAbout
+          let aboutNote = ''
           if (about) {
             // 话题硬校验（§9.2）：about 非空必须是「这个房间里一条还开着的话题」
             const chk = checkTopicAbout(await nest.home(), charId, about)
-            if (chk.error) return fail('say：' + chk.error)
+            if (chk.error) {
+              about = ''
+              aboutNote =
+                '（话题「' + rawAbout + '」已经收掉了，这句按普通说话记下了。' +
+                '想重新聊这条线就用 open_topic 重提一次。）'
+              void agentDebug(charId, dbgSlice, 'say 话题降级（话照说、按普通说话入账）：' + rawAbout)
+            }
           }
           await nest.say(charId, text, action || undefined, about || undefined)
           // 话题账（§9.2）：带 about=解析话题（加入/续谈/裁决接受）；不带 about 也是裁决动作
           await nest.resolveTopicSay(charId, about || null)
           scheduleSnapshot()
-          return { ok: true, result: '已说出口。', effect: { tool: 'say', text, ...(action ? { action } : {}), ...(about ? { about } : {}) } }
+          return {
+            ok: true,
+            result: '已说出口。' + aboutNote,
+            effect: { tool: 'say', text, ...(action ? { action } : {}), ...(about ? { about } : {}) },
+          }
         }
         if (name === 'open_topic') {
           const about = typeof args.about === 'string' ? args.about.trim() : ''
@@ -1241,7 +1258,7 @@ export default {
           try { args = c.arguments ? JSON.parse(c.arguments) : {} } catch { args = { raw: c.arguments } }
           let outcome
           try {
-            outcome = await execTool(charId, c.name, args)
+            outcome = await execTool(charId, c.name, args, dbgSlice)
           } catch (error) {
             // 工具异常（参数不合法、门禁拦截等）转成模型可读的失败回执：
             // 当轮就能看见并纠正，而不是炸掉整个回合

@@ -2077,7 +2077,7 @@ test('end_topic 工具接线：收话题 → topic-end 账本行 + 状态 closin
   }
 })
 
-test('say.about 硬校验：话题不存在 → 工具失败（回执带 Error 回到模型）、台词不入账', async () => {
+test('say.about 门禁降级（§9.2 修订）：话题不存在 → 话照说入账，回执只提示这条线收了', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-top2-'))
   const ws = webServerStub()
   const captured = []
@@ -2099,11 +2099,15 @@ test('say.about 硬校验：话题不存在 → 工具失败（回执带 Error �
     await until(() => captured.filter((c) => c.system.includes('成员小玖')).length >= 2)
     const kyuSteps = captured.filter((c) => c.system.includes('成员小玖'))
     const toolResult = JSON.stringify(kyuSteps[1].messages)
-    assert.ok(toolResult.includes('Error'), '失败回执回填给模型，当轮可纠正')
-    assert.ok(toolResult.includes('不存在的线'), toolResult.slice(0, 400))
+    // 注意别用 includes('Error')：消息 JSON 里自带 "isError":false，会误命中
+    assert.ok(!toolResult.includes('Error: '), '不再当失败处理：' + toolResult.slice(0, 300))
+    assert.ok(toolResult.includes('不存在的线'), '回执里点名那条没了的话题，模型可纠正')
+    assert.ok(toolResult.includes('已经收掉'), '回执说明按普通说话记下了')
     const st = await svc.status()
     const log = await readLog(dir, st.sliceId)
-    assert.equal(log.some((e) => e.type === 'say' && e.who === 'kyu'), false, '非法 about 的台词不入账')
+    const row = log.find((e) => e.type === 'say' && e.who === 'kyu')
+    assert.ok(row, '台词必须入账（旧行为是整句被话题门禁吞掉）')
+    assert.ok(!row.about, '降级后不挂话题标记，实际：' + JSON.stringify(row.about))
   } finally {
     await rmSafe(dir)
   }
@@ -2627,6 +2631,66 @@ test('家当编辑接口（House §2）：setItems 整表替换 + 快照同步�
     assert.equal(noRoom.code, 500)
     st = JSON.parse((await call('GET', '/catnest/api/state')).body)
     assert.equal(st.rooms.find((r) => r.id === 'living').items.length, 2, '报错后账本没动')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('say 话题降级（§9.2 修订）：about 指向已收掉的话题，台词照常入账不丢', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-about-'))
+  const ws = webServerStub()
+  const line = '那条线都收了我还是想说完喵'
+  const llm = {
+    stream: (opts) => {
+      const stop = hasAssistantToolCall(opts.messages)
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          argumentsDelta: JSON.stringify({ text: line, about: '早就收掉的话题' }),
+        }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('study')
+    await svc.moveCharacter('kyu', 'study')
+    await svc.moveCharacter('moli', 'study') // open_topic 要求同房有姐妹
+    await svc.openTopic('kyu', '早就收掉的话题', '开个头')
+    await svc.moveCharacter('moli', 'bedroom') // 再支开她，只留小玖一个接话人
+    const homePath = join(dir, 'home.json')
+    const home = JSON.parse(await readFile(homePath, 'utf8'))
+    for (const x of Object.values(home.topics || {})) x.status = 'ended'
+    await writeFile(homePath, JSON.stringify(home))
+    // 主人说一句 → 小玖接话，她的 say 挂了个没了的话题
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
+    const findLine = async () => {
+      const t = await svc.transcript()
+      // transcript 给的是人话化文本（「小玖：…」），原文在 rawText
+      return ((t && t.lines) || []).find(
+        (l) => l.type === 'say' && l.who === 'kyu' && String(l.rawText || l.text || '').includes(line),
+      )
+    }
+    await until(async () => !!(await findLine()))
+    const row = await findLine()
+    assert.ok(row, '台词必须入账（旧行为是整句被话题门禁吞掉，主人看到「说了又没了」）')
+    assert.ok(!row.about, '降级后不挂话题标记，实际：' + JSON.stringify(row.about))
   } finally {
     await rmSafe(dir)
   }
