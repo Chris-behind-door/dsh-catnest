@@ -2695,3 +2695,66 @@ test('say 话题降级（§9.2 修订）：about 指向已收掉的话题，台�
     await rmSafe(dir)
   }
 })
+
+test('家当工具接线（House §4）：猫娘 take_item 入账，下一轮时间线看得见', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-itemtool-'))
+  const ws = webServerStub()
+  const prompts = []
+  const llm = {
+    stream: (opts) => {
+      const mine = typeof opts.system === 'string' && opts.system.includes('成员小玖')
+      const stop = !mine || hasAssistantToolCall(opts.messages)
+      if (mine && !stop) prompts.push(opts.messages[0].content[0].text)
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'take_item' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ name: '消婴器', count: 2 }) }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    const livingItems = async () => {
+      const st = JSON.parse((await call('GET', '/catnest/api/state')).body)
+      return st.rooms.find((r) => r.id === 'living').items
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'bedroom') // 只留小玖一个
+    await svc.setRoomItems('living', [{ name: '消婴器', count: 5 }], 'master')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '零食到了' }))
+    await until(async () => {
+      const items = await livingItems()
+      return items.length === 1 && items[0].count === 3
+    })
+    // 账本：by=kyu 的 took 行
+    const st = await svc.status()
+    const rows = (await readFile(join(dir, 'slices', st.sliceId, 'log.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+    const took = rows.find((r) => r.type === 'items' && r.by === 'kyu' && r.took)
+    assert.ok(took, '猫娘的动作入了账')
+    assert.deepEqual(took.took, [{ name: '消婴器', count: 2 }])
+    // 下一轮 prompt 的片内时间线里有人话（她下一轮就知道自己拿了几个）
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '还剩几个' }))
+    await until(() => prompts.length >= 2)
+    const last = prompts[prompts.length - 1]
+    assert.ok(last.includes('小玖从客厅拿走了 消婴器×2'), '时间线里有家当变更：' + last.slice(-300))
+  } finally {
+    await rmSafe(dir)
+  }
+})

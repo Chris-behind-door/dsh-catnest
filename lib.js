@@ -232,6 +232,74 @@ function itemCount(v) {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1
 }
 
+// 工具传进来的数量参数（HOUSE_DESIGN §4）：缺省 1，必须 ≥1 的整数，上限 ITEM_COUNT_MAX
+function itemAmountArg(v) {
+  if (v === undefined || v === null || String(v).trim() === '') return 1
+  const n = Number(String(v).trim())
+  if (!Number.isFinite(n) || n < 1 || Math.floor(n) !== n) {
+    throw new Error('数量要是 ≥1 的整数')
+  }
+  if (n > ITEM_COUNT_MAX) throw new Error('一次最多 ' + ITEM_COUNT_MAX + ' 个')
+  return n
+}
+
+// 落盘用的精简形态：count=1 不写、没状态不写（账本保持轻）
+function compactItem(it) {
+  const out = { name: it.name }
+  if ((it.count || 1) > 1) out.count = it.count
+  if (it.state) out.state = it.state
+  return out
+}
+
+// 家当变更差异（HOUSE_DESIGN §3）：以名字为键，产出 added / removed / changed。
+// 账本行与时间线渲染共用同一份口径。
+export function itemsDiff(before, after) {
+  const b = new Map((before || []).map((it) => [it.name, it]))
+  const a = new Map((after || []).map((it) => [it.name, it]))
+  const added = []
+  const removed = []
+  const changed = []
+  for (const [name, it] of a) {
+    if (!b.has(name)) {
+      added.push(it)
+      continue
+    }
+    const old = b.get(name)
+    if ((old.count || 1) !== (it.count || 1) || (old.state || '') !== (it.state || '')) {
+      changed.push({ name, from: old, to: it })
+    }
+  }
+  for (const [name, it] of b) if (!a.has(name)) removed.push(it)
+  return { added, removed, changed }
+}
+
+// 家当变更的人话（HOUSE_DESIGN §3）：谁给哪个房间添了/拿走了什么、什么变了样。
+// 片内时间线（index.js）与家史（sliceEventsText）共用。
+export function itemsEventText(line, home) {
+  if (!line) return ''
+  const who = !line.by || line.by === 'master' ? '主人' : charName(home, line.by) || String(line.by)
+  const room = roomName(home, line.room)
+  const fmt = (it) =>
+    it.name + ((it.count || 1) > 1 ? '×' + it.count : '') + (it.state ? '（' + it.state + '）' : '')
+  const parts = []
+  if (Array.isArray(line.took) && line.took.length > 0) {
+    parts.push(who + '从' + room + '拿走了 ' + line.took.map(fmt).join('、'))
+  }
+  if (Array.isArray(line.put) && line.put.length > 0) {
+    parts.push(who + '给' + room + '添了 ' + line.put.map(fmt).join('、'))
+  }
+  if (Array.isArray(line.added) && line.added.length > 0) {
+    parts.push(who + '给' + room + '添了 ' + line.added.map(fmt).join('、'))
+  }
+  if (Array.isArray(line.removed) && line.removed.length > 0) {
+    parts.push(who + '从' + room + '拿走了 ' + line.removed.map(fmt).join('、'))
+  }
+  if (Array.isArray(line.changed) && line.changed.length > 0) {
+    parts.push(who + '动了' + room + '的 ' + line.changed.map((c) => fmt(c.to || c)).join('、'))
+  }
+  return parts.join('；')
+}
+
 // 房间物品渲染文本（「沙发、消婴器×50（新的）」）；没有东西的房间返回空串（不占 token）
 export function roomItemsText(home, roomId) {
   return roomItems(home, roomId)
@@ -715,6 +783,8 @@ export function dialogueText(home, e) {
       return `${name}：这个还要聊`
     case 'activity-pause':
       return `${name}放下了手里的活（${e.activity}）`
+    case 'items':
+      return itemsEventText(e, home)
     default:
       return ''
   }
@@ -870,6 +940,11 @@ export function sliceEventsText(home, logText) {
       case 'activity-pause':
         lines.push(`${charName(home, e.char)}放下了手里的活（${e.activity}）`)
         break
+      case 'items': {
+        const t = itemsEventText(e, home)
+        if (t) lines.push(t)
+        break
+      }
       case 'move':
         lines.push(`${charName(home, e.char)}从${roomName(home, e.from)}挪去了${roomName(home, e.to)}`)
         break
@@ -1655,11 +1730,12 @@ export class CatNest {
 
   // 家当编辑（HOUSE_DESIGN §2）：整表替换一个房间的东西。主人补货/清理走这条
   // （面板 → API → 本方法），也可以继续手改 home.json。校验从严：报错即不改盘。
-  async setRoomItems(roomId, rawItems) {
+  async setRoomItems(roomId, rawItems, by) {
     return this.mutate(async () => {
       const home = await this.home()
       const room = (home.rooms || []).find((r) => r && r.id === roomId)
       if (!room) throw new Error('没有这个房间：' + String(roomId))
+      const before = roomItems(home, roomId)
       if (!Array.isArray(rawItems)) throw new Error('items 需要是数组')
       if (rawItems.length > ITEMS_MAX) throw new Error('一个房间最多 ' + ITEMS_MAX + ' 件东西')
       const items = []
@@ -1693,8 +1769,120 @@ export class CatNest {
         items.push(item)
       }
       room.items = items
-      await this.saveHome(home)
-      return { room: roomId, items: roomItems(home, roomId) }
+      const after = await this.applyItems(home, roomId, before, by)
+      return { room: roomId, items: after }
+    })
+  }
+
+  // 家当变更的公共尾巴（HOUSE_DESIGN §3/§4）：算差异 → 写账（片内才记，跟家里其他事件
+  // 一个规矩） → 落盘。面板编辑与猫娘工具都走这里，账本口径只有一处。
+  async applyItems(home, roomId, before, by, action) {
+    const after = roomItems(home, roomId)
+    await this.saveHome(home)
+    // 账本行：工具知道自己在干什么（拿 2 个 / 放 3 个），就按它报的记——
+    // 只靠 diff 会说成「变了样」，还丢掉主语；面板整表替换没有动作语义，才回落到 diff。
+    const diff = itemsDiff(before, after)
+    const row =
+      action ||
+      ({ added: diff.added, removed: diff.removed, changed: diff.changed })
+    const touched =
+      (row.added || []).length +
+        (row.removed || []).length +
+        (row.changed || []).length +
+        (row.took || []).length +
+        (row.put || []).length >
+      0
+    if (touched) {
+      const cur = await this.readJson(join(this.dir, CURRENT_FILE), null)
+      if (cur && cur.sliceId) {
+        await this.log('items', { room: roomId, by: by || 'master', ...row })
+      }
+    }
+    return after
+  }
+
+  // 猫娘的房间（家当工具用）：只能碰自己所在的房间——跟「隔壁有什么看不见」是同一套可见性
+  roomOf(home, charId) {
+    const ch = home.characters && home.characters[charId]
+    if (!ch || !ch.room) throw new Error('你不在任何一个房间里')
+    const room = (home.rooms || []).find((r) => r && r.id === ch.room)
+    if (!room) throw new Error('找不到你所在的房间：' + ch.room)
+    return room
+  }
+
+  // 家当工具（HOUSE_DESIGN §4）：拿/用掉 N 个。归零即从房间里消失。
+  async takeItem(charId, name, count) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const room = this.roomOf(home, charId)
+      const before = roomItems(home, room.id)
+      const target = before.find((it) => it.name === name)
+      if (!target) throw new Error('这个房间里没有「' + name + '」')
+      const n = itemAmountArg(count)
+      const have = target.count || 1
+      if (have < n) throw new Error('「' + name + '」只有 ' + have + ' 个，拿不了 ' + n + ' 个')
+      const left = have - n
+      room.items = before
+        .map((it) => (it.name === name ? { ...it, count: left } : it))
+        .filter((it) => it.count > 0) // 注意别写 (it.count || 1)：0 会被兜成 1，拿空的条目删不掉
+        .map(compactItem)
+      const after = await this.applyItems(home, room.id, before, charId, { took: [{ name, count: n }] })
+      return { room: room.id, name, taken: n, left, items: after }
+    })
+  }
+
+  // 家当工具：往自己房间放 N 个（买回来的、做好的、从别处拿来的）。已有就累加。
+  async putItem(charId, name, count, state) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const room = this.roomOf(home, charId)
+      const before = roomItems(home, room.id)
+      const clean = String(name == null ? '' : name).trim()
+      if (!clean) throw new Error('要放的东西得有名字')
+      if (clean.length > ITEM_NAME_MAX) throw new Error('名字太长（最多 ' + ITEM_NAME_MAX + ' 字）')
+      const n = itemAmountArg(count)
+      const st = typeof state === 'string' ? state.trim() : ''
+      if (st.length > ITEM_STATE_MAX) throw new Error('状态太长（最多 ' + ITEM_STATE_MAX + ' 字）')
+      const exists = before.some((it) => it.name === clean)
+      if (!exists && before.length >= ITEMS_MAX) {
+        throw new Error('这个房间已经放了 ' + ITEMS_MAX + ' 件东西，先收一收')
+      }
+      room.items = (exists
+        ? before.map((it) =>
+            it.name === clean
+              ? { ...it, count: (it.count || 1) + n, state: st || it.state }
+              : it,
+          )
+        : [...before, { name: clean, count: n, state: st || null }]
+      ).map(compactItem)
+      const after = await this.applyItems(home, room.id, before, charId, {
+        put: [{ name: clean, count: n, state: st || null }],
+      })
+      return { room: room.id, name: clean, put: n, count: (after.find((it) => it.name === clean) || {}).count || 1, items: after }
+    })
+  }
+
+  // 家当工具：改自己房间里某件东西的状态（「水壶」→「空的」）。空串＝没有状态。
+  async setItemState(charId, name, state) {
+    return this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const room = this.roomOf(home, charId)
+      const before = roomItems(home, room.id)
+      const clean = String(name == null ? '' : name).trim()
+      const target = before.find((it) => it.name === clean)
+      if (!target) throw new Error('这个房间里没有「' + clean + '」')
+      const st = typeof state === 'string' ? state.trim() : ''
+      if (st.length > ITEM_STATE_MAX) throw new Error('状态太长（最多 ' + ITEM_STATE_MAX + ' 字）')
+      room.items = before
+        .map((it) => (it.name === clean ? { ...it, state: st || null } : it))
+        .map(compactItem)
+      const after = await this.applyItems(home, room.id, before, charId, {
+        changed: [{ name: clean, from: target, to: { name: clean, state: st || null, count: target.count || 1 } }],
+      })
+      return { room: room.id, name: clean, state: st || null, items: after }
     })
   }
 

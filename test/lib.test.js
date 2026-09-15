@@ -22,6 +22,8 @@ import {
   charName,
   roomItems,
   roomItemsText,
+  itemsDiff,
+  itemsEventText,
   settleActivities,
   dialogueText,
   companionSync,
@@ -1778,6 +1780,133 @@ test('账本损坏：备份原文件 + 报错，绝不静默写默认家覆盖',
     await nest3.ensure()
     await writeFile(p, '{oops')
     await assert.rejects(() => nest3.home(), /读不出来/)
+  } finally {
+    await cleanup()
+  }
+})
+
+// ── 家当账 + 家当工具（HOUSE_DESIGN §3/§4）──
+
+test('itemsDiff：以名字为键算增删改（数量/状态变化才算 changed）', () => {
+  const before = [
+    { name: '沙发', state: null, count: 1 },
+    { name: '消婴器', state: null, count: 50 },
+    { name: '水壶', state: '满的', count: 1 },
+  ]
+  const after = [
+    { name: '沙发', state: null, count: 1 },
+    { name: '消婴器', state: null, count: 48 },
+    { name: '水壶', state: '空的', count: 1 },
+    { name: '零食', state: '新的', count: 3 },
+  ]
+  const d = itemsDiff(before, after)
+  assert.deepEqual(d.added.map((i) => i.name), ['零食'])
+  assert.deepEqual(d.removed, [])
+  assert.deepEqual(d.changed.map((c) => c.name), ['消婴器', '水壶'])
+  const d2 = itemsDiff(after, before)
+  assert.deepEqual(d2.removed.map((i) => i.name), ['零食'])
+  assert.deepEqual(d2.added, [])
+})
+
+test('itemsEventText：添/拿/变 三种说法，主人和猫娘各有主语', () => {
+  const home = { characters: { kyu: { id: 'kyu', name: '小玖' } }, rooms: [{ id: 'living', name: '客厅' }] }
+  assert.equal(
+    itemsEventText({ room: 'living', by: 'master', added: [{ name: '消婴器', count: 50, state: '新的' }] }, home),
+    '主人给客厅添了 消婴器×50（新的）',
+  )
+  assert.equal(
+    itemsEventText({ room: 'living', by: 'kyu', removed: [{ name: '纸巾', count: 1 }] }, home),
+    '小玖从客厅拿走了 纸巾',
+  )
+  assert.equal(
+    itemsEventText({ room: 'living', by: 'kyu', took: [{ name: '消婴器', count: 2 }] }, home),
+    '小玖从客厅拿走了 消婴器×2',
+  )
+  assert.equal(
+    itemsEventText({ room: 'living', by: 'kyu', put: [{ name: '零食', count: 3, state: '新的' }] }, home),
+    '小玖给客厅添了 零食×3（新的）',
+  )
+  assert.equal(
+    itemsEventText({ room: 'living', by: 'kyu', changed: [{ name: '水壶', to: { name: '水壶', state: '空的', count: 1 } }] }, home),
+    '小玖动了客厅的 水壶（空的）',
+  )
+  assert.equal(itemsEventText({ room: 'living', by: 'master' }, home), '')
+})
+
+test('家当账：setRoomItems 与家当工具都落 items 行（片内才记）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    // 面板编辑：整表替换
+    await nest.setRoomItems('living', [{ name: '消婴器', count: 50 }, { name: '沙发' }])
+    // 猫娘：拿 2 个、放 3 包零食、改水壶状态
+    const taken = await nest.takeItem('kyu', '消婴器', 2)
+    assert.equal(taken.left, 48)
+    const put = await nest.putItem('kyu', '零食', 3, '新的')
+    assert.equal(put.count, 3)
+    await nest.putItem('kyu', '水壶')
+    const st = await nest.setItemState('kyu', '水壶', '空的')
+    assert.equal(st.state, '空的')
+    // 账本：片内 items 行按发生顺序排（面板一次 + 工具四次 = 五条）
+    const cur = await nest.status()
+    const rows = (await readFile(join(dir, 'slices', cur.sliceId, 'log.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l))
+      .filter((r) => r.type === 'items')
+    assert.equal(rows.length, 5, '五次变更五条账')
+    assert.equal(rows[0].by, 'master')
+    assert.ok(rows[0].added.some((i) => i.name === '消婴器'))
+    assert.equal(rows[1].by, 'kyu')
+    assert.deepEqual(rows[1].took, [{ name: '消婴器', count: 2 }], '工具报「拿了 2 个」，不是模糊的「变了」')
+    assert.deepEqual(rows[2].put, [{ name: '零食', count: 3, state: '新的' }])
+    assert.deepEqual(rows[3].put, [{ name: '水壶', count: 1, state: null }])
+    assert.deepEqual(rows[4].changed.map((c) => c.name), ['水壶'])
+    assert.equal(rows[4].changed[0].to.state, '空的')
+    // 落盘是精简形态
+    const onDisk = JSON.parse(await readFile(join(dir, 'home.json'), 'utf8'))
+    const living = onDisk.rooms.find((r) => r.id === 'living').items
+    assert.deepEqual(living.find((i) => i.name === '零食'), { name: '零食', count: 3, state: '新的' })
+    assert.deepEqual(living.find((i) => i.name === '沙发'), { name: '沙发' })
+    await nest.close()
+  } finally {
+    await cleanup()
+  }
+})
+
+test('家当工具：拿不存在的 / 数量不够 / 改不存在的东西 都报错且不改账本', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.setRoomItems('living', [{ name: '消婴器', count: 3 }])
+    await assert.rejects(() => nest.takeItem('kyu', '不存在的东西'), /没有/)
+    await assert.rejects(() => nest.takeItem('kyu', '消婴器', 5), /只有 3 个/)
+    await assert.rejects(() => nest.takeItem('kyu', '消婴器', 0), /整数/)
+    await assert.rejects(() => nest.takeItem('kyu', '消婴器', 2.5), /整数/)
+    await assert.rejects(() => nest.setItemState('kyu', '不存在的东西', 'x'), /没有/)
+    await assert.rejects(() => nest.putItem('kyu', '', 1), /名字/)
+    assert.deepEqual(roomItems(await nest.home(), 'living'), [{ name: '消婴器', state: null, count: 3 }])
+    // 全拿走 → 从房间里消失
+    const r = await nest.takeItem('kyu', '消婴器', 3)
+    assert.equal(r.left, 0)
+    assert.equal(roomItems(await nest.home(), 'living').length, 0)
+    await nest.close()
+  } finally {
+    await cleanup()
+  }
+})
+
+test('家当工具只能碰自己所在的房间', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.setRoomItems('kitchen', [{ name: '水壶' }])
+    // 小玖默认在客厅：厨房的水壶够不着
+    await assert.rejects(() => nest.takeItem('kyu', '水壶'), /没有/)
+    await nest.moveCharacter('kyu', 'kitchen')
+    const r = await nest.takeItem('kyu', '水壶')
+    assert.equal(r.left, 0)
+    await nest.close()
   } finally {
     await cleanup()
   }

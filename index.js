@@ -62,7 +62,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -472,6 +472,13 @@ export default {
           else if (!l.private) out.push(ntext)
           continue
         }
+        if (l.type === 'items') {
+          // 家当变更（HOUSE_DESIGN §3）：家里的东西进出是公共事实，全员时间线可见
+          flushMoves()
+          const t = itemsEventText(l, home)
+          if (t) out.push(t)
+          continue
+        }
         if (l.type === 'topic-open' || l.type === 'topic-join' || l.type === 'topic-end' || l.type === 'topic-reopen' || l.type === 'activity-pause') {
           // 话题与放下锅铲账本行（§9.2/§9.9）：公共家庭事实，全员时间线可见
           flushMoves()
@@ -582,6 +589,49 @@ export default {
             },
           },
           required: ['activity'],
+        },
+      },
+      {
+        name: 'take_item',
+        description:
+          '从你现在待的房间里拿走或用掉东西（拿一包零食吃掉、用掉一张纸巾）。' +
+          '只能碰你所在房间里的东西：隔壁房间有什么你看不见，也够不着。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: '东西的名字（跟【屋里有什么】里写的完全一致）' },
+            count: { type: 'number', description: '可选：拿几个，默认 1' },
+          },
+          required: ['name'],
+        },
+      },
+      {
+        name: 'put_item',
+        description:
+          '往你现在待的房间里放东西（买回来的、做好的、从别处拿过来的）。' +
+          '房间里已经有同名的那就累加数量。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: '东西的名字' },
+            count: { type: 'number', description: '可选：放几个，默认 1' },
+            state: { type: 'string', description: '可选：顺手写它的状态（「新的」「还热着」）' },
+          },
+          required: ['name'],
+        },
+      },
+      {
+        name: 'set_item_state',
+        description:
+          '改你现在待的房间里某件东西的状态（做完饭把灶台写成「脏了」、水壶写成「空的」）。' +
+          '状态是给人看的短语，不是数量；数量用 take_item / put_item。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: '东西的名字' },
+            state: { type: 'string', description: '新的状态短语（空字符串=清掉状态）' },
+          },
+          required: ['name'],
         },
       },
       {
@@ -823,6 +873,39 @@ export default {
     const execTool = async (charId, name, args, dbgSlice) => {
       const fail = (msg) => ({ ok: false, result: 'Error: ' + msg, effect: null })
       try {
+        if (name === 'take_item') {
+          const itemName = typeof args.name === 'string' ? args.name.trim() : ''
+          if (!itemName) return fail('take_item 需要 name')
+          const r = await nest.takeItem(charId, itemName, args.count)
+          scheduleSnapshot()
+          return {
+            ok: true,
+            result: r.left > 0 ? '拿走了 ' + r.taken + ' 个，还剩 ' + r.left + ' 个。' : '全拿走了，房间里没有了。',
+            effect: { tool: 'take_item', name: itemName, count: r.taken },
+          }
+        }
+        if (name === 'put_item') {
+          const itemName = typeof args.name === 'string' ? args.name.trim() : ''
+          if (!itemName) return fail('put_item 需要 name')
+          const r = await nest.putItem(charId, itemName, args.count, args.state)
+          scheduleSnapshot()
+          return {
+            ok: true,
+            result: '放好了，现在有 ' + r.count + ' 个。',
+            effect: { tool: 'put_item', name: itemName, count: r.put },
+          }
+        }
+        if (name === 'set_item_state') {
+          const itemName = typeof args.name === 'string' ? args.name.trim() : ''
+          if (!itemName) return fail('set_item_state 需要 name')
+          const r = await nest.setItemState(charId, itemName, typeof args.state === 'string' ? args.state : '')
+          scheduleSnapshot()
+          return {
+            ok: true,
+            result: r.state ? '记下了：' + r.name + '（' + r.state + '）。' : '把 ' + r.name + ' 的状态清掉了。',
+            effect: { tool: 'set_item_state', name: itemName, state: r.state },
+          }
+        }
         if (name === 'say') {
           const text = typeof args.text === 'string' ? args.text : ''
           if (!text.trim()) return fail('say 需要非空 text')
@@ -1113,6 +1196,9 @@ export default {
         '想走动就调用 move_to；想做事就调用 do_activity（做事要说预计多久，见下面的分寸）；' +
         '想记住什么就调用 remember；心情/身体状态（发情/生病/受伤…，可带倒计时）用 set_condition；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
+        '屋里有什么就摆在【屋里有什么】那行里：想拿、想吃、想用掉就用 take_item，' +
+        '想放东西（买回来的、做好的）用 put_item，想把某件东西写成别的状态（灶台脏了、水壶空了）' +
+        '用 set_item_state——只能碰你自己待的那个房间，隔壁有什么你看不见也够不着。' +
         '同一轮里可以调用多个工具，也该把这一轮要做的事一次调完（比如一边说话一边走去别的房间，就把 say 和 move_to 放在同一轮里调）。' +
         '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
         '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。\n\n' +
@@ -1271,6 +1357,10 @@ export default {
           if (outcome.effect) {
             actions.push(outcome.effect)
             if (outcome.effect.tool === 'say') said = true
+          } else if (!outcome.ok) {
+            // 工具失败落盘（2026-09-15 主人定案）：失败回执本来只回给模型，主人那边什么都看不到，
+            // 出了「话说了又没了」这种事只能靠推断。谁、哪个工具、为什么，落一行进 agent-debug.log。
+            void agentDebug(charId, dbgSlice, '工具失败 ' + c.name + '：' + outcome.result)
           }
           messages.push({
             role: 'user',
@@ -1768,7 +1858,11 @@ export default {
         return { homeOn: !!(h.autonomy && h.autonomy.homeOn) }
       },
       // 家当编辑（HOUSE_DESIGN §2）：整表替换一个房间的东西，校验从严
-      setRoomItems: (roomId, items) => nest.setRoomItems(roomId, items),
+      setRoomItems: (roomId, items, by) => nest.setRoomItems(roomId, items, by),
+      // 家当工具（HOUSE_DESIGN §4）：猫娘在自己房间里拿/放/改状态
+      takeItem: (charId, name, count) => nest.takeItem(charId, name, count),
+      putItem: (charId, name, count, state) => nest.putItem(charId, name, count, state),
+      setItemState: (charId, name, state) => nest.setItemState(charId, name, state),
       dropStaleHear: (id) => nest.dropStaleHear(id),
       // 参考话题池（§9.13）：诊断/调试用，看某个角色此刻会抽到什么引子
       topicSeeds: async (id, opts) => pickTopicSeeds(await nest.home(), id, opts || {}),
