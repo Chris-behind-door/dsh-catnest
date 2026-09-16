@@ -2758,3 +2758,197 @@ test('家当工具接线（House §4）：猫娘 take_item 入账，下一轮时
     await rmSafe(dir)
   }
 })
+
+// ── §9.16（2026-09-16）：说话音量 + 跨片过期活动不补发唤醒 ──
+
+test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切，隔墙也听得清', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-vol-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'kitchen') // 隔壁
+    // 小声 = 耳语：隔壁的墨璃一个字都听不见（2026-09-16 主人要的「和姐姐耳语」）
+    await svc.say('kyu', '这句只说给主人听', undefined, undefined, '小声')
+    assert.equal((await svc.hear('moli')).buffer.length, 0, '耳语不出屋')
+    // 大声 = 喊：隔壁进缓冲（闻声，不是看见形态）
+    const r = await svc.say('kyu', '姐姐——！', undefined, undefined, '大声')
+    assert.ok(r.faint.includes('moli'))
+    assert.ok(r.urgent.includes('moli'), '真切到当场叫人')
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    const rows = log.filter((e) => e.type === 'say')
+    assert.equal(rows[0].volume, '小声')
+    assert.equal(rows[1].volume, '大声')
+    assert.deepEqual(rows[0].audience.silent, ['moli'], '听不见也记账（复盘用）')
+    assert.deepEqual(rows[1].audience.faint, ['moli'])
+    // 忙碌降半档：埋头做事的猫，隔壁的大声落到"隐约"，不被一嗓子打断
+    await svc.setActivity('moli', '修bug', 60)
+    const r2 = await svc.say('kyu', '姐姐，吃饭啦！', undefined, undefined, '大声')
+    assert.ok(r2.faint.includes('moli'), '忙也听得见')
+    assert.ok(!r2.urgent.includes('moli'), '忙 → 不当场叫醒（工作状态下隔壁的大声降半档）')
+    // 时间线渲染：隔墙的真切写成「喊声」，同房的小声标「低声」
+    const tl = await svc.transcript()
+    assert.ok(
+      tl.lines.some((l) => l.type === 'say' && l.volume === '大声'),
+      '音量随 transcript 出给前端做字号',
+    )
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('say 工具带 volume（§9.16）：角色喊一声 → 隔壁被当场唤醒（大喊 notice + 回合）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-voltool-'))
+  const ws = webServerStub()
+  const prompts = []
+  // 小玖的桩：调 say(volume=大声)；其他角色沉默
+  const llm = {
+    stream: (opts) => {
+      const mine = typeof opts.system === 'string' && opts.system.includes('成员小玖')
+      const stop = !mine || hasAssistantToolCall(opts.messages)
+      if (mine && !stop && Array.isArray(opts.messages)) prompts.push(captureUser(opts.messages[0]))
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          argumentsDelta: JSON.stringify({ text: '姐姐，汤好了——！', volume: '大声' }),
+        }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'kitchen')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    await until(async () => {
+      const l = await readLog(dir, (await svc.status()).sliceId)
+      return l.some((e) => e.type === 'say' && e.who === 'kyu' && e.volume === '大声')
+    })
+    await until(async () => {
+      const l = await readLog(dir, (await svc.status()).sliceId)
+      return l.some((e) => e.type === 'notice' && /大喊，清清楚楚/.test(e.text || ''))
+    })
+    const log = await readLog(dir, (await svc.status()).sliceId)
+    const clamor = log.find((e) => e.type === 'notice' && /大喊，清清楚楚/.test(e.text || ''))
+    assert.equal(clamor.char, 'moli', '被叫醒的是隔壁的墨璃')
+    assert.equal(clamor.private, true)
+    assert.ok(/隔壁客厅传来小玖的一声大喊/.test(clamor.text), clamor.text)
+    const sayRow = log.filter((e) => e.type === 'say' && e.who === 'kyu').pop()
+    assert.equal(sayRow.volume, '大声', '音量入账')
+    assert.ok(sayRow.audience.faint.includes('moli'), '隔壁闻声（看不见形态）')
+    // 隔壁的墨璃确实被排了回合，且【最近听到的】里有那句喊话
+    await until(() => prompts.length >= 1)
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('POST say 音量（§9.16）：小声=耳语不出屋；大声=隔壁听得清并当场被叫醒', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-mvol-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'kitchen') // 隔壁
+    // 主人耳语（面板选小声）：隔壁的墨璃一个字都听不到
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '姐姐，只跟你说', volume: '小声' }))
+    assert.equal((await svc.hear('moli')).buffer.length, 0, '耳语不出客厅')
+    // 主人喊一声（面板选大声）：隔壁听得清，当场被叫醒
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '姐姐——！', volume: '大声' }))
+    await until(async () => {
+      const l = await readLog(dir, (await svc.status()).sliceId)
+      return l.some((e) => e.type === 'notice' && /大喊，清清楚楚/.test(e.text || ''))
+    })
+    const log = await readLog(dir, (await svc.status()).sliceId)
+    const clamor = log.find((e) => e.type === 'notice' && /大喊，清清楚楚/.test(e.text || ''))
+    assert.equal(clamor.char, 'moli')
+    assert.ok(/隔壁客厅传来主人的一声大喊/.test(clamor.text), clamor.text)
+    const rows = (await svc.transcript()).lines.filter((l) => l.type === 'say')
+    assert.equal(rows[0].volume, '小声', '耳语音量入账（前端按它调字号）')
+    assert.equal(rows[1].volume, '大声')
+    await until(() => prompts.some((p) => p.system.includes('成员墨璃') && p.user.includes('姐姐——！')))
+    const moliPrompt = prompts.find((p) => p.system.includes('成员墨璃') && p.user.includes('姐姐——！'))
+    assert.ok(
+      moliPrompt.user.includes('（客厅传来主人的喊声：）'),
+      '隔墙的真切在时间线里写成「喊声」，且不显示动作（看不见形态）：' + moliPrompt.user.slice(-400),
+    )
+    // 小声那句不进隔壁的时间线（耳语就是耳语）
+    assert.ok(!moliPrompt.user.includes('姐姐，只跟你说'), '耳语不出现在隔壁的时间线里')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('T3 过时到期（§9.16）：停摆期间溜走的到期静默结算，不补发「做完了」也不唤醒', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-stale-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.moveMaster('living') // 主人在家（顺带把 T6 闸上）
+    const homePath = join(dir, 'home.json')
+    const home = JSON.parse(await readFile(homePath, 'utf8'))
+    const nowMs = Date.now()
+    // 小玖那只：40 分钟前就到期了（家在这段时间里根本没在跑）
+    home.characters.kyu.activity = '睡觉'
+    home.characters.kyu.activityEndsAt = new Date(nowMs - 40 * 60000).toISOString()
+    // 墨璃那只：刚到期（正常 tick 该给的那一声）
+    home.characters.moli.activity = '读书'
+    home.characters.moli.activityEndsAt = new Date(nowMs - 60 * 1000).toISOString()
+    await writeFile(homePath, JSON.stringify(home))
+    await svc.tick()
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    const done = log.filter((e) => e.type === 'notice' && /做完了/.test(e.text || ''))
+    assert.equal(done.length, 1, '只有新鲜到期才补发「做完了」，实际：' + JSON.stringify(done.map((d) => d.text)))
+    assert.equal(done[0].char, 'moli')
+    const h = await svc.home()
+    assert.equal(h.characters.kyu.activity, null, '过时到期静默结算（状态照样清）')
+    assert.equal(h.characters.moli.activity, null)
+    await until(() => prompts.some((p) => p.system.includes('成员墨璃')))
+    assert.ok(
+      !prompts.some((p) => p.system.includes('成员小玖')),
+      '过时的那只不被唤醒——「下午 6 点才睡醒」就是这么来的',
+    )
+  } finally {
+    await rmSafe(dir)
+  }
+})

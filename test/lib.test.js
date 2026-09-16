@@ -375,9 +375,9 @@ test('charName：主人 / 名册名 / 未知回显', () => {
   assert.equal(charName(home, 'nobody'), 'nobody')
 })
 
-// ── 家物理 · 活动持续计时（2026-09-15：close 不冻结，片外照流）──
+// ── 家物理 · 活动持续计时（2026-09-15：close 不冻结，片外照流；2026-09-16 §9.16：开片静默结算）──
 
-test('活动持续计时：close 不清 endsAt，片外时间照流，open 后早已到期 → 不忙', async () => {
+test('活动持续计时（§9.15/§9.16）：close 不清 endsAt，开片把片外到期的静默结算', async () => {
   const { dir, nest, cleanup } = await mk()
   const t0 = FIXED.getTime()
   try {
@@ -392,14 +392,46 @@ test('活动持续计时：close 不清 endsAt，片外时间照流，open 后�
     assert.equal(h2.characters.moli.activityEndsAt, new Date(t0 + 30 * 60000).toISOString())
     assert.equal(h2.characters.moli.activityLeftMs, null)
     assert.equal(h2.characters.moli.activity, '读书')
-    // 模式外过 3 天 → open：endsAt 原样（片外时间已流逝，活动早已到期）
+    // 模式外过 3 天 → open：片外这段时间"流过了但没被经历"，早已到期的活动在这一瞬静默
+    // 结算——不补发迟到的「做完了X」公共 notice、不唤醒（§9.16：否则就是下午 6 点才睡醒）
     nest.now = () => new Date(t0 + 10 * 60000 + 3 * 86400000)
     await nest.open()
     const h3 = await nest.home()
+    assert.equal(h3.characters.moli.activity, null, '片外已到期 → 开片静默结算')
+    assert.equal(h3.characters.moli.activityEndsAt, null)
     assert.equal(h3.characters.moli.activityLeftMs, null)
-    assert.equal(h3.characters.moli.activityEndsAt, new Date(t0 + 30 * 60000).toISOString())
-    const ch = (await nest.home()).characters.moli
-    assert.equal(isBusy(ch, nest.now()), false, '跨片到期 → isBusy false')
+    assert.equal(isBusy(h3.characters.moli, nest.now()), false, '跨片到期 → 不忙')
+    const lines = (await nest.transcript()).lines
+    assert.ok(!lines.some((l) => l.type === 'notice'), '静默收尾：不落「做完了」notice')
+    assert.ok(
+      lines.some((l) => l.type === 'gap' && typeof l.ms === 'number'),
+      '隔得久 → 记一行片外空窗，实际：' + JSON.stringify(lines.map((l) => l.type)),
+    )
+    await nest.close()
+  } finally {
+    await cleanup()
+  }
+})
+
+test('片外未到期的活动照旧跨片带着绝对 endsAt（§9.15/§9.16）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  const t0 = FIXED.getTime()
+  try {
+    await nest.open()
+    await nest.setActivity('kyu', '睡觉', 480) // endsAt = t0+8h
+    nest.now = () => new Date(t0 + 10 * 60000)
+    await nest.close()
+    // 片外只过 15 分钟（离到点还早）→ 开片不算过期，计时继续走
+    nest.now = () => new Date(t0 + 25 * 60000)
+    await nest.open()
+    const h = await nest.home()
+    assert.equal(h.characters.kyu.activity, '睡觉')
+    assert.equal(h.characters.kyu.activityEndsAt, new Date(t0 + 480 * 60000).toISOString())
+    assert.equal(isBusy(h.characters.kyu, nest.now()), true)
+    assert.ok(
+      !(await nest.transcript()).lines.some((l) => l.type === 'gap'),
+      '空窗不到半小时 → 不在时间线里留空窗行（日常开关片不刷屏）',
+    )
     await nest.close()
   } finally {
     await cleanup()
@@ -481,6 +513,59 @@ test('say：同房直接听到 / 相邻进缓冲 / 远处无感，主人视角�
     await nest.open()
     const h2 = await nest.hear('moli')
     assert.equal(h2.buffer.length, 1)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切并当场叫人 / 再远隐约 / 忙碌降半档', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveMaster('living')
+    await nest.moveCharacter('kyu', 'living') // 小玖在客厅
+    await nest.moveCharacter('moli', 'kitchen') // 墨璃在厨房（与客厅相邻）
+    // 1) 小声 = 悄悄话：隔壁完全听不见（缓冲不进、audience.silent 记账）
+    const r1 = await nest.say('kyu', '这句只想跟主人说', undefined, undefined, '小声')
+    assert.equal(r1.volume, '小声')
+    assert.deepEqual(r1.faint, [], '隔壁不该隐约听见')
+    assert.ok(r1.silent.includes('moli'), r1)
+    assert.equal((await nest.hear('moli')).buffer.length, 0)
+    assert.equal(r1.direct.includes('master'), true, '同房照旧听得见（小声不出屋，不是没声音）')
+    const row1 = (await nest.transcript()).lines.filter((l) => l.type === 'say').pop()
+    assert.equal(row1.volume, '小声', '音量入账，供时间线与字体渲染')
+    assert.deepEqual(row1.audience.silent, ['moli'])
+    // 2) 大声 = 喊一声：隔壁听得真切（进缓冲 + urgent 立刻叫人），再远一间的隐约听得到
+    await nest.moveCharacter('kyu', 'living')
+    const r2 = await nest.say('kyu', '姐姐——！', undefined, undefined, '大声')
+    assert.equal(r2.volume, '大声')
+    assert.ok(r2.faint.includes('moli'), '隔壁听得见')
+    assert.ok(r2.urgent.includes('moli'), '隔壁真切到当场叫人（不等缓冲攒够）')
+    assert.equal((await nest.hear('moli')).buffer.length, 1)
+    // 远处（卧室→厨房隔着客厅）
+    await nest.moveCharacter('moli', 'bedroom')
+    await nest.moveCharacter('kyu', 'kitchen')
+    const r3 = await nest.say('kyu', '喊一声试试', undefined, undefined, '大声')
+    assert.ok(r3.faint.includes('moli'), '大声到远处变隐约（听得见）')
+    assert.ok(!r3.urgent.includes('moli'), '远处不真切，不当场叫人')
+    await nest.resolveHear('moli', 'ignore')
+    // 3) 忙碌降半档：埋头做事的猫，隔壁的大声落到"隐约"，不被一嗓子打断
+    await nest.moveCharacter('kyu', 'living')
+    await nest.moveCharacter('moli', 'kitchen')
+    await nest.setActivity('moli', '修bug', 60)
+    const r4 = await nest.say('kyu', '姐姐，吃饭啦！', undefined, undefined, '大声')
+    assert.ok(r4.faint.includes('moli'), '忙也听得见（进缓冲）')
+    assert.ok(!r4.urgent.includes('moli'), '忙 → 不当场叫醒（工作状态下隔壁的大声降半档）')
+    const row4 = (await nest.transcript()).lines.filter((l) => l.type === 'say').pop()
+    assert.ok(!row4.audience.silent.includes('moli'), '降半档不等于听不见——不会变成"一忙就聋"')
+    // 正常音量在忙碌时行为不变（老规矩：隐约 + 攒阈值）
+    await nest.resolveHear('moli', 'ignore')
+    const r5 = await nest.say('kyu', '随口一句', undefined, undefined, '正常')
+    assert.ok(r5.faint.includes('moli'))
+    assert.deepEqual(r5.urgent, [])
+    // 非法音量按正常处理
+    const r6 = await nest.say('kyu', '乱传的音量', undefined, undefined, '超级大声')
+    assert.equal(r6.volume, '正常')
   } finally {
     await cleanup()
   }
@@ -1433,13 +1518,26 @@ test('openTopic/endTopic/resolveTopicSay 方法：账本行与状态一致（含
     // expireTopics：无 closing/open 话题时静默
     const r7 = await nest.expireTopics()
     assert.deepEqual(r7.expired, [])
-    // 服务层 about 硬校验：游离短语进不了账本（工具层之外的第二道闸）
-    await assert.rejects(() => nest.say('moli', '嗯', undefined, '窗外那棵树'), /不存在/)
+    // 服务层 about 门禁（2026-09-16 定案·唯一真相）：about 是标签，台词是内容。
+    // 指向不存在/已收掉的话题 → 摘掉标记照常入账，回执给模型人话原因；绝不吞台词。
     const before = (await nest.transcript()).lines.filter((l) => l.type === 'say').length
-    await assert.rejects(() => nest.say('moli', '嗯', undefined, '窗外那棵树'), /不存在/)
-    assert.equal((await nest.transcript()).lines.filter((l) => l.type === 'say').length, before, '被拒的 say 不入账')
-    // 已收掉的话题也不能再带
-    await assert.rejects(() => nest.say('moli', '嗯', undefined, '那盆花'), /不存在/)
+    const d1 = await nest.say('moli', '窗外那棵树的叶子掉了', undefined, '窗外那棵树')
+    assert.equal(d1.aboutDropped, '窗外那棵树', '降级：报告丢掉的话题短语')
+    assert.equal(d1.about, null, '降级后不带话题标记')
+    assert.match(d1.aboutNote, /不存在或已经收掉/)
+    const after1 = (await nest.transcript()).lines.filter((l) => l.type === 'say')
+    assert.equal(after1.length, before + 1, '台词照常入账（旧的整句吞掉已退役）')
+    assert.equal(after1[after1.length - 1].rawText, '窗外那棵树的叶子掉了')
+    assert.ok(!after1[after1.length - 1].about, '不入账幽灵 about')
+    // 已收掉的话题（那盆花刚 ended）同样降级
+    const d2 = await nest.say('moli', '嗯', undefined, '那盆花')
+    assert.equal(d2.aboutDropped, '那盆花')
+    assert.equal((await nest.transcript()).lines.filter((l) => l.type === 'say').length, before + 2)
+    // 合法 about 照旧挂上（不误伤）
+    await nest.openTopic('kyu', '今晚吃什么', '今晚吃什么呢')
+    const ok = await nest.say('moli', '吃面吧', undefined, '今晚吃什么')
+    assert.equal(ok.about, '今晚吃什么')
+    assert.equal(ok.aboutDropped, undefined)
   } finally {
     await cleanup()
   }

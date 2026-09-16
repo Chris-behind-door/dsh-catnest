@@ -320,6 +320,46 @@ export function roomRelation(home, fromRoom, toRoom) {
   return room.adjacent.includes(toRoom) ? 'adjacent' : 'far'
 }
 
+// ── 说话音量（§9.16，2026-09-16 落地的 9/15 待办）──
+// 离散三档（连续值语义不清："0.7 的声音是什么声音啊"）：
+//   小声 = 悄悄话，只出这一间屋子（同房听得见，隔壁听不见）
+//   正常 = 现在的行为，隔壁隐约闻声（进缓冲，攒够阈值才掀被子）
+//   大声 = 喊一声，隔壁听得清清楚楚（当场被叫醒），再远一间的还隐约闻得到
+// 声学模型：每穿一堵墙降一档（三档制）。主题例外只有一条——「工作状态下隔壁的大声
+// 降半档」：真切到隔壁的那一声，落到正埋头做事的听者耳朵里降回"隐约"，她照旧听得见
+// （进缓冲、按老规矩攒够才反应），但不会被一嗓子当场打断。忙碌只削弱"当场抓住"的
+// 那一声，不改其他档位（正常/远处的动静本来就是慢路，不用再降——降了会变成"忙起来
+// 就什么都听不见"，那是另一个设计）。
+// 字体映射与传播范围是两件事（主人 2026-09-15 定的拆法）：前端按 volume 调字号，不走这里。
+export const SAY_VOLUMES = ['小声', '正常', '大声']
+export const SAY_VOLUME_DEFAULT = '正常'
+const SAY_VOLUME_NOTCH = { 小声: 0, 正常: 1, 大声: 2 }
+const SAY_RELATION_STEPS = { same: 0, adjacent: 1, far: 2 }
+
+// 归一化：只认三档，其余（含旧数据缺省）一律按正常
+export function sayVolume(v) {
+  const s = typeof v === 'string' ? v.trim() : ''
+  return SAY_VOLUMES.includes(s) ? s : SAY_VOLUME_DEFAULT
+}
+
+// 听觉判定：这句音量走到「听者所在房间」时剩下几档。
+// 返回 { level: 'clear'|'faint'|'silent', steps, notch, gripped }。
+// 同房（steps=0）永远真切——同一屋檐下，再小的声音也听得见，小声只是不出屋；
+// 隔墙则看衰减后的档位：≥1 真切 / 0 隐约 / <0 听不见。
+// gripped = 真切到"当场抓住注意力"（隔着一堵墙且不被忙碌削掉）——调度层据此立刻唤醒。
+export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy) {
+  const rel = roomRelation(home, speakingRoom, listenerRoom)
+  const steps = SAY_RELATION_STEPS[rel] === undefined ? 2 : SAY_RELATION_STEPS[rel]
+  let notch = SAY_VOLUME_NOTCH[sayVolume(volume)] - steps
+  // 忙碌降半档：只降"真切"那一档（大声）、且只降隔墙听见的（同房不降）
+  const damped = steps >= 1 && !!listenerBusy && notch >= 1
+  if (damped) notch -= 1
+  if (notch < 0) return { level: 'silent', steps, notch, gripped: false }
+  if (steps === 0) return { level: 'clear', steps, notch, gripped: false }
+  if (notch >= 1) return { level: 'clear', steps, notch, gripped: true }
+  return { level: 'faint', steps, notch, gripped: false }
+}
+
 // 角色是否在忙（有活动且未到期；无结束时间的活动视为一直在忙）。
 // 暂停中的活动（activityPaused，「放下锅铲」）= 不忙：可被叫、可接话、可被轻推（§9.9）。
 export function isBusy(ch, now) {
@@ -335,6 +375,9 @@ export function isBusy(ch, now) {
 // （旧行为：无 duration → activityEndsAt=null → isBusy 永远为真，卡在同一件事里出不来）。
 export const ACTIVITY_DEFAULT_MIN = 60
 export const ACTIVITY_MAX_MIN = 24 * 60
+// 片外空窗留行门槛（§9.16）：两片之间隔半小时以上才记一行「时间片外过去了…」。
+// 日常开关片（回家自动开片、收工关片，隔几秒）不该在时间线里刷这种行。
+export const GAP_LINE_MIN_MS = 30 * 60000
 
 // T6 无产出退避（§9.14）：连着轻推都没产出（没说也没做事）时，冷却按 2^n 拉长、封顶 capMs。
 // 清零由调用方负责（有产出 / 手上有活 / 家里出事）。
@@ -563,8 +606,9 @@ export function matchTopic(home, charId, about) {
   return x
 }
 
-// 带 about 的 say 硬校验（§9.2）：话题必须存在且未收掉。
-// 返回 { topic } 合法；{ error } 不合法，error 是人话原因（进工具回执，供模型当轮纠正）。
+// 带 about 的 say 话题判定（§9.2 / §9.16.3）：话题必须存在且未收掉。
+// 返回 { topic } 合法；{ error } 不合法。注意：不合法**不是** say 的失败条件——
+// 唯一的调用点在 say() 里，命中即降级（摘掉标记照常入账），error 只当人话原因用。
 export function checkTopicAbout(home, charId, about) {
   const a = typeof about === 'string' ? about.trim() : ''
   if (!a) return { topic: null }
@@ -1178,12 +1222,33 @@ export class CatNest {
     const home = await this.home()
     // 话题是片内作用域：开新片清空全部旧话题（对话不跨片，回顾归蒸馏；片内进程重启则留存）
     home.topics = {}
+    // 跨片过期活动静默结算（§9.16，2026-09-16 定案）：片外的时间照流（绝对计时，
+    // §9.15 定案），但家是静止的——没人被谁叫醒。已经到期的活动在开片这一瞬安静收掉，
+    // 不走 T3 的「做完了X」公共 notice + 唤醒。否则会出现「凌晨关片、睡觉在早上 8 点
+    // 到期，傍晚 6 点开片时被告知刚睡醒」这种迟到 10 小时的闹钟（2026-09-16 实测：
+    // 小玖「训练模型」到期 12 小时后在傍晚被唤醒并汇报「训练跑完啦」）。
+    // 片外流逝的时间仍然承认（activityEndsAt 就是绝对戳），只是不再补一场迟到的唤醒。
+    settleActivities(home, this.now())
     await this.saveHome(home)
     const snapshot = { home, relations: await this.relations() }
     await this.writeJsonAtomic(join(dir, OPEN_SNAP_FILE), snapshot)
     await this.writeJsonAtomic(join(dir, META_FILE), { sliceId, openedAt, closedAt: null })
     await writeFile(join(dir, LOG_FILE), '', { mode: 0o600 })
     await this.writeJsonAtomic(join(this.dir, CURRENT_FILE), { sliceId, openedAt })
+    // 片外空窗留一行（§9.16）：时间片是猫的"经历"边界，片外的时间流过了却没被经历。
+    // 隔得久（≥ GAP_LINE_MIN_MS）就记一行，让读时间线的角色知道「钟表走了这么久，
+    // 但家里没人醒着」——否则两片之间的事件容易被脑补成"刚刚发生"。
+    try {
+      const prevId = await this.latestClosedSliceId()
+      const prevMeta = prevId ? await this.readJson(join(this.dir, SLICES_DIR, prevId, META_FILE), null) : null
+      const closedMs = prevMeta && typeof prevMeta.closedAt === 'string' ? new Date(prevMeta.closedAt).getTime() : NaN
+      const nowMs = this.now().getTime()
+      if (Number.isFinite(closedMs) && nowMs - closedMs >= GAP_LINE_MIN_MS) {
+        await this.log('gap', { from: prevMeta.closedAt, to: openedAt, ms: nowMs - closedMs })
+      }
+    } catch {
+      /* 空窗行是锦上添花，写不了不拖累开片 */
+    }
     // 回顾取"最近一个已关闭时间片"：新片 closedAt 为 null，天然排除
     const recap = await this.recap()
     return { sliceId, openedAt, recap }
@@ -1520,32 +1585,48 @@ export class CatNest {
   // 它是视觉信息：同房（含自己）看得见，隔墙闻声的只收台词（听觉）。
   // 与 do_activity（持续状态）/ move_to（位置变化）不同，action 只属于这句话。
   // about（可选）= 话题短语（topic 套件 §9.2）：在某个话题里说的话带上它；轻飘飘一句不带。
-  async say(who, text, action, about) {
+  async say(who, text, action, about, volume) {
     return this.mutate(async () => {
       await this.requireOpen()
       if (typeof who !== 'string' || !who) throw new Error('who 需要是角色 id 或 "master"')
       if (typeof text !== 'string' || !text.trim()) throw new Error('text 需要是非空字符串')
       const act = typeof action === 'string' ? action.trim() : ''
-      const ab = typeof about === 'string' ? about.trim() : ''
       const home = await this.home()
-      // about 硬校验（§9.2）落在服务层：任何入口（工具、接话链、后续新调用点）
-      // 都不能把游离短语写进账本。开场白走 _sayCore（openTopic 内），不受此限。
+      // 话题门禁降级（唯一真相，2026-09-16 定案）：about 是标签，台词是内容。
+      // 指向不存在/已收掉的话题时摘掉标记照常入账。旧版「硬校验失败 → 整句吞掉」
+      // 退役——工具层曾另有一份同样的降级，两份逻辑并存时谁先跑决定了「话丢了没有」
+      // （服务层那份还会在「校验通过 → 话题被 tick 收掉 → 落账」的竞态里真吞一句）。
+      // 现在只有这里一处判定：任何入口（工具/接话链/新调用点）行为一致。
+      // 开场白走 _sayCore（openTopic 内），不受此限。
+      let ab = typeof about === 'string' ? about.trim() : ''
+      let aboutNote = ''
+      let aboutDropped = ''
       if (ab && who !== 'master') {
         const chk = checkTopicAbout(home, who, ab)
-        if (chk.error) throw new Error(chk.error)
+        if (chk.error) {
+          aboutDropped = ab
+          ab = ''
+          aboutNote =
+            '（话题「' + aboutDropped + '」不存在或已经收掉了，这句按普通说话记下了。' +
+            '想聊这条线就用 open_topic 重提一次。）'
+        }
       }
-      return this._sayCore(home, who, text, act || undefined, ab || undefined)
+      const r = await this._sayCore(home, who, text, act || undefined, ab || undefined, volume)
+      if (!aboutDropped) return r
+      return { ...r, aboutDropped, aboutNote }
     })
   }
 
-  // 说话核心（必须在 mutate 内调用）：入账 say 行 + 相邻进缓冲 + 落盘。
+  // 说话核心（必须在 mutate 内调用）：入账 say 行 + 听到的人进缓冲 + 落盘。
   // say() 与 resolveHear() 共用；后者不能直接调 this.say()（mutate 内再 mutate 会死锁排队）。
-  async _sayCore(home, who, text, action, about) {
+  // volume（§9.16）：小声/正常/大声，决定这句话能走多远（见 sayPerceive）。
+  async _sayCore(home, who, text, action, about, volume) {
     const room = this.locateRoom(home, who)
     if (!room) {
       if (who === 'master') throw new Error('主人不在家（先 moveMaster 进房）')
       throw new Error(`角色 "${who}" 不存在`)
     }
+    const vol = sayVolume(volume)
     // 说话时刻全员位置快照（含主人；人不在家不记）
     const positions = {}
     for (const [id, ch] of Object.entries(home.characters || {})) {
@@ -1553,26 +1634,53 @@ export class CatNest {
     }
     if (home.master && home.master.atHome && home.master.room) positions.master = home.master.room
     const around = this.perceiveAround(home, room, who !== 'master', who)
+    // 听觉判定（§9.16 声学模型）：每穿一堵墙降一档；正在忙的听者再降一档（「工作状态下
+    // 隔壁的大声降半档」）。≥1 真切 / 0 隐约 / <0 听不见。同房永远真切（同一屋檐下，
+    // 再小的声音也听得见），所以忙碌降档只对隔壁和远处生效。
+    const now = this.now()
+    const clear = []
+    const faint = []
+    const silent = []
+    const urgent = []
+    for (const id of [...around.direct, ...around.adjacent, ...around.far]) {
+      const lroom = id === 'master' ? (home.master && home.master.room) : (home.characters[id] && home.characters[id].room)
+      const busy = id === 'master' ? false : isBusy(home.characters[id], now)
+      const p = sayPerceive(home, room, lroom, vol, busy)
+      if (p.level === 'silent') {
+        silent.push(id)
+      } else if (p.level === 'clear' && p.steps === 0) {
+        clear.push(id) // 同房：听得见，也看得见形态（action 给人看）
+      } else if (p.level === 'clear') {
+        faint.push(id) // 隔壁大声：听得清，但还是隔着一堵墙（看不见形态）
+        if (p.gripped) urgent.push(id) // 真切到当场抓住注意力：喊一声就是为了被听见，不等缓冲攒够
+      } else {
+        faint.push(id)
+      }
+    }
     await this.log('say', {
       who,
       room,
       text,
+      // 音量（§9.16）：小声/大声才记，缺省即正常；旧 log 无此字段，消费侧按正常处理
+      ...(vol !== '正常' ? { volume: vol } : {}),
       // 动作随台词入账（视觉信息）；旧 log 无此字段，消费侧容缺省
       ...(action ? { action } : {}),
       // 话题短语（topic 套件）：话题里的发言带 about，口径与渲染一致
       ...(about ? { about } : {}),
       positions,
-      audience: { clear: [...around.direct], faint: [...around.adjacent] },
+      // audience = 听觉判定结果（权威）：clear 同房真切（看得见形态）/ faint 隔墙闻声
+      // （看不见形态）/ silent 完全没听见（小声不出屋就是这个）。旧行只有 clear/faint。
+      audience: { clear, faint, silent },
     })
     const buffered = []
-    for (const id of around.adjacent) {
+    for (const id of faint) {
       if (id === 'master') continue // 主人不攒缓冲（人是即时感知的），回看走 transcript
       const ch = home.characters && home.characters[id]
       if (!ch) continue
       ch.hear = ch.hear || []
       // 缓冲只攒声音（text）：action 是视觉信息，隔墙看不见，不进缓冲。
       // room = 说话时房间（声源位置；人后来走开也不改，供唤醒校验与位置描述）
-      ch.hear.push({ t: this.now().toISOString(), from: who, room, text })
+      ch.hear.push({ t: now.toISOString(), from: who, room, text })
       buffered.push(id)
       await this.log('hear', { char: id, from: who, room, text })
     }
@@ -1585,10 +1693,16 @@ export class CatNest {
     return {
       who,
       room,
+      volume: vol,
+      about: about || null,
       direct: around.direct,
       adjacent: around.adjacent,
       buffered,
       far: around.far,
+      clear,
+      faint,
+      silent,
+      urgent,
       hearReady: ready,
     }
   }

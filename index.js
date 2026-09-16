@@ -62,7 +62,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, checkTopicAbout, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -81,6 +81,11 @@ const T6_SAY_COOLDOWN_MS = 5 * 60000
 // §9.14（2026-09-14 主人定案）：轻推冷却从「上次说话」改成「上次轻推」起算，并做无产出退避
 // （2^n 拉长、封顶 2 小时）。旧行为是「从不说话的猫每个 tick 都被推一次」——58h 片 429 次推的根因。
 const T6_BACKOFF_MAX_MS = 120 * 60000
+// §9.16（2026-09-16）：活动到期的「过时」门槛。tick 是 60s 一跳，正常到期最多差一分钟；
+// endsAt 比此刻旧出一大截，说明这段时间家根本没在跑（宿主宕机 / 片外空窗）——那段
+// 时间没有被经历，就不该补发一场迟到几小时的「做完了X」+ 唤醒（实测：清晨到期的
+// 睡觉，傍晚开片时才被唤醒并汇报「我睡好了」）。
+const ACTIVITY_STALE_MS = 10 * 60000
 
 // 收尾蒸馏（2026-08-26 定案 #3/#4）：一次生成、按角色分段的条目式输出。
 // 【回顾】段=主人回来时的总述（写 summary.json/recap）；每角色段=该角色自己的记忆
@@ -495,6 +500,21 @@ export default {
           }
           continue
         }
+        if (l.type === 'gap') {
+          // 片外空窗（§9.16）：时间片是"经历"的边界，片外的时间流过了却没被经历。
+          // 让读时间线的角色知道钟表走了多久、家里当时是静止的，别把空窗前后接成"刚刚"。
+          flushMoves()
+          const fromMs = typeof l.from === 'string' ? new Date(l.from).getTime() : NaN
+          const toMs = typeof l.to === 'string' ? new Date(l.to).getTime() : NaN
+          const human =
+            Number.isFinite(fromMs) && Number.isFinite(toMs)
+              ? humanInterval(fromMs, toMs)
+              : typeof l.ms === 'number'
+                ? humanInterval(0, l.ms)
+                : ''
+          out.push('（时间片外过去了' + human + '，家是静止的、钟表一直在走，现在重新开始）')
+          continue
+        }
         if (l.type === 'move' || l.type === 'master-move') {
           const mover = l.type === 'move' ? l.char : l.who || 'master'
           if (!mover) continue
@@ -514,11 +534,18 @@ export default {
         // 话题短语是内容层面的信息（不是形态），隔墙也带上：否则对方听见了内容，
         // 却不知道这是在聊哪条线，也就接不上（§9.2 开完不限房间）
         const aboutTxt = typeof l.about === 'string' && l.about ? '（聊' + l.about + '）' : ''
+        // 音量（§9.16）：隔墙听得真切的是「喊声」，同房的小声标注「低声」，让读时间线的
+        // 角色知道这句话当时是怎么说出口的（旧行缺省=正常，不标）。
+        const vol = sayVolume(l.volume)
         if (level === 'faint') {
           // 隔墙只闻声不见形：action 是视觉信息，不入听者的时间线；话题标记跟着内容走
-          out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + '的声音：）' + aboutTxt + l.rawText)
+          const how = vol === '大声' ? '的喊声' : '的声音'
+          out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + how + '：）' + aboutTxt + l.rawText)
         } else {
-          out.push(nameOf(who) + (act ? '（' + act + '）' : '') + aboutTxt + '：' + l.rawText)
+          const volTxt = vol === '小声' ? '低声' : vol === '大声' ? '大声' : ''
+          out.push(
+            nameOf(who) + (volTxt ? '（' + volTxt + '）' : '') + (act ? '（' + act + '）' : '') + aboutTxt + '：' + l.rawText,
+          )
         }
       }
       flushMoves()
@@ -542,7 +569,8 @@ export default {
           '对家人说一句话。这是唯一的说话方式：想说话就调用它，把要说的话放进 text；' +
           '直接输出的文字家人听不见、也不会入账，只有这里的 text 才算说出口。' +
           '说这句话时如果伴随着一个具体的即时小动作，把它放进 action（可选）。' +
-          '如果在某个话题里说话（接了别人的话题或自己开的话题），把 about 带上话题短语。',
+          '如果在某个话题里说话（接了别人的话题或自己开的话题），把 about 带上话题短语。' +
+          '说话音量用 volume（小声的悄悄话只有同屋听得见；大声喊一声隔壁也听得清）。',
         parameters: {
           type: 'object',
           properties: {
@@ -560,6 +588,14 @@ export default {
                 '要和这个房间里一条还开着的话题的短语完全一致（写错了或者那条线已经收了，' +
                 '这句话照样说得出去，只是不挂在那条线上，回执会告诉你）。' +
                 '想开新的话题用 open_topic；跟主人说话、随口一句都不用带。',
+            },
+            volume: {
+              type: 'string',
+              enum: SAY_VOLUMES,
+              description:
+                '可选：说话音量（缺省「正常」）。「小声」=悄悄话，只有同一间屋子的人听得见，' +
+                '隔壁什么都不知道——想避开别人说私房话就用它；「大声」=喊一声，隔壁听得清清楚楚' +
+                '并且会被当场叫醒，再远一间的也能隐约听到。音量只影响别人听不听得见，不影响你说了什么。',
             },
           },
           required: ['text'],
@@ -910,32 +946,27 @@ export default {
           const text = typeof args.text === 'string' ? args.text : ''
           if (!text.trim()) return fail('say 需要非空 text')
           const action = typeof args.action === 'string' ? args.action.trim() : ''
-          // 话题门禁降级（2026-09-15 主人定案）：about 指向不存在/已收掉的话题时，旧行为是
-          // 把整句台词吞掉（账本没有 say 行、前端打字机气泡随后被 settle 收走，主人只看到
-          // 「话说了又没了」）。台词本身没错，错的只是挂了个没了的话题名——所以降级成普通
-          // 说话照常入账，只在回执里告诉模型这条线已经收了。
           const rawAbout = typeof args.about === 'string' ? args.about.trim() : ''
-          let about = rawAbout
-          let aboutNote = ''
-          if (about) {
-            // 话题硬校验（§9.2）：about 非空必须是「这个房间里一条还开着的话题」
-            const chk = checkTopicAbout(await nest.home(), charId, about)
-            if (chk.error) {
-              about = ''
-              aboutNote =
-                '（话题「' + rawAbout + '」已经收掉了，这句按普通说话记下了。' +
-                '想重新聊这条线就用 open_topic 重提一次。）'
-              void agentDebug(charId, dbgSlice, 'say 话题降级（话照说、按普通说话入账）：' + rawAbout)
-            }
+          const volume = sayVolume(args.volume)
+          // 话题门禁降级（§9.2 修订 + 2026-09-16 定案）：判定只此一处不够——它落在
+          // 服务层 nest.say（任何入口都过同一道闸），这里只负责把结果翻成人话回执。
+          // 旧版在工具层又抄了一份同样的校验，两份逻辑并存：谁先跑决定了「话丢了没有」，
+          // 服务层那份还能在「校验通过→话题被 tick 收掉→落账」的竞态里真吞一句台词。
+          const r = await nest.say(charId, text, action || undefined, rawAbout || undefined, volume)
+          if (r && r.aboutDropped) {
+            void agentDebug(charId, dbgSlice, 'say 话题降级（话照说、按普通说话入账）：' + r.aboutDropped)
           }
-          await nest.say(charId, text, action || undefined, about || undefined)
           // 话题账（§9.2）：带 about=解析话题（加入/续谈/裁决接受）；不带 about 也是裁决动作
-          await nest.resolveTopicSay(charId, about || null)
+          await nest.resolveTopicSay(charId, (r && r.about) || null)
           scheduleSnapshot()
+          // 大声（真切到隔壁）当场唤醒隔壁听众：喊一声就是为了被听见，不等缓冲攒够。
+          for (const id of (r && r.urgent) || []) {
+            await tryWakeHear(id, true, { bypassReady: true, clamor: { from: charId, room: r.room } })
+          }
           return {
             ok: true,
-            result: '已说出口。' + aboutNote,
-            effect: { tool: 'say', text, ...(action ? { action } : {}), ...(about ? { about } : {}) },
+            result: '已说出口。' + ((r && r.aboutNote) || ''),
+            effect: { tool: 'say', text, ...(action ? { action } : {}), ...(r && r.about ? { about: r.about } : {}), ...(volume !== '正常' ? { volume } : {}) },
           }
         }
         if (name === 'open_topic') {
@@ -1205,6 +1236,10 @@ export default {
         '【家里的分寸（路 B §9.6）】\n' +
         '· 家人正忙着各自的事时，可以轻飘飘地说一句（分享见闻、打招呼），别追着聊；重要的事才停一下手里的。\n' +
         '· 轻飘飘的话对方不接也正常，不接也是回应，不用追着问。\n' +
+        '· 说话音量（say 的 volume，缺省正常）：「小声」是悄悄话，只出这一间屋子，隔壁一点都听不见；' +
+        '「大声」是喊一声，隔壁听得清清楚楚、当场就会被叫醒，再远一间的也隐约听得到。' +
+        '想避开别人说私房话就用小声；隔着墙要人听见就用大声。音量只管别人听不听得见，' +
+        '和你说了什么无关——别人正埋头做事时，隔壁大声到了她那儿也会变成隐约（她会晚一点才反应过来）。\n' +
         '· 话题（open_topic / end_topic / say 的 about）是你和姐妹聊天的工具：提起来的时候' +
         '必须是当面提（房间里没有别的猫娘就开不起话题），开起来之后走到别的房间也还能接着聊；' +
         '主人那边不需要话题，跟主人说话直接 say。\n' +
@@ -1442,6 +1477,8 @@ export default {
               : '朝' + charName(home, l.target) + '喊话：' + String(l.rawText || ''),
           // 台词伴随的即时动作（舞台指示），前端渲染为气泡前缀；旧行无此字段
           action: typeof l.action === 'string' ? l.action : '',
+          // 音量（§9.16）：前端按档位调字号（小声小字、大声大字）；旧行缺省=正常
+          volume: sayVolume(l.volume),
         }))
       return { sliceId: t ? t.sliceId : null, lines }
     }
@@ -1531,12 +1568,14 @@ export default {
     // 2026-09-13 修订：过时动静（对话早散场 / 人已走远）先丢弃不唤醒——
     // 唤醒本该是"刚攒满就掀被子"，被队列忙跳过而拖到几分钟后就不该再掀。
     // 判据见 hearStaleOf（时间 HEAR_STALE_MS + 空间）。
-    const tryWakeHear = async (charId, force = false) => {
+    // opts.bypassReady（§9.16）：不要求缓冲攒满阈值——隔壁的一声「大声」听得真切，
+    // 当场就该被叫醒，不用等攒够几次（threshold 是为"隐约的动静"设计的慢路）。
+    const tryWakeHear = async (charId, force = false, opts = {}) => {
       try {
         const st = await nest.status()
         if (!st || !st.open) return null
         const home = await nest.home()
-        if (!hearReadyOf(home, charId)) return null
+        if (!opts.bypassReady && !hearReadyOf(home, charId)) return null
         if (hearStaleOf(home, charId, nest.now())) {
           const stale = await nest.dropStaleHear(charId)
           console.log(
@@ -1547,10 +1586,10 @@ export default {
         const ch = home.characters && home.characters[charId]
         const last = ch && Array.isArray(ch.hear) && ch.hear.length > 0 ? ch.hear[ch.hear.length - 1] : null
         if (ch && !ch.hearNotified) {
-          const from = last ? last.from : 'master'
+          const from = (opts.clamor && opts.clamor.from) || (last ? last.from : 'master')
           // 位置取「说那句话时的房间」（旧条目无 room 才回落到说话人此刻的房间）：
           // 墨璃在客厅说完再挪去卧室，小玖听到的仍是客厅的动静，别写成"隔壁卧室"。
-          let fromRoom = (last && last.room) || null
+          let fromRoom = (opts.clamor && opts.clamor.room) || (last && last.room) || null
           if (!fromRoom) {
             if (from === 'master') fromRoom = home.master && home.master.atHome ? home.master.room : null
             else if (home.characters && home.characters[from]) fromRoom = home.characters[from].room
@@ -1558,12 +1597,10 @@ export default {
           const fromName = from === 'master' ? '主人' : charName(home, from) || from
           const roomTxt = fromRoom ? roomName(home, fromRoom) : ''
           // 动静是她的耳朵、她的感知（v1 拍板改私有）；台词内容不誊进家庭时间线
-          await nest.notice(
-            charId,
-            from,
-            (roomTxt ? '隔壁' + roomTxt : '隔壁') + '传来' + fromName + '的动静，已经几次了（见【最近听到的】）',
-            true,
-          )
+          const what = opts.bypassReady
+            ? '传来' + fromName + '的一声大喊，清清楚楚（见【最近听到的】）'
+            : '传来' + fromName + '的动静，已经几次了（见【最近听到的】）'
+          await nest.notice(charId, from, (roomTxt ? '隔壁' + roomTxt : '隔壁') + what, true)
           await nest.markHearNotified(charId)
         }
         if (turningChars.has(charId)) return null
@@ -1687,14 +1724,23 @@ export default {
           await tryWake(e.charId, true)
         }
         // 2) activity 到期（T3）：静默清除（不落 activity 行）+「做完了事」公共 notice
-        //    （唯一公共事件，家庭事实）+ 唤醒本人
+        //    （唯一公共事件，家庭事实）+ 唤醒本人。
+        //    §9.16（2026-09-16）：只对"新鲜到期"这么做。endsAt 已经旧过 ACTIVITY_STALE_MS
+        //    的，是家停摆期间溜走的（宿主宕机 / 片外空窗）——静默收掉，不补发迟到几小时的
+        //    「做完了X」和唤醒（那会变成「下午 6 点才睡醒」）。开片处的同类结算见 lib.js open()。
         const home = await nest.home()
         const nowT = Date.now()
         for (const ch of Object.values(home.characters || {})) {
           if (!ch || !ch.activity || !ch.activityEndsAt) continue
-          if (new Date(ch.activityEndsAt).getTime() > nowT) continue
+          const endsMs = new Date(ch.activityEndsAt).getTime()
+          if (!Number.isFinite(endsMs) || endsMs > nowT) continue
           const actName = ch.activity
           await nest.clearActivity(ch.id)
+          const lateMs = nowT - endsMs
+          if (lateMs > ACTIVITY_STALE_MS) {
+            void agentDebug(ch.id, st.sliceId, '活动到期过时静默结算（不通知不唤醒）：' + actName + '，晚了 ' + humanInterval(0, lateMs))
+            continue
+          }
           await nest.notice(ch.id, ch.id, (ch.name || ch.id) + '做完了' + actName, false)
           t6Idle.delete(ch.id) // §9.14：活动做完是家里的事 → 退避清零，下次从头算
           await tryWake(ch.id, true)
@@ -1717,15 +1763,21 @@ export default {
     // 主人消息立刻入账并推送；各角色依次被询问（每次 agentTurn 内部重取时间线，
     // 后者能看到前者刚入账的话）；「未调 say 工具」即沉默，接话人数自然涌现；
     // llm 缺席/异常推 replyError 可见，超时/空输出视为沉默不拖累伙伴。
-    const masterSay = async (text) => {
+    const masterSay = async (text, volume) => {
       const home = await nest.home()
       if (!(home.master && home.master.atHome)) {
         throw new Error('主人还不在家，先在地图上点个房间回来喵')
       }
-      const said = await nest.say('master', text)
+      // 音量（§9.16）：面板上选小声=耳语，隔壁听不见；选大声=喊，隔壁听得清并当场被叫醒。
+      const vol = sayVolume(volume)
+      const said = await nest.say('master', text, undefined, undefined, vol)
       scheduleSnapshot()
-      // 调度层 T1：主人的动静让相邻房缓冲攒满 → 边沿唤醒对应角色（与接话链共用串行队列）
+      // 调度层 T1：主人的动静让相邻房缓冲攒满 → 边沿唤醒对应角色（与接话链共用串行队列）；
+      // 大声（真切到隔壁）当场唤醒，不等攒阈值。
       for (const id of said.hearReady || []) await tryWakeHear(id)
+      for (const id of said.urgent || []) {
+        await tryWakeHear(id, true, { bypassReady: true, clamor: { from: 'master', room: said.room } })
+      }
       const present = said.direct || []
       // 串行依次：同房角色逐个入队 agentTurn（后者经时间线可见前者刚说的话）。
       // responders 强制顺序与 MAX_SPEAKERS 退役（定案 #13），直接按名册自然序。
@@ -1845,7 +1897,7 @@ export default {
       adjustRelation: (pair, field, delta) => nest.adjustRelation(pair, field, delta),
       recap: () => nest.recap(),
       recapLLM: (sliceId) => recapLLM(sliceId),
-      say: (who, text, action, about) => nest.say(who, text, action, about),
+      say: (who, text, action, about, volume) => nest.say(who, text, action, about, volume),
       openTopic: (charId, about, text, to) => nest.openTopic(charId, about, text, to),
       endTopic: (charId, about, text) => nest.endTopic(charId, about, text),
       resolveTopicSay: (charId, about) => nest.resolveTopicSay(charId, about),
@@ -2062,7 +2114,8 @@ export default {
               if (op === 'say') {
                 const text = String(body.text || '').trim()
                 if (!text) return json(res, 400, { error: 'text required' })
-                return json(res, 200, await masterSay(text))
+                // volume：小声/正常/大声（§9.16），缺省正常；非法值当正常
+                return json(res, 200, await masterSay(text, body.volume))
               }
               if (op === 'selectModel') {
                 // 猫窝面板换模型：写宿主默认选择（与工作模式的选择器同一存储）
@@ -2122,6 +2175,9 @@ export default {
 export {
   roomRelation,
   isBusy,
+  sayVolume,
+  sayPerceive,
+  SAY_VOLUMES,
   hearReadyOf,
   hearStaleOf,
   autonomyEnabled,
