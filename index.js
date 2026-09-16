@@ -1312,6 +1312,7 @@ export default {
       }
       const messages = [{ role: 'user', content: [{ type: 'text', text: user }] }]
       const actions = []
+      const lostDrafts = [] // 打字机吐过、但没落账的台词（回合末兜底入账）
       let said = false
       let selfChecked = false
       for (let step = 0; step < MAX_STEPS; step++) {
@@ -1320,12 +1321,15 @@ export default {
         // 正式台词由 say 入账后的 snapshot 带来，前端据此收掉打字机气泡。
         let started = false
         let live = true
+        let draft = '' // 本步打字机吐出去的 say 文本（已解码），用于兜底入账
+        let stepSaid = false
         const onSayDelta = (frag) => {
           if (!live) return
           if (!started) {
             started = true
             broadcast({ kind: 'deltaStart', char: charId, name })
           }
+          draft += frag
           broadcast({ kind: 'delta', char: charId, text: frag })
         }
         const result = await llmStep(system, messages, STEP_MAX_TOKENS, onSayDelta)
@@ -1333,6 +1337,7 @@ export default {
         if (started) broadcast({ kind: 'deltaEnd', char: charId, name })
         if (!result) {
           void agentDebug(charId, dbgSlice, '本步无结果（软超时或异常，详情见控制台）')
+          if (draft.trim()) lostDrafts.push(draft.trim()) // 半句话也是话（见回合末兜底）
           break // 超时/失败：本轮到此为止，保留已产生的动作
         }
         const { toolCalls, text } = result
@@ -1391,7 +1396,10 @@ export default {
           }
           if (outcome.effect) {
             actions.push(outcome.effect)
-            if (outcome.effect.tool === 'say') said = true
+            if (outcome.effect.tool === 'say') {
+              said = true
+              stepSaid = true
+            }
           } else if (!outcome.ok) {
             // 工具失败落盘（2026-09-15 主人定案）：失败回执本来只回给模型，主人那边什么都看不到，
             // 出了「话说了又没了」这种事只能靠推断。谁、哪个工具、为什么，落一行进 agent-debug.log。
@@ -1402,6 +1410,31 @@ export default {
             content: [{ type: 'tool-result', toolCallId: c.id, content: [{ type: 'text', text: outcome.result }], isError: !outcome.ok }],
           })
         }
+        // 这一步打字机吐了字，却没有任何 say 成功落账 → 记进兜底清单
+        if (draft.trim() && !stepSaid) lostDrafts.push(draft.trim())
+      }
+      // ── 打字机兜底入账（§9.17，2026-09-16 主人定案）──
+      // 现象（主人实测）：小玖在屏上打了一大段话，气泡随后变半透明「这句话没能说出口，
+      // 没进账本」（`slices/20260916T180830/agent-debug.log` 12:02:54 那轮：模型调了 say，
+      // 但 arguments 没能解析出非空 text——尾部被截断或字符串里有裸换行——工具失败、
+      // 台词没入账，而打字机是流式直播的，字早就吐出来了）。
+      // 打字机里流出来的字**就是这句话的 text 参数**，主人看见了、家人也该听见：
+      // 落账失败不该连坐内容，在这里按普通说话补记一次（只补没落账的那些，不重复）。
+      // 只在「整轮一句都没落账」时补：中途哪一步成功说过话，屏幕上留下的也是那一步的
+      // 气泡（打字机每步重置），再补前面失败的那条只会把同一句话记两遍。
+      if (!said && lostDrafts.length > 0) {
+        for (const lost of lostDrafts) {
+          try {
+            await nest.say(charId, lost)
+            said = true
+            void agentDebug(charId, dbgSlice, '打字机兜底入账（工具调用没落地）：' + lost.slice(0, 60))
+          } catch (error) {
+            void agentDebug(charId, dbgSlice, '打字机兜底失败：' + (error && error.message ? error.message : String(error)))
+            break
+          }
+        }
+      } else if (lostDrafts.length > 0) {
+        void agentDebug(charId, dbgSlice, '打字机有 ' + lostDrafts.length + ' 段草稿没落账，但本轮已有台词入账，不重复补')
       }
       void agentDebug(
         charId, dbgSlice,
@@ -1541,8 +1574,11 @@ export default {
         turningChars.delete(charId)
       }
       // 结算帧：沉默/超时/llm 缺席/异常都要结算（前端据此收起「正在想」名单+打字机气泡）。
-      // 契约只带 name：带 char 会被前端/测试的帧段切分误认为打字机帧
-      broadcast({ kind: 'settle', name })
+      // 契约只带 name：带 char 会被前端/测试的帧段切分误认为打字机帧。
+      // said（§9.17）：这一轮到底有没有台词落账——前端据此决定「打字机气泡」是正常
+      // 被快照接管，还是真成了「没能说出口」（旧版一律按后者灰掉，撞上快照晚到的一瞬
+      // 会闪一下灰）。
+      broadcast({ kind: 'settle', name, said: !!(r && r.said) })
       scheduleSnapshot()
       // 回合结束全屋复检（边沿触发）：回合中新鲜动静又把谁攒满 → 再唤醒
       try {

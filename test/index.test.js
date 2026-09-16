@@ -2952,3 +2952,100 @@ test('T3 过时到期（§9.16）：停摆期间溜走的到期静默结算，�
     await rmSafe(dir)
   }
 })
+
+// ── §9.17（2026-09-16）：打字机兜底入账 ──
+
+test('say 工具参数没解析出来（截断/裸换行）→ 打字机里的台词兜底入账，不再半透明消失', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-draft-'))
+  const ws = webServerStub()
+  const prompts = []
+  // 复刻 2026-09-16 12:02:54 那轮：模型调了 say，argumentsDelta 把 text 吐出来（打字机
+  // 有字），但 JSON 不合法（这里给一个没闭合的字符串）→ 工具失败、台词原本要丢
+  const llm = {
+    stream: (opts) => {
+      const mine = typeof opts.system === 'string' && opts.system.includes('成员小玖')
+      const stop = !mine || hasAssistantToolCall(opts.messages)
+      if (mine && !stop && Array.isArray(opts.messages)) {
+        prompts.push({ system: opts.system, user: captureUser(opts.messages[0]) })
+      }
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: '{"text":"诶——笨猫？我尾巴都要炸了喵' }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    await until(() =>
+      prompts.some((p) => p.system.includes('成员小玖')),
+    )
+    // 等一下兜底落账
+    const st = await svc.status()
+    await until(async () => {
+      const lines = ((await svc.transcript()).lines || []).filter(
+        (l) => l.type === 'say' && l.who === 'kyu',
+      )
+      return lines.length > 0
+    })
+    const rows = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+    assert.equal(rows[0].rawText, '诶——笨猫？我尾巴都要炸了喵', '打字机吐出来的话必须入账，实际：' + JSON.stringify(rows[0].rawText))
+    const log = await readLog(dir, st.sliceId)
+    const kyuSay = log.filter((e) => e.type === 'say' && e.who === 'kyu')
+    assert.ok(kyuSay.length === 1, '只补一次，不重复入账')
+    // 工具失败照样落诊断，兜底也留痕
+    const dbg = await readFile(join(dir, 'slices', st.sliceId, 'agent-debug.log'), 'utf8')
+    assert.ok(/工具失败 say/.test(dbg), '工具失败仍然落盘')
+    assert.ok(/打字机兜底入账（工具调用没落地）/.test(dbg), '兜底也留痕，实际：' + dbg.slice(-400))
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('say 正常落账时不会重复兜底（说出口一次就一次）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-draft2-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayToolStub('姐姐，汤好了') })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    await until(async () => {
+      const rows = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+      return rows.length > 0
+    })
+    await new Promise((r) => setTimeout(r, 250))
+    const rows = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+    assert.equal(rows.length, 1, '正常路径只入账一次，兜底不该再补一条')
+    assert.equal(rows[0].rawText, '姐姐，汤好了')
+    void prompts
+  } finally {
+    await rmSafe(dir)
+  }
+})
