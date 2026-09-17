@@ -85,7 +85,7 @@ export function initialRelationsOf(companionId) {
 // （说话时房间，供唤醒校验与位置描述）
 // v4→v5（2026-09-16 HOUSE_DESIGN §1）：rooms[].items 家当（房间里的东西 + 可选状态）。迁移按
 // 房间 id 补默认稿（主人改 home.json 即可增删），不在默认表里的房间给空数组。
-export const HOME_VERSION = 5
+export const HOME_VERSION = 6
 // "听到"决策链阈值（草案：小玖3条/姐姐5条，待调——存 home.json 可改）
 export const HEAR_THRESHOLDS = { kyu: 3, moli: 5 }
 // 同房接话顺序：小玖活泼先抢，姐姐谦让（草案 4.5）
@@ -97,11 +97,19 @@ export const DISTANCE_LEVELS = ['same', 'adjacent', 'far']
 // 每个条件是一条「时间段」：{ id, name, startAt, endAt, cycleDays? }。
 // phase（pending/active/expired）由 now 实时推导，不落盘；cycleDays 表示
 // 到期后几天自动开始下一轮（发情周期自动续）。
+// estrus 不再自带 cycleDays（§9.18）：周期统一归 home.cycles 表记账（按猫配、带抖动），
+// condition 只是「当前这一轮」的投影。两套续轮逻辑并存会互相打架。
 export const CONDITION_TYPES = {
-  estrus: { label: '发情期', defaultDays: 4, cycleDays: 20 },
+  estrus: { label: '发情期', defaultDays: 3 },
   sick: { label: '生病', defaultDays: 2 },
   injured: { label: '受伤', defaultDays: 2 },
   tired: { label: '疲劳', defaultDays: 1 },
+  // 每日随机身体状态的收录（§9.18）：给了标签，场景里才不会显示成「精神特别好中」
+  spirited: { label: '精神好', defaultDays: 1 },
+  appetite: { label: '胃口好', defaultDays: 1 },
+  shedding: { label: '换毛期', defaultDays: 2 },
+  insomnia: { label: '失眠', defaultDays: 1 },
+  stiffneck: { label: '落枕', defaultDays: 1 },
 }
 // 未知状态名的默认时长（天）
 export const CONDITION_DEFAULT_DAYS = 1
@@ -117,6 +125,14 @@ export const CONDITION_ALIASES = {
   sick: 'sick',
   injured: 'injured',
   tired: 'tired',
+  精神特别好: 'spirited',
+  精神好: 'spirited',
+  胃口特别好: 'appetite',
+  胃口好: 'appetite',
+  换毛期: 'shedding',
+  换毛: 'shedding',
+  失眠: 'insomnia',
+  落枕: 'stiffneck',
 }
 // 归一化：中文名 → 收录键（查不到原样返回）
 export function conditionKey(name) {
@@ -150,7 +166,7 @@ function defaultHome() {
           activityPaused: null, // pause_activity「放下锅铲」：暂停中的活动标记（暂停=不忙）
           lastAmbientAt: null, // 活动隔墙动静上次入账时刻（§9.5，每 10min 补一条去重）
           mood: null, // 挂状态（心情/神态，字符串；空=无），瞬态随位置进场景动态窗口
-          conditions: [], // 持久状态（时间段）：{ id, name, startAt, endAt, cycleDays? }
+          conditions: [], // 持久状态（时间段）：{ id, name, startAt, endAt, cycleDays?, source?, note? }
           hear: [], // "听到"决策链缓冲（相邻动静攒存）
         },
       ]),
@@ -158,6 +174,12 @@ function defaultHome() {
     hearThresholds: { ...HEAR_THRESHOLDS },
     master: { atHome: false, room: null },
     topics: {}, // 话题状态（§9.2，片内作用域：open 时清空；跨片不延续）
+    // 发情周期日历（§9.18）：每只猫一条 {gapDays, durDays, nextStart, nextEnd, jitterDays,
+    // seeded, rounds}。首次结算由 settleCycles 按 CYCLE_CONFIG 错开播种，所以这里是空对象。
+    cycles: {},
+    // 每日随机身体状态（§9.18）：默认开（2026-09-17 主人拍板）；rolledOn 记今天掷过没有，
+    // 防开片重掷（片是你开几次就几次，日子一天只有一个）
+    regime: { enabled: true, rolledOn: null, picks: [], lastResult: null },
     // 自主闸：离家自动那档不变（主人不想跑就别待在离家状态）；homeOn 只管
     // 「主人在家时要不要也跑 T6 自主节奏」，默认关（省 API、不抢主人模型槽位）
     autonomy: { homeOn: false },
@@ -471,6 +493,218 @@ export function advanceConditions(home, now) {
     ch.conditions = kept
   }
   return { changed }
+}
+
+// ── 发情周期日历（§9.18，2026-09-17 主人拍板）──
+// 周期归这张表记账（每只猫一条），conditions 里的「发情」只是当前这一轮的投影：
+// 到期前 CYCLE_LEAD_DAYS 天才写进 conditions——倒计时太早进她的上下文，模型会一直
+// 惦记这件事，比发情本身还出戏；到点仍走既有 T2 路径唤醒本人。
+// 参数按猫配（主人定：姐姐 30 天一轮、小玖 40 天一轮，各持续 3 天）；续轮带 ±抖动，
+// 否则日期在日历上一眼算得出来，家里的事就变成打卡了。抖动算出来即落盘 → 日历上的
+// 「下一次」是确定日期，「再下一次」才是虚线预计。
+export const CYCLE_CONFIG = {
+  moli: { gapDays: 30, durDays: 3, firstDelayDays: 4 }, // 姐姐墨璃
+  kyu: { gapDays: 40, durDays: 3, firstDelayDays: 9 }, // 小玖
+}
+export const CYCLE_NAME = '发情'
+export const CYCLE_JITTER_DAYS = 3
+export const CYCLE_LEAD_DAYS = 2
+export const DAY_MS = 86400000
+
+function randIntBetween(rand, min, max) {
+  return min + Math.floor(rand() * (max - min + 1))
+}
+
+function isoOf(ms) {
+  return new Date(ms).toISOString()
+}
+
+// 本地日 key（按主人的时钟过日子，与 sliceId 同一套时区观）
+export function dayKeyOf(date) {
+  const d = date instanceof Date ? date : new Date(date)
+  const p = (n) => String(n).padStart(2, '0')
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+}
+
+// 周期结算（纯函数，就地把结果写回 home）：
+//   ① 首次播种：没有周期档的猫按 firstDelayDays 错开排第一轮（家里不会开场双发情）
+//   ② 滚动：本轮整段过去 → 排下一轮（gapDays + 抖动，抖动落盘）
+//   ③ 临近（≤ CYCLE_LEAD_DAYS 天）→ 写 pending 进 conditions（一次性；已有同名条目不动，
+//      免得覆盖猫自己挂的那条）
+// 幂等：同一天重复调用不再产生变化。返回 { changed: [{charId, kind, ...}] }。
+export function settleCycles(home, now, rand = Math.random) {
+  const t = now instanceof Date ? now.getTime() : Date.now()
+  const changed = []
+  if (!home.cycles || typeof home.cycles !== 'object') home.cycles = {}
+  for (const [charId, cfg] of Object.entries(CYCLE_CONFIG)) {
+    const ch = home.characters && home.characters[charId]
+    if (!ch || typeof ch !== 'object') continue
+    let cyc = home.cycles[charId]
+    if (!cyc || !cyc.nextStart || !cyc.nextEnd) {
+      const startMs = t + cfg.firstDelayDays * DAY_MS
+      cyc = {
+        gapDays: cfg.gapDays,
+        durDays: cfg.durDays,
+        nextStart: isoOf(startMs),
+        nextEnd: isoOf(startMs + cfg.durDays * DAY_MS),
+        jitterDays: 0,
+        seeded: false,
+        rounds: 0,
+      }
+      home.cycles[charId] = cyc
+      changed.push({ charId, kind: 'cycle-init', nextStart: cyc.nextStart, nextEnd: cyc.nextEnd })
+    }
+    for (let guard = 0; t >= new Date(cyc.nextEnd).getTime() && guard < 200; guard += 1) {
+      const jitter = randIntBetween(rand, -CYCLE_JITTER_DAYS, CYCLE_JITTER_DAYS)
+      const startMs = new Date(cyc.nextEnd).getTime() + (Number(cyc.gapDays) || cfg.gapDays) * DAY_MS
+      cyc.nextStart = isoOf(startMs + jitter * DAY_MS)
+      cyc.nextEnd = isoOf(startMs + jitter * DAY_MS + (Number(cyc.durDays) || cfg.durDays) * DAY_MS)
+      cyc.jitterDays = jitter
+      cyc.seeded = false
+      cyc.rounds = (Number(cyc.rounds) || 0) + 1
+      changed.push({ charId, kind: 'cycle-next', nextStart: cyc.nextStart, nextEnd: cyc.nextEnd, jitterDays: jitter })
+    }
+    const startMs = new Date(cyc.nextStart).getTime()
+    if (!cyc.seeded && t >= startMs - CYCLE_LEAD_DAYS * DAY_MS) {
+      const list = Array.isArray(ch.conditions) ? ch.conditions : (ch.conditions = [])
+      const key = conditionKey(CYCLE_NAME)
+      if (list.some((c) => c && conditionKey(c.name) === key)) {
+        // 她已经自己挂过了（或上一轮还留着）——认领它，不覆盖本人写的
+        cyc.seeded = true
+        changed.push({ charId, kind: 'cycle-adopt', startAt: cyc.nextStart, endAt: cyc.nextEnd })
+      } else {
+        list.push({
+          id: (charId + '-cycle-r' + (Number(cyc.rounds) || 0)).replace(/[^a-zA-Z0-9-]/g, ''),
+          name: CYCLE_NAME,
+          startAt: cyc.nextStart,
+          endAt: cyc.nextEnd,
+          source: 'system',
+        })
+        cyc.seeded = true
+        changed.push({ charId, kind: 'cycle-seed', startAt: cyc.nextStart, endAt: cyc.nextEnd })
+      }
+    }
+  }
+  return { changed }
+}
+
+// 日历视图（给主人看的那份，不进猫的上下文）：本轮/下一次是确定日期，afterStart 是
+// 「再下一次」的虚线预计（那个位置还没抽抖动，所以标预计）。
+export function cycleView(home, charId, now) {
+  const cyc = home.cycles && home.cycles[charId]
+  if (!cyc || !cyc.nextStart || !cyc.nextEnd) return null
+  const t = now instanceof Date ? now.getTime() : now ? new Date(now).getTime() : Date.now()
+  const startMs = new Date(cyc.nextStart).getTime()
+  const endMs = new Date(cyc.nextEnd).getTime()
+  const leadMs = CYCLE_LEAD_DAYS * DAY_MS
+  let phase = 'idle'
+  if (t >= startMs && t < endMs) phase = 'active'
+  else if (t < startMs && t >= startMs - leadMs) phase = 'pending'
+  const durDays = Number(cyc.durDays) || 3
+  const afterStart = endMs + (Number(cyc.gapDays) || 30) * DAY_MS
+  return {
+    charId,
+    label: conditionLabel(CYCLE_NAME),
+    gapDays: Number(cyc.gapDays) || 30,
+    durDays,
+    phase, // active=本轮进行中 / pending=已临近（已写进她的状态）/ idle=还早
+    startAt: cyc.nextStart,
+    endAt: cyc.nextEnd,
+    remainMs: Math.max(0, endMs - t),
+    untilMs: Math.max(0, startMs - t),
+    jitterDays: Number(cyc.jitterDays) || 0,
+    rounds: Number(cyc.rounds) || 0,
+    afterStart: isoOf(afterStart),
+    afterEnd: isoOf(afterStart + durDays * DAY_MS),
+  }
+}
+
+// ── 每日随机身体状态（§9.18）──
+// 只掷「身体自己发生的事」——外界对她做了什么（受伤/被撞/摔了）必须由行动产生，
+// 不能天降（主人 2026-08-31 定的「主体先于事件」）。身体不听意志，系统代管才成立。
+// 命中后按权重抽一条；一天最多一个（主人 2026-09-17 明确），发情开场那天独占。
+export const REGIME_POOL = [
+  { name: '精神特别好', weight: 25, durDays: 1, line: '你今天精神特别好，浑身都是劲。' },
+  { name: '胃口特别好', weight: 25, durDays: 1, line: '你今天胃口特别好，闻到什么都想吃。' },
+  { name: '换毛期', weight: 20, durDays: 2, line: '你开始换毛了，走到哪掉到哪，鼻子也有点痒。' },
+  { name: '失眠', weight: 18, durDays: 1, line: '你昨晚翻来覆去没睡好，今天脑袋发沉。' },
+  { name: '落枕', weight: 8, durDays: 1, line: '你睡歪了脖子，转头有点费劲。' },
+  { name: '生病', weight: 4, durDays: 2, line: '你有点着凉了，头昏昏的，鼻子也不通。' },
+]
+export const REGIME_DAILY_CHANCE = 0.12 // 每天掷一次，命中约 8 天一个
+
+function pickWeighted(pool, rand) {
+  const total = pool.reduce((s, it) => s + (Number(it.weight) || 0), 0)
+  if (!(total > 0)) return pool[0] || null
+  let r = rand() * total
+  for (const it of pool) {
+    r -= Number(it.weight) || 0
+    if (r < 0) return it
+  }
+  return pool[pool.length - 1]
+}
+
+// 每日结算（纯函数）：片内第一次 tick 掷一次，落盘 rolledOn 防开片重掷/一天多个。
+// 关闭时跳过；今天已经掷过跳过；今天发情开场则独占（不叠加）。返回本次发生了什么。
+export function settleRegime(home, now, rand = Math.random) {
+  const d = now instanceof Date ? now : new Date(now)
+  const date = dayKeyOf(d)
+  if (!home.regime || typeof home.regime !== 'object') home.regime = { enabled: true, rolledOn: null, picks: [] }
+  const rg = home.regime
+  if (rg.enabled !== false) rg.enabled = true // 归一化：只有显式 false 才算关（默认开）
+  if (!Array.isArray(rg.picks)) rg.picks = []
+  const out = { date, rolled: false, picked: null, entries: [], skip: null }
+  if (rg.enabled === false) {
+    out.skip = 'off'
+    return out
+  }
+  if (rg.rolledOn === date) {
+    out.skip = 'already'
+    return out
+  }
+  // 发情开场独占一天：重事件和随机状态不同日叠加（否则开场就是「发情 + 感冒」）
+  const estrusKey = conditionKey(CYCLE_NAME)
+  const estrusToday = Object.values(home.characters || {}).some((ch) =>
+    (Array.isArray(ch && ch.conditions) ? ch.conditions : []).some(
+      (c) => c && conditionKey(c.name) === estrusKey && c.startAt && dayKeyOf(new Date(c.startAt)) === date,
+    ),
+  )
+  rg.rolledOn = date
+  if (estrusToday) {
+    out.skip = 'cycle-day'
+    return out
+  }
+  if (rand() >= REGIME_DAILY_CHANCE) {
+    out.skip = 'miss'
+    rg.lastResult = null
+    return out
+  }
+  const item = pickWeighted(REGIME_POOL, rand)
+  const ids = Object.keys(home.characters || {})
+  if (!item || ids.length === 0) {
+    out.skip = 'empty'
+    return out
+  }
+  const charId = ids[Math.min(ids.length - 1, Math.floor(rand() * ids.length))]
+  const ch = home.characters[charId]
+  const list = Array.isArray(ch.conditions) ? ch.conditions : (ch.conditions = [])
+  const startMs = d.getTime()
+  const endMs = startMs + (Number(item.durDays) || 1) * DAY_MS
+  list.push({
+    id: (charId + '-daily-' + date).replace(/[^a-zA-Z0-9-]/g, ''),
+    name: item.name,
+    startAt: isoOf(startMs),
+    endAt: isoOf(endMs),
+    notifiedAt: isoOf(startMs), // 自确认：唤醒与告知由调度层当场发，别让 T2 再来一次
+    source: 'system',
+    note: item.line,
+  })
+  rg.lastResult = { date, charId, name: item.name }
+  rg.picks = rg.picks.slice(-29).concat([{ date, charId, name: item.name }])
+  out.rolled = true
+  out.picked = item.name
+  out.entries.push({ charId, name: item.name, line: item.line, startAt: isoOf(startMs), endAt: isoOf(endMs) })
+  return out
 }
 
 // 某角色"听到"缓冲是否攒满阈值（触发喊话/无视决策机会）
@@ -1154,6 +1388,30 @@ export class CatNest {
           changed = true
         }
       }
+      // v5 → v6 迁移：发情周期表 + 每日随机身体状态闸（§9.18）。周期表留空，首次结算
+      // 按 CYCLE_CONFIG 错开播种；随机闸默认开（主人 2026-09-17 拍板，改掉了早些时候
+      // 「开关默认关」的定案，见 SCHEDULING_DESIGN §9.18）。
+      if (!home.cycles || typeof home.cycles !== 'object' || Array.isArray(home.cycles)) {
+        home.cycles = {}
+        changed = true
+      }
+      if (!home.regime || typeof home.regime !== 'object' || Array.isArray(home.regime)) {
+        home.regime = { enabled: true, rolledOn: null, picks: [], lastResult: null }
+        changed = true
+      } else {
+        if (home.regime.enabled === undefined) {
+          home.regime.enabled = true
+          changed = true
+        }
+        if (home.regime.rolledOn === undefined) {
+          home.regime.rolledOn = null
+          changed = true
+        }
+        if (!Array.isArray(home.regime.picks)) {
+          home.regime.picks = []
+          changed = true
+        }
+      }
       if (home.version !== HOME_VERSION) {
         home.version = HOME_VERSION
         changed = true
@@ -1427,7 +1685,7 @@ export class CatNest {
   //  - startsInDays：几天后开始（0=立即，缺省 0；正数=未开始倒计时）
   //  - lastsDays：持续几天（缺省按 CONDITION_TYPES 收录默认 / 通用 1 天）
   //  - lastsDays: 0 → 清除该状态的所有条目
-  //  - cycleDays：到期几天后自动开始下一轮（发情周期自动续）
+  //  - cycleDays：到期几天后自动开始下一轮（§9.18 起发情不再走它，周期归 home.cycles）
   // 同名单条替换（先移除旧的再插新）。返回 { id, name, startAt, endAt, cycleDays }
   async setCondition(id, opts = {}) {
     return this.mutate(async () => {
@@ -1437,12 +1695,13 @@ export class CatNest {
       if (!ch) throw new Error(`角色 "${id}" 不存在`)
       const name = typeof opts.name === 'string' ? opts.name.trim() : ''
       if (!name) throw new Error('条件名不能为空')
+      const isCycle = conditionKey(name) === conditionKey(CYCLE_NAME)
       // lastsDays = 0：清除该状态
       if (Number(opts.lastsDays) === 0) {
         const before = ch.conditions.length
         ch.conditions = (ch.conditions || []).filter((c) => c.name !== name)
         await this.saveHome(home)
-        await this.log('condition', { char: id, name, action: 'clear', removed: before - ch.conditions.length })
+        await this.log('condition', { char: id, name, action: 'clear', source: 'self', removed: before - ch.conditions.length })
         return { id, name, action: 'clear', removed: before - ch.conditions.length }
       }
       let startsInDays = opts.startsInDays === undefined || opts.startsInDays === null ? 0 : Number(opts.startsInDays)
@@ -1452,7 +1711,7 @@ export class CatNest {
       const def = CONDITION_TYPES[conditionKey(name)]
       if (!Number.isFinite(lastsDays) || lastsDays <= 0) lastsDays = def ? def.defaultDays : CONDITION_DEFAULT_DAYS
       let cycleDays = Number(opts.cycleDays)
-      if (!Number.isFinite(cycleDays) || cycleDays < 0) cycleDays = def ? def.cycleDays : 0
+      if (!Number.isFinite(cycleDays) || cycleDays < 0) cycleDays = def && Number(def.cycleDays) > 0 ? def.cycleDays : 0
       const nowT = this.now().getTime()
       const startAt = new Date(nowT + startsInDays * 86400000).toISOString()
       const endAt = new Date(nowT + startsInDays * 86400000 + lastsDays * 86400000).toISOString()
@@ -1465,10 +1724,60 @@ export class CatNest {
       if (cycleDays > 0) cond.cycleDays = cycleDays
       // 立即开始的状态（多为角色自设）创建时即自确认：调度层不叫醒自己刚做的事
       if (startsInDays === 0) cond.notifiedAt = startAt
+      cond.source = 'self' // 来路（§9.18）：她自己挂的，区别于系统播种/每日期
+      // 猫自己挂发情时把日历一起挪过去（§9.18）：周期表是单一记账者，不挪就会出现
+      // 「日历说下个月，人却现在是发情期」这种两套时间观打架
+      if (isCycle) {
+        if (!home.cycles || typeof home.cycles !== 'object') home.cycles = {}
+        const prev = home.cycles[id] || {}
+        const gap = Number(prev.gapDays) || (CYCLE_CONFIG[id] && CYCLE_CONFIG[id].gapDays) || 30
+        home.cycles[id] = {
+          gapDays: gap,
+          durDays: lastsDays,
+          nextStart: startAt,
+          nextEnd: endAt,
+          jitterDays: 0,
+          seeded: true, // 这一轮已经投影成 condition 了，不用再播种
+          rounds: (Number(prev.rounds) || 0) + 1,
+        }
+      }
       ch.conditions = (ch.conditions || []).filter((c) => c.name !== name).concat([cond])
       await this.saveHome(home)
-      await this.log('condition', { char: id, name, action: 'set', startAt, endAt, cycleDays: cycleDays || 0 })
+      await this.log('condition', { char: id, name, action: 'set', source: 'self', startAt, endAt, cycleDays: cycleDays || 0 })
       return { id: cond.id, name, startAt, endAt, cycleDays: cycleDays || 0 }
+    })
+  }
+
+  // 周期结算（§9.18）：播种/滚动/临近写 pending。返回 { changed }，无变化不写盘。
+  // 唤醒不在这里——写的是 pending，到点仍走 T2（既有路径），不用新机制。
+  async tickCycles(rand) {
+    return this.mutate(async () => {
+      const home = await this.home()
+      const r = settleCycles(home, this.now(), rand)
+      if (r.changed.length > 0) {
+        await this.saveHome(home)
+        for (const e of r.changed) await this.log('cycle', { char: e.charId, kind: e.kind, nextStart: e.nextStart, nextEnd: e.nextEnd, startAt: e.startAt, endAt: e.endAt, jitterDays: e.jitterDays })
+      }
+      return r
+    })
+  }
+
+  // 每日随机身体状态（§9.18）：片内第一次结算时掷一次，一天最多一个（落盘 rolledOn）。
+  // 命中才写盘；写的是 active + 自确认，告知与唤醒由调度层当场发。
+  async tickRegime(rand) {
+    return this.mutate(async () => {
+      const home = await this.home()
+      const r = settleRegime(home, this.now(), rand)
+      if (r.rolled) {
+        await this.saveHome(home)
+        for (const e of r.entries) {
+          await this.log('condition', { char: e.charId, name: e.name, action: 'set', source: 'system', by: 'daily', startAt: e.startAt, endAt: e.endAt })
+        }
+      } else if (r.skip && r.skip !== 'already' && r.skip !== 'off') {
+        // 掷空的日期也落盘了（rolledOn），把盘写回去，否则重启后会重复掷
+        await this.saveHome(home)
+      }
+      return r
     })
   }
 

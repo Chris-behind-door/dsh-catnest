@@ -62,7 +62,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, cycleView, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -105,6 +105,9 @@ export default {
   apply(ctx, config) {
     const dir = config && config.catnestDir ? String(config.catnestDir) : DEFAULT_DIR
     const nest = new CatNest(dir)
+    // §9.18 周期抖动与每日掷骰的随机源：默认 Math.random；测试注入固定桩，
+    // 否则「每天 12% 掷中一个状态」会让调用 tick 的用例偶发飘红。
+    const tickRand = config && typeof config.tickRand === 'function' ? config.tickRand : undefined
 
     // ── 角色调度（里程碑三）助手 ──
 
@@ -346,6 +349,17 @@ export default {
       '克里斯：这个家的主人，大学生。平时叫"主人"就可以，正经场合叫他克里斯。' +
       '小麦色的皮肤，一头利落的寸头，看着干净又精神；脸清秀，身上带着恰到好处的肉感，' +
       '只有肚子上有一点软软的小肉，趴着的时候格外好抱。'
+
+    // 场合许可（2026-09-17 上线试跑，主人点头的 S2 版）：
+    // 来源=越界回绝的四格对照实验（~/cc-duet/，run_permission_6x.py / run_note_split.py）。
+    // 六个实验格里只有"表达许可"这一句是主人选定先上的：S2 单跑沉默率 17%（基线 22%），
+    // 但 18 回合/格分不出显著性，所以拿产线一天的真实回合数来判。
+    // 判定口径：新片沉默率（基线=既有 946 回合 11.2%）与条款词密度。
+    // 回退：删掉这段常量与 system 末尾的拼接即可。
+    const SCENE_PERMIT =
+      '【可以做的事】\n' +
+      '顺着气氛贴近、说带暗示的话、把心里想的做出来，都是可以的；' +
+      '按自己的性子闪躲或者反撩也行。不写露骨描写，也不要跳出角色讲道理。'
 
     // 静态场景段：总体地图 + 声音传播规则（世界客观法则，开片后恒定，进缓存稳定区）
     const buildHomeViewStatic = (home) => {
@@ -740,13 +754,14 @@ export default {
       {
         name: 'set_condition',
         description:
-          '给自己设置一段有明确时间的状态（身体/生理类，如 发情、生病、受伤、疲劳等，猫娘以发情周期为主）。' +
+          '给自己设置一段有明确时间的身体状态（生病、受伤、疲劳等）。' +
           'startAtSoon 传 0 = 现在开始；传正数 n = n 天后开始（未开始的会显示倒计时）。' +
-          '持续 lastsDays 天（缺省用常见时长）。用 lastsDays=0 清除这个状态。',
+          '持续 lastsDays 天（缺省用常见时长）。用 lastsDays=0 清除这个状态。' +
+          '注意：发情不用自己设——家里按你的周期自动安排，到点你会感觉到身体变了。',
         parameters: {
           type: 'object',
           properties: {
-            name: { type: 'string', description: '状态名：发情 / 生病 / 受伤 / 疲劳…（或自定义）' },
+            name: { type: 'string', description: '状态名：生病 / 受伤 / 疲劳…（或自定义；发情不用自己设）' },
             startsInDays: { type: 'number', description: '几天后开始（0=立即，缺省 0；正数=未来开始有倒计时）' },
             lastsDays: { type: 'number', description: '持续几天（缺省按状态常见时长）；0=清除该状态' },
           },
@@ -1225,7 +1240,8 @@ export default {
         '【主人】' + MASTER_PERSONA + '\n\n' +
         '你通过调用工具来行动：想说话就调用 say（说话时伴随的即时小动作放进 say 的 action，没有就别传）；' +
         '想走动就调用 move_to；想做事就调用 do_activity（做事要说预计多久，见下面的分寸）；' +
-        '想记住什么就调用 remember；心情/身体状态（发情/生病/受伤…，可带倒计时）用 set_condition；' +
+        '想记住什么就调用 remember；身体状态（生病/受伤/疲劳…，可带倒计时）用 set_condition' +
+        '（发情不用自己设，家里按周期自动安排，到点你会感觉到）；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
         '屋里有什么就摆在【屋里有什么】那行里：想拿、想吃、想用掉就用 take_item，' +
         '想放东西（买回来的、做好的）用 put_item，想把某件东西写成别的状态（灶台脏了、水壶空了）' +
@@ -1249,7 +1265,8 @@ export default {
         '· 做事要给出预计时长（分钟）：做一会儿就给几十，睡一觉这种给足（比如 do_activity 传「睡觉」和 480）。到点框架会叫醒你一次。\n' +
         '· 做事期间家里安静也不会来打扰你，所以想安静待着就找件事做（哪怕只是「发呆」）；反过来，什么都不做地闲着，过一阵会被问一句「闲下来了」。\n' +
         '· 睡觉是「在做的事」，不是身体状态：想睡就用 do_activity 传「睡觉」，别用 set_condition（set_condition 留给生病、发情、受伤这类身体变化）。\n' +
-        '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题（想不出聊什么就先用 pick_topic 翻翻），或继续安静待着。'
+        '· 被「闲下来了」叫醒时：可以找个事做、挪个地方、带个话题（想不出聊什么就先用 pick_topic 翻翻），或继续安静待着。\n\n' +
+        SCENE_PERMIT
 
       // 关系段（易变）：构建逻辑不变，出口搬到 user 尾部动态窗口
       const relLines = []
@@ -1471,9 +1488,14 @@ export default {
             startAt: x.startAt,
             endAt: x.endAt,
             cycleDays: x.cycleDays || 0,
+            source: x.source || 'self', // 来路（§9.18）：self=她自己挂的 / system=周期或每日期
+            note: x.note || null,
             phase: conditionPhase(x, new Date()),
             text: conditionText(x, new Date()),
           })),
+          // 发情周期日历（§9.18）：给主人看的那份，常驻可见（本轮/下一次是确定日期，
+          // 再下一次是虚线预计）。她自己的上下文只在前 2 天看得到倒计时。
+          cycle: cycleView(home, c.id, new Date()),
         })),
         master: { atHome: !!(home.master && home.master.atHome), room: (home.master && home.master.room) || null },
         autonomy: { homeOn: !!(home.autonomy && home.autonomy.homeOn) },
@@ -1759,6 +1781,20 @@ export default {
           t6Idle.delete(e.charId) // §9.14：家里有事 → 退避清零
           await tryWake(e.charId, true)
         }
+        // 1.5) 周期日历 + 每日随机身体状态（§9.18，2026-09-17 主人拍板）。
+        //      周期归 home.cycles 表记账：首次错开播种、到期滚下一轮（带抖动）、临近 2 天
+        //      才写 pending——倒计时太早进上下文她会一直惦记。到点仍走上面的 T2，不新增机制。
+        //      随机状态每天最多一个（落盘 rolledOn，开片几次都只掷一次），命中当场告知并唤醒。
+        const cyRes = await nest.tickCycles(tickRand)
+        for (const e of cyRes.changed || []) {
+          void agentDebug(e.charId, st.sliceId, '周期日历：' + e.kind + ' 下一轮 ' + (e.nextStart || e.startAt || ''))
+        }
+        const rgRes = await nest.tickRegime(tickRand)
+        for (const e of rgRes.entries || []) {
+          await nest.notice(e.charId, 'body', e.line, true)
+          t6Idle.delete(e.charId) // 家里有事 → 退避清零
+          await tryWake(e.charId, true)
+        }
         // 2) activity 到期（T3）：静默清除（不落 activity 行）+「做完了事」公共 notice
         //    （唯一公共事件，家庭事实）+ 唤醒本人。
         //    §9.16（2026-09-16）：只对"新鲜到期"这么做。endsAt 已经旧过 ACTIVITY_STALE_MS
@@ -1927,6 +1963,9 @@ export default {
       setCondition: (id, opts) => nest.setCondition(id, opts),
       conditionsOf: (id) => nest.conditionsOf(id),
       tickConditions: () => nest.tickConditions(),
+      // §9.18：周期日历结算 / 每日随机身体状态（rand 可注入，测试与手动结算用）
+      tickCycles: (rand) => nest.tickCycles(rand),
+      tickRegime: (rand) => nest.tickRegime(rand),
       // 调度层诊断：手动跑一次 60s 心跳（观察期/测试用；正常节奏由定时器驱动）
       tick: () => scheduleTick(),
       moveMaster: (roomId) => nest.moveMaster(roomId),

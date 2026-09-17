@@ -100,6 +100,10 @@ const toolOnceMessagesStub = (who, name, args, out) => ({
   },
 })
 
+// §9.18：周期抖动与每日掷骰的固定随机源——0.5 永不命中（chance 0.12），抖动折中成 0。
+// 不注入的话，调用 tick 的用例会偶发被"今天家里掷出一个状态"打乱（实测飘红一次）。
+const noRoll = () => 0.5
+
 // 给角色写一个"已到期"的活动（测试用）：tick 第 2 步会走 T3 到期并叫醒她。
 const expireActivity = async (dir, charId) => {
   const file = join(dir, 'home.json')
@@ -233,7 +237,7 @@ test('apply 接线：ctx.catnest 全接口可用', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-'))
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB })
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     assert.ok(svc, 'ctx.catnest 已提供')
     assert.equal(svc.dir, dir)
@@ -286,7 +290,7 @@ test('companions：personas 过滤 companion:true；服务缺席回退默认名�
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-c-'))
   try {
     const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB })
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const roster = await provided.catnest.companions()
     assert.equal(roster.source, 'personas')
     assert.deepEqual(roster.entries.map((e) => e.id).sort(), ['kyu', 'moli'])
@@ -298,7 +302,7 @@ test('companions：personas 过滤 companion:true；服务缺席回退默认名�
   const dir2 = await mkdtemp(join(tmpdir(), 'catnest-idx-c2-'))
   try {
     const { ctx, provided } = mkCtx({}) // 无 personas
-    plugin.apply(ctx, { catnestDir: dir2 })
+    plugin.apply(ctx, { catnestDir: dir2, tickRand: noRoll })
     const roster = await provided.catnest.companions()
     assert.equal(roster.source, 'default')
     assert.deepEqual(roster.entries.map((e) => e.id).sort(), ['kyu', 'moli'])
@@ -319,7 +323,7 @@ test('open 名册对齐：名册新角色自动进家 + 建 master 关系对', a
   }
   try {
     const { ctx, provided } = mkCtx({ personas: personasStub })
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const opened = await svc.open()
     assert.equal(typeof opened.sliceId, 'string')
@@ -351,7 +355,7 @@ test('close→收尾蒸馏：回顾段落盘 summary + 分角色 learn 各域；
     },
   })
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.moveMaster('living')
@@ -379,7 +383,7 @@ test('distill 显式调用：llm 缺席回落规则化；空片给安静文案',
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-d2-'))
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB }) // 无 llm
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.say('moli', '今天的风好温柔')
@@ -417,7 +421,7 @@ test('distill 分角色分条：各角色段分别 learn 各自记忆；回顾�
     memory: memoryStub,
   })
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.say('moli', '风好温柔')
@@ -448,7 +452,7 @@ test('interruptReaction：llm 按角色×活动生成反应；llm 缺席 reactio
     llm: llmStub('喵？主人叫我？人家刚打到关键的地方啦！'),
   })
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.setActivity('kyu', '打游戏', 30)
@@ -464,7 +468,7 @@ test('interruptReaction：llm 按角色×活动生成反应；llm 缺席 reactio
   const dir2 = await mkdtemp(join(tmpdir(), 'catnest-idx-r2-'))
   try {
     const { ctx: ctx2, provided: provided2 } = mkCtx({ personas: PERSONAS_STUB }) // 无 llm
-    plugin.apply(ctx2, { catnestDir: dir2 })
+    plugin.apply(ctx2, { catnestDir: dir2, tickRand: noRoll })
     await provided2.catnest.open()
     const r2 = await provided2.catnest.interruptReaction('kyu', 'master')
     assert.equal(r2.reaction, null)
@@ -481,7 +485,7 @@ test('recapLLM：llm 改写回顾；llm 缺席回落规则化', async () => {
     llm: llmStub('你不在的时候，小玖在厨房忙活，墨璃陪着她聊天，家里暖暖的。'),
   })
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.moveMaster('living')
@@ -497,7 +501,7 @@ test('recapLLM：llm 改写回顾；llm 缺席回落规则化', async () => {
   const dir2 = await mkdtemp(join(tmpdir(), 'catnest-idx-l2-'))
   try {
     const { ctx: ctx2, provided: provided2 } = mkCtx({ personas: PERSONAS_STUB }) // 无 llm
-    plugin.apply(ctx2, { catnestDir: dir2 })
+    plugin.apply(ctx2, { catnestDir: dir2, tickRand: noRoll })
     await provided2.catnest.open()
     await provided2.catnest.say('kyu', '喵')
     await provided2.catnest.close()
@@ -570,7 +574,7 @@ test('存在感 UI 路由：state 返回家视图 / action 可开片关片移动
   try {
     const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB })
     ctx.webServer = ws
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     assert.equal(ws.routes.length, 1)
     assert.equal(ws.routes[0].path, '/catnest/api')
     const handler = ws.routes[0].handler
@@ -632,7 +636,7 @@ test('POST say：主人消息立刻入账，同房角色后台接话进 dialogue
   })
   ctx3.webServer = ws3
   try {
-    plugin.apply(ctx3, { catnestDir: dir3 })
+    plugin.apply(ctx3, { catnestDir: dir3, tickRand: noRoll })
     const h3 = ws3.routes[0].handler
     const call = (method, url, body) => {
       const r = fakeRes()
@@ -686,7 +690,7 @@ test('多角色接话链：同房两角色串行接话（后者可见前者台�
   })
   ctx4.webServer = ws4
   try {
-    plugin.apply(ctx4, { catnestDir: dir4 })
+    plugin.apply(ctx4, { catnestDir: dir4, tickRand: noRoll })
     const svc = provided4.catnest
     const h4 = ws4.routes[0].handler
     const call = (method, url, body) => {
@@ -742,7 +746,7 @@ test('接话提示词：不设风格限制（无行数/字数/格式约束），
   })
   ctx6.webServer = ws6
   try {
-    plugin.apply(ctx6, { catnestDir: dir6 })
+    plugin.apply(ctx6, { catnestDir: dir6, tickRand: noRoll })
     const svc = provided6.catnest
     const h6 = ws6.routes[0].handler
     const call = (method, url, body) => {
@@ -814,7 +818,7 @@ test('接话回忆：recall 直接按 时间片 标签池级过滤（防先 reca
   const { ctx: ctx7, provided: provided7 } = mkCtx({ personas: PERSONAS_STUB, llm: llmMsgSpy, memory: memoryStub })
   ctx7.webServer = ws7
   try {
-    plugin.apply(ctx7, { catnestDir: dir7 })
+    plugin.apply(ctx7, { catnestDir: dir7, tickRand: noRoll })
     const svc = provided7.catnest
     const h7 = ws7.routes[0].handler
     const call = (method, url, body) => {
@@ -864,7 +868,7 @@ test('片内时间线：全量入 prompt（同房入账/跨房隔离/相邻弱�
   const { ctx: ctx8, provided: provided8 } = mkCtx({ personas: PERSONAS_STUB, llm: llmHist })
   ctx8.webServer = ws8
   try {
-    plugin.apply(ctx8, { catnestDir: dir8 })
+    plugin.apply(ctx8, { catnestDir: dir8, tickRand: noRoll })
     const svc = provided8.catnest
     const h8 = ws8.routes[0].handler
     const call = (method, url, body) => {
@@ -979,7 +983,7 @@ test('缓存布局：system 移动前后逐字节稳定；易变状态居尾部�
   const { ctx: ctxC, provided: providedC } = mkCtx({ personas: PERSONAS_STUB, llm: llmCache })
   ctxC.webServer = wsC
   try {
-    plugin.apply(ctxC, { catnestDir: dirC })
+    plugin.apply(ctxC, { catnestDir: dirC, tickRand: noRoll })
     const svc = providedC.catnest
     const hC = wsC.routes[0].handler
     const call = (method, url, body) => {
@@ -1057,7 +1061,7 @@ test('沉默权：模型不调 say 工具 → 不入账、不算错误', async (
   })
   ctx9.webServer = ws9
   try {
-    plugin.apply(ctx9, { catnestDir: dir9 })
+    plugin.apply(ctx9, { catnestDir: dir9, tickRand: noRoll })
     const svc = provided9.catnest
     const h9 = ws9.routes[0].handler
     const closeCbs = []
@@ -1110,7 +1114,7 @@ test('SSE events：连接即推首帧快照；avatar 路由白名单伺服 PNG',
   const { ctx: ctx5 } = mkCtx({ personas: PERSONAS_STUB })
   ctx5.webServer = ws5
   try {
-    plugin.apply(ctx5, { catnestDir: dir5 })
+    plugin.apply(ctx5, { catnestDir: dir5, tickRand: noRoll })
     const h5 = ws5.routes[0].handler
 
     // SSE：假 res 记录 write 出的帧；req close 可手动触发
@@ -1178,7 +1182,7 @@ test('接话失败可见：llm 缺席 → SSE 推 replyError(noLlm)，不再静�
   })
   ctx6.webServer = ws6
   try {
-    plugin.apply(ctx6, { catnestDir: dir6 })
+    plugin.apply(ctx6, { catnestDir: dir6, tickRand: noRoll })
     const svc = provided6.catnest
     const h6 = ws6.routes[0].handler
     // 连一个 SSE 客户端
@@ -1231,7 +1235,7 @@ test('工具说话整句入账：模型调 say 工具 → 台词进 dialogue（�
   })
   ctx7.webServer = ws7
   try {
-    plugin.apply(ctx7, { catnestDir: dir7 })
+    plugin.apply(ctx7, { catnestDir: dir7, tickRand: noRoll })
     const svc = provided7.catnest
     const h7 = ws7.routes[0].handler
     const call = (method, url, body) => {
@@ -1281,7 +1285,7 @@ test('say 打字机：argumentsDelta 分片增量抠 text（转义/切分边界/
   const { ctx: ctxTy1, provided: providedTy1 } = mkCtx({ personas: PERSONAS_STUB, llm: llmTyper })
   ctxTy1.webServer = wsTy1
   try {
-    plugin.apply(ctxTy1, { catnestDir: dirTy1 })
+    plugin.apply(ctxTy1, { catnestDir: dirTy1, tickRand: noRoll })
     const svc = providedTy1.catnest
     const hTy1 = wsTy1.routes[0].handler
     const sseReq = {
@@ -1363,7 +1367,7 @@ test('打字机只跟 say：move_to 等其他工具不产生 delta 帧', async (
   const { ctx: ctxTy2, provided: providedTy2 } = mkCtx({ personas: PERSONAS_STUB, llm: llmMover })
   ctxTy2.webServer = wsTy2
   try {
-    plugin.apply(ctxTy2, { catnestDir: dirTy2 })
+    plugin.apply(ctxTy2, { catnestDir: dirTy2, tickRand: noRoll })
     const svc = providedTy2.catnest
     const hTy2 = wsTy2.routes[0].handler
     const sseReq = {
@@ -1409,7 +1413,7 @@ const setupNest = async (llm) => {
   const ws = webServerStub()
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
-  plugin.apply(ctx, { catnestDir: dir })
+  plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
   const svc = provided.catnest
   const h = ws.routes[0].handler
   await h(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'open' })), fakeRes())
@@ -1586,7 +1590,7 @@ test('状态进角色上下文：active 与 pending 倒计时都在自己的 pro
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: llmCap })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     await h(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'open' })), fakeRes())
@@ -1640,7 +1644,7 @@ test('say action：动作随台词入账、dialogue 透传、时间线同房可�
   const { ctx: ctxA, provided: providedA } = mkCtx({ personas: PERSONAS_STUB, llm: llmAct })
   ctxA.webServer = wsA
   try {
-    plugin.apply(ctxA, { catnestDir: dirA })
+    plugin.apply(ctxA, { catnestDir: dirA, tickRand: noRoll })
     const svc = providedA.catnest
     const h = wsA.routes[0].handler
     const call = (method, url, body) => {
@@ -1720,7 +1724,7 @@ test('隔墙话题：开完之后不限房间——卧室的墨璃看得见话�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
@@ -1812,7 +1816,7 @@ test('notice 链路：私有只进本人时间线，公共原样进全员；私�
   })
   ctxN.webServer = wsN
   try {
-    plugin.apply(ctxN, { catnestDir: dirN })
+    plugin.apply(ctxN, { catnestDir: dirN, tickRand: noRoll })
     const svc = providedN.catnest
     const hN = wsN.routes[0].handler
     const call = (method, url, body) => {
@@ -1853,7 +1857,7 @@ test('T1 唤醒：缓冲攒满边沿触发 notice+唤醒；in-flight 不重复�
   })
   ctxT1.webServer = wsT1
   try {
-    plugin.apply(ctxT1, { catnestDir: dirT1 })
+    plugin.apply(ctxT1, { catnestDir: dirT1, tickRand: noRoll })
     const svc = providedT1.catnest
     const hT1 = wsT1.routes[0].handler
     const call = (method, url, body) => {
@@ -1911,7 +1915,7 @@ test('T2 唤醒：pending→active 翻转 → 私有 notice + 唤醒；notifiedA
   })
   ctxT2.webServer = wsT2
   try {
-    plugin.apply(ctxT2, { catnestDir: dirT2 })
+    plugin.apply(ctxT2, { catnestDir: dirT2, tickRand: noRoll })
     const svc = providedT2.catnest
     await svc.open()
     // 主人在家：T6 自主轻推闸死（§9.1 触发闸=主人离家），T2 单向验证不被自主节奏污染
@@ -1970,7 +1974,7 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
   })
   ctxT3.webServer = wsT3
   try {
-    plugin.apply(ctxT3, { catnestDir: dirT3 })
+    plugin.apply(ctxT3, { catnestDir: dirT3, tickRand: noRoll })
     const svc = providedT3.catnest
     const hT3 = wsT3.routes[0].handler
     const call = (method, url, body) => {
@@ -2087,7 +2091,7 @@ test('say.about 门禁降级（§9.2 修订）：话题不存在 → 话照说�
   })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
@@ -2159,7 +2163,7 @@ test('say.about 渲染 + 【当前话题】presence：话题内发言带标记�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (url, body) => h(fakeReq('POST', url, body), fakeRes()).then(() => {})
@@ -2191,7 +2195,7 @@ test('T6 门控：离家轻推（每 tick 至多一只）；睡觉/忙/刚说过
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const st0 = await svc.open()
     // 1) 主人从未交互（atHome=false 默认、无任何 master 行）→ tick 轻推
@@ -2241,7 +2245,7 @@ test('T6 静默闸只认 activity（§9.14）：生病等 condition 期间照旧
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.setCondition('kyu', { name: '生病', lastsDays: 2 })
@@ -2262,7 +2266,7 @@ test('T6 无产出退避（§9.14）：推过一次还没产出 → 同一只不
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     const kyuNudges = () =>
@@ -2429,7 +2433,7 @@ test('参考话题引子：姐妹自由聊天给、状态唤醒与主人接话�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayCaptureStub([], prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
@@ -2470,7 +2474,7 @@ test('参考话题引子：她本人还挂着话题时不注入', async () => {
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayCaptureStub([], prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
@@ -2505,7 +2509,7 @@ test('pick_topic 工具：按当前房间给引子，也能点类目', async () 
   })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (body) => h(fakeReq('POST', '/catnest/api/action', JSON.stringify(body)), fakeRes()).then(() => {})
@@ -2553,7 +2557,7 @@ test('家当（HOUSE_DESIGN §1）：prompt 只注入自己所在房间的东西
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2598,7 +2602,7 @@ test('家当编辑接口（House §2）：setItems 整表替换 + 快照同步�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: llmStub('嗯') })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     assert.ok(provided.catnest, '服务面已提供')
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2661,7 +2665,7 @@ test('say 话题降级（§9.2 修订）：about 指向已收掉的话题，台�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2719,7 +2723,7 @@ test('家当工具接线（House §4）：猫娘 take_item 入账，下一轮时
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2767,7 +2771,7 @@ test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切，隔墙也�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.moveMaster('living')
@@ -2831,7 +2835,7 @@ test('say 工具带 volume（§9.16）：角色喊一声 → 隔壁被当场唤�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2873,7 +2877,7 @@ test('POST say 音量（§9.16）：小声=耳语不出屋；大声=隔壁听得
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -2920,7 +2924,7 @@ test('T3 过时到期（§9.16）：停摆期间溜走的到期静默结算，�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     await svc.open()
     await svc.moveMaster('living') // 主人在家（顺带把 T6 闸上）
@@ -2982,7 +2986,7 @@ test('say 工具参数没解析出来（截断/裸换行）→ 打字机里的�
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -3025,7 +3029,7 @@ test('say 正常落账时不会重复兜底（说出口一次就一次）', asyn
   const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: sayToolStub('姐姐，汤好了') })
   ctx.webServer = ws
   try {
-    plugin.apply(ctx, { catnestDir: dir })
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
     const svc = provided.catnest
     const h = ws.routes[0].handler
     const call = (method, url, body) => {
@@ -3045,6 +3049,122 @@ test('say 正常落账时不会重复兜底（说出口一次就一次）', asyn
     assert.equal(rows.length, 1, '正常路径只入账一次，兜底不该再补一条')
     assert.equal(rows[0].rawText, '姐姐，汤好了')
     void prompts
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// ── §9.18 发情周期日历 + 每日随机身体状态（2026-09-17 主人拍板）──
+
+const stateOf = async (h) => {
+  const r = fakeRes()
+  await h(fakeReq('GET', '/catnest/api/state'), r)
+  return JSON.parse(r.body)
+}
+
+test('§9.18 周期日历：首结算按猫播种（姐姐 4 天 / 小玖 9 天，错开），state 常驻可见', async () => {
+  const n = await setupNest(silentStub)
+  try {
+    const day = 86400000
+    await n.svc.tick()
+    const home = await n.svc.home()
+    const kyu = new Date(home.cycles.kyu.nextStart).getTime()
+    const moli = new Date(home.cycles.moli.nextStart).getTime()
+    assert.equal(Math.round((kyu - moli) / day), 5, '第一轮错开 5 天（姐姐 4 天 / 小玖 9 天）')
+    assert.equal(home.cycles.kyu.gapDays, 40, '小玖 40 天一轮')
+    assert.equal(home.cycles.moli.gapDays, 30, '姐姐 30 天一轮')
+    assert.equal(home.cycles.kyu.durDays, 3)
+    assert.equal(home.characters.kyu.conditions.length, 0, '还早 → 不写 pending，她的上下文干净')
+    const st = await stateOf(n.h)
+    const kc = st.characters.find((c) => c.id === 'kyu')
+    assert.ok(kc.cycle, '主人的那份日历常驻在 state 里')
+    assert.equal(kc.cycle.gapDays, 40)
+    assert.equal(kc.cycle.phase, 'idle')
+    assert.ok(kc.cycle.afterStart, '再下一次是虚线预计')
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('§9.18 周期到点：临近写 pending（source=system）→ 到点走既有 T2 唤醒', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-cyc2-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.tick()
+    const day = 86400000
+    // 手工把姐姐的下一轮挪进临近窗口（1 天后开始）
+    const home = await svc.home()
+    const startMs = Date.now() + day
+    home.cycles.moli.nextStart = new Date(startMs).toISOString()
+    home.cycles.moli.nextEnd = new Date(startMs + 3 * day).toISOString()
+    home.cycles.moli.seeded = false
+    await writeFile(join(dir, 'home.json'), JSON.stringify(home, null, 2))
+    await svc.tick()
+    const h2 = await svc.home()
+    const c = h2.characters.moli.conditions.find((x) => x.name === '发情')
+    assert.ok(c, '临近 2 天 → 写进 conditions（这时她才看得到倒计时）')
+    assert.equal(c.source, 'system')
+    assert.equal(c.cycleDays, undefined, '条件不自带周期，续轮归 cycles 表')
+    assert.equal(h2.characters.kyu.conditions.length, 0, '还早的那只不写')
+    // 到点：把这一轮的开始挪到此刻之前 → 下一次 tick 的 T2 翻转并唤醒
+    const h3 = await svc.home()
+    const live = h3.characters.moli.conditions.find((x) => x.name === '发情')
+    live.startAt = new Date(Date.now() - 1000).toISOString()
+    delete live.notifiedAt
+    await writeFile(join(dir, 'home.json'), JSON.stringify(h3, null, 2))
+    await svc.tick()
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    assert.ok(
+      log.some((e) => e.type === 'notice' && String(e.text).includes('你感觉到身体变了')),
+      '到点走 T2：告知她本人身体变了',
+    )
+    await until(() => prompts.some((p) => p.system.includes('成员墨璃')))
+    void prompts
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('§9.18 每日随机身体状态：命中写 condition（system + 自确认）+ 当场告知唤醒；一天只一个', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-reg-'))
+  const ws = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: () => 0 }) // 必中：chance 判定过、抽第一项、选第一只猫
+    const svc = provided.catnest
+    await svc.open()
+    await svc.tick()
+    const home = await svc.home()
+    const c = home.characters.kyu.conditions.find((x) => x.source === 'system')
+    assert.ok(c, '命中：家里给了一只猫一个身体状态')
+    assert.equal(c.name, '精神特别好')
+    assert.equal(c.notifiedAt, c.startAt, '自确认：告知由调度层当场发，不让 T2 再来一次')
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    assert.ok(
+      log.some((e) => e.type === 'notice' && e.private === true && e.text === c.note),
+      '私有 notice 进她的时间线',
+    )
+    await until(() => prompts.some((p) => p.system.includes('成员小玖')))
+    // 一天一个：再 tick 不叠第二个（rolledOn 落盘）
+    await svc.tick()
+    const h2 = await svc.home()
+    assert.equal(h2.characters.kyu.conditions.filter((x) => x.source === 'system').length, 1)
+    assert.equal(h2.characters.moli.conditions.filter((x) => x.source === 'system').length, 0)
+    // 来路进 state（主人那边看得到是谁给的）
+    const state = await stateOf(ws.routes[0].handler)
+    const kc = state.characters.find((x) => x.id === 'kyu')
+    assert.equal(kc.conditions[0].source, 'system')
+    assert.equal(kc.conditions[0].note, c.note)
   } finally {
     await rmSafe(dir)
   }

@@ -37,6 +37,15 @@ import {
   conditionText,
   advanceConditions,
   CONDITION_TYPES,
+  settleCycles,
+  settleRegime,
+  cycleView,
+  dayKeyOf,
+  CYCLE_CONFIG,
+  CYCLE_JITTER_DAYS,
+  CYCLE_LEAD_DAYS,
+  REGIME_POOL,
+  REGIME_DAILY_CHANCE,
   topicKey,
   topicPeers,
   matchTopic,
@@ -984,6 +993,172 @@ test('sliceData / summary：收尾摘要落盘与读取', async () => {
   }
 })
 
+// ── §9.18 发情周期日历（home.cycles）+ 每日随机身体状态（home.regime）──
+
+test('settleCycles：首次播种按 CYCLE_CONFIG 错开（姐姐 4 天 / 小玖 9 天），同一天幂等', () => {
+  const day = 86400000
+  const t0 = FIXED.getTime()
+  const home = { characters: { kyu: { conditions: [] }, moli: { conditions: [] } } }
+  const r1 = settleCycles(home, FIXED, () => 0.5)
+  assert.equal(r1.changed.filter((e) => e.kind === 'cycle-init').length, 2)
+  const moliDelay = Math.round((new Date(home.cycles.moli.nextStart).getTime() - t0) / day)
+  const kyuDelay = Math.round((new Date(home.cycles.kyu.nextStart).getTime() - t0) / day)
+  assert.equal(moliDelay, CYCLE_CONFIG.moli.firstDelayDays)
+  assert.equal(kyuDelay, CYCLE_CONFIG.kyu.firstDelayDays)
+  assert.ok(kyuDelay > moliDelay, '第一轮错开，不会开场双发情')
+  assert.equal(home.cycles.kyu.gapDays, 40, '小玖 40 天一轮')
+  assert.equal(home.cycles.moli.gapDays, 30, '姐姐 30 天一轮')
+  assert.equal(home.cycles.moli.durDays, 3)
+  assert.equal(home.characters.kyu.conditions.length, 0, '离开始还有 9 天 > LEAD 窗口 → 不写 pending，她的上下文干净')
+  const r2 = settleCycles(home, FIXED, () => 0.5)
+  assert.equal(r2.changed.length, 0, '同一天重复结算不再变化')
+})
+
+test('settleCycles：临近 LEAD 天写 pending（source=system）；本轮过去滚下一轮且抖动落盘', () => {
+  const day = 86400000
+  const t0 = FIXED.getTime()
+  const iso = (ms) => new Date(ms).toISOString()
+  const home = {
+    characters: { kyu: { conditions: [] }, moli: { conditions: [] } },
+    cycles: {
+      kyu: { gapDays: 40, durDays: 3, nextStart: iso(t0 + day), nextEnd: iso(t0 + 4 * day), jitterDays: 0, seeded: false, rounds: 0 },
+      moli: { gapDays: 30, durDays: 3, nextStart: iso(t0 - 5 * day), nextEnd: iso(t0 - 2 * day), jitterDays: 0, seeded: true, rounds: 1 },
+    },
+  }
+  const r = settleCycles(home, FIXED, () => 0.9) // randInt(-3,3) → +3
+  const jitter = -CYCLE_JITTER_DAYS + Math.floor(0.9 * (CYCLE_JITTER_DAYS * 2 + 1))
+  assert.ok(r.changed.find((e) => e.kind === 'cycle-seed' && e.charId === 'kyu'), '小玖 1 天后开始 → 播种')
+  const c = home.characters.kyu.conditions[0]
+  assert.equal(c.name, '发情')
+  assert.equal(c.startAt, home.cycles.kyu.nextStart)
+  assert.equal(c.endAt, home.cycles.kyu.nextEnd)
+  assert.equal(c.source, 'system', '来路要记着是家里排的')
+  assert.equal(c.cycleDays, undefined, '条件不再自带周期，续轮归 cycles 表')
+  const next = r.changed.find((e) => e.kind === 'cycle-next' && e.charId === 'moli')
+  assert.ok(next, '姐姐本轮已过去 → 滚下一轮')
+  assert.equal(next.jitterDays, jitter)
+  assert.equal(home.cycles.moli.jitterDays, jitter, '抖动落盘：日历上的下一次才是确定日期')
+  assert.equal(new Date(home.cycles.moli.nextStart).getTime(), t0 - 2 * day + (30 + jitter) * day)
+  assert.equal(home.cycles.moli.seeded, false)
+  assert.equal(settleCycles(home, FIXED, () => 0.9).changed.length, 0, '再跑不重复播种/滚动')
+})
+
+test('settleCycles：她自己挂过发情时不重复写（不覆盖本人那条）', () => {
+  const day = 86400000
+  const t0 = FIXED.getTime()
+  const iso = (ms) => new Date(ms).toISOString()
+  const home = {
+    characters: {
+      kyu: { conditions: [{ id: 'x', name: '发情', startAt: iso(t0 + day), endAt: iso(t0 + 4 * day), source: 'self' }] },
+      moli: { conditions: [] },
+    },
+    cycles: {
+      kyu: { gapDays: 40, durDays: 3, nextStart: iso(t0 + day), nextEnd: iso(t0 + 4 * day), jitterDays: 0, seeded: false, rounds: 0 },
+      moli: { gapDays: 30, durDays: 3, nextStart: iso(t0 + 2 * day), nextEnd: iso(t0 + 5 * day), jitterDays: 0, seeded: false, rounds: 0 },
+    },
+  }
+  const r = settleCycles(home, FIXED, () => 0.5)
+  assert.equal(home.characters.kyu.conditions.length, 1)
+  assert.equal(home.characters.kyu.conditions[0].source, 'self')
+  assert.equal(home.cycles.kyu.seeded, true, '标记已投影，不然每天都来检查一遍')
+  assert.equal(r.changed.filter((e) => e.kind === 'cycle-adopt').length, 1, '本人那条被认领，不覆盖')
+  assert.equal(r.changed.filter((e) => e.kind === 'cycle-seed').length, 1, '只有姐姐那条是新播种的')
+})
+
+test('cycleView：active / pending / idle 三态 + 「再下一次」是虚线预计', () => {
+  const day = 86400000
+  const t0 = FIXED.getTime()
+  const iso = (ms) => new Date(ms).toISOString()
+  const base = (startMs) => ({ gapDays: 40, durDays: 3, nextStart: iso(startMs), nextEnd: iso(startMs + 3 * day), jitterDays: 0, seeded: true, rounds: 0 })
+  const v1 = cycleView({ cycles: { kyu: base(t0 - day) } }, 'kyu', FIXED)
+  assert.equal(v1.phase, 'active')
+  assert.ok(v1.remainMs > 0)
+  assert.equal(v1.label, '发情期')
+  assert.equal(v1.afterStart, iso(t0 + 2 * day + 40 * day), '再下一次 = 本轮结束 + gap（没算抖动）')
+  const v2 = cycleView({ cycles: { kyu: base(t0 + day) } }, 'kyu', FIXED)
+  assert.equal(v2.phase, 'pending')
+  assert.equal(v2.untilMs, day)
+  const v3 = cycleView({ cycles: { kyu: base(t0 + 10 * day) } }, 'kyu', FIXED)
+  assert.equal(v3.phase, 'idle')
+  assert.equal(cycleView({}, 'kyu', FIXED), null)
+})
+
+test('settleRegime：一天一掷、命中写 condition（source=system + 自确认 + note）', () => {
+  const day = 86400000
+  const home = {
+    characters: { kyu: { conditions: [] }, moli: { conditions: [] } },
+    regime: { enabled: true, rolledOn: null, picks: [] },
+  }
+  const seq = [0.01, 0, 0] // 命中 → 抽中第一项 → 选第一只猫
+  let i = 0
+  const rand = () => seq[Math.min(i++, seq.length - 1)]
+  const r = settleRegime(home, FIXED, rand)
+  assert.equal(r.rolled, true)
+  assert.equal(r.picked, REGIME_POOL[0].name)
+  const c = home.characters.kyu.conditions[0]
+  assert.equal(c.name, '精神特别好')
+  assert.equal(c.source, 'system')
+  assert.equal(c.notifiedAt, c.startAt, '自确认：告知与唤醒由调度层当场发，别让 T2 再来一次')
+  assert.equal(c.note, REGIME_POOL[0].line)
+  assert.equal(new Date(c.endAt).getTime() - new Date(c.startAt).getTime(), REGIME_POOL[0].durDays * day)
+  assert.equal(home.regime.rolledOn, dayKeyOf(FIXED))
+  assert.deepEqual(home.regime.picks[0], { date: dayKeyOf(FIXED), charId: 'kyu', name: '精神特别好' })
+  assert.equal(settleRegime(home, FIXED, rand).skip, 'already')
+})
+
+test('settleRegime：关掉不掷、发情开场那天独占、掷空也记今天', () => {
+  const day = 86400000
+  const t0 = FIXED.getTime()
+  const fresh = () => ({
+    characters: { kyu: { conditions: [] }, moli: { conditions: [] } },
+    regime: { enabled: true, rolledOn: null, picks: [] },
+  })
+  const off = fresh()
+  off.regime.enabled = false
+  assert.equal(settleRegime(off, FIXED, () => 0).skip, 'off')
+  assert.equal(off.regime.rolledOn, null, '关着的时候不动账')
+  const h2 = fresh()
+  h2.characters.kyu.conditions.push({ name: '发情', startAt: FIXED.toISOString(), endAt: new Date(t0 + 3 * day).toISOString() })
+  const r2 = settleRegime(h2, FIXED, () => 0)
+  assert.equal(r2.skip, 'cycle-day', '发情开场独占一天，不叠随机状态')
+  assert.equal(h2.regime.rolledOn, dayKeyOf(FIXED), '独占那天也记着掷过，免得之后又叠一个')
+  assert.equal(h2.characters.kyu.conditions.length, 1, '不写新状态')
+  const h3 = fresh()
+  const r3 = settleRegime(h3, FIXED, () => 0.99)
+  assert.equal(r3.skip, 'miss')
+  assert.equal(h3.regime.rolledOn, dayKeyOf(FIXED), '掷空也落盘：重开片不会同一天再掷一次')
+  assert.equal(h3.characters.kyu.conditions.length, 0)
+  assert.ok(REGIME_DAILY_CHANCE > 0 && REGIME_DAILY_CHANCE < 0.5, '先按低频跑，试行一周看频率再调')
+})
+
+test('home v5→v6 迁移：补 cycles 空表与 regime 默认开，用户数据不丢', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await writeFile(
+      join(dir, 'home.json'),
+      JSON.stringify({
+        version: 5,
+        rooms: [{ id: 'living', name: '客厅', functions: [], adjacent: [], items: [] }],
+        characters: { kyu: { id: 'kyu', name: '小玖', room: 'living', conditions: [] } },
+        master: { atHome: false, room: null },
+        topics: {},
+        autonomy: { homeOn: false },
+        hearThresholds: { kyu: 3 },
+      }),
+    )
+    await nest.ensure()
+    const home = await nest.home()
+    assert.equal(home.version, HOME_VERSION)
+    assert.equal(home.rooms[0].name, '客厅', '用户数据不丢')
+    assert.deepEqual(home.cycles, {}, '周期表留空，首次结算才播种')
+    assert.equal(home.regime.enabled, true, '默认开（2026-09-17 主人拍板）')
+    assert.equal(home.regime.rolledOn, null)
+    assert.deepEqual(home.regime.picks, [])
+  } finally {
+    await cleanup()
+  }
+})
+
 // ── 持久状态（conditions）：phase 推导 / 文本 / 周期续期 ──
 
 test('conditions 纯函数：phase 三态推导与倒计时文本', () => {
@@ -1002,19 +1177,27 @@ test('conditions 纯函数：phase 三态推导与倒计时文本', () => {
   assert.equal(conditionLabel('estrus'), '发情期')
   assert.equal(conditionLabel('发情'), '发情期')
   assert.equal(conditionLabel('自定义状态'), '自定义状态')
-  assert.equal(CONDITION_TYPES.estrus.cycleDays > 0, true, '发情应有周期')
+  // §9.18：发情不再自带 cycleDays（周期归 home.cycles 表记账，按猫配 + 抖动）
+  assert.equal(CONDITION_TYPES.estrus.cycleDays, undefined, '发情的周期不再挂收录表')
+  assert.equal(conditionLabel('精神特别好'), '精神好', '随机池的状态名也要有收录标签')
 })
 
 test('setCondition：立即开始 / 未来倒计时 / lastsDays=0 清除 / 非法输入', async () => {
   const { nest, cleanup } = await mk()
   try {
     await nest.open()
-    // 立即开始（缺省 name=发情 归一化到 estrus：默认 4 天，不是通用 1 天）
+    // 立即开始（缺省 name=发情 归一化到 estrus：默认 3 天，不是通用 1 天）
     const r1 = await nest.setCondition('kyu', { name: '发情' })
     assert.equal(conditionPhase(r1, FIXED), 'active')
     const r1ms = new Date(r1.endAt).getTime() - new Date(r1.startAt).getTime()
-    assert.ok(Math.abs(r1ms - 4 * 86400000) < 60000, '中文名「发情」应落到收录表默认 4 天，实得 ' + (r1ms / 86400000) + ' 天')
-    assert.equal(r1.cycleDays, 20, '中文名映射后应带发情周期续轮')
+    assert.ok(Math.abs(r1ms - 3 * 86400000) < 60000, '中文名「发情」应落到收录表默认 3 天，实得 ' + (r1ms / 86400000) + ' 天')
+    assert.equal(r1.cycleDays, 0, '§9.18：发情不再自带 cycleDays，周期归 cycles 表')
+    // 自己挂的发情要把日历一起挪过去（单一记账者）
+    const h1 = await nest.home()
+    assert.equal(h1.cycles.kyu.seeded, true, '自己挂的那轮要标记已投影')
+    assert.equal(h1.cycles.kyu.nextStart, r1.startAt)
+    assert.equal(h1.cycles.kyu.durDays, 3)
+    assert.equal(h1.characters.kyu.conditions[0].source, 'self', '来路字段')
     // 未来 2 天开始
     const r2 = await nest.setCondition('moli', { name: '生病', startsInDays: 2, lastsDays: 1 })
     const of = await nest.conditionsOf('moli')

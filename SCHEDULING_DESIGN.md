@@ -616,3 +616,40 @@ system 静态段补（状态事实走 presence，指令走静态，prefix cache 
 **测试**：基线上调 **135/135 → 141/141**。新增/改写：lib「say 音量（小声不出屋/大声真切/再远隐约/忙碌降半档/非法值按正常）」「活动持续计时（开片静默结算 + 空窗行）」「片外未到期照旧跨片」「服务层 about 降级（台词入账、不入幽灵 about、合法不误伤）」；index「say 音量物理层 + 缓冲账」「say 工具带 volume → 隔壁当场唤醒（大喊 notice + 回合）」「POST say 音量（主人耳语不出屋 / 大声隔壁被叫醒 + 时间线写『喊声』）」「T3 过时到期静默（只唤醒新鲜那只）」。
 
 **生效**：改动要 dsh web 重启才在线上生效（`~/.dsh/scripts/dsh-web-restart.sh`，先 `--check`）。
+
+### 9.18 发情周期日历 + 每日随机身体状态（2026-09-17 主人拍板）
+
+**动因（实证，不是猜）**：翻全部 25 个时间片的账本，`condition` 行总共只有 **5 条**，全是 kyu 的「发情」；`home.json` 里两只猫的 `conditions` 一直是空的。那 5 条里两次 `set` 的 `cycleDays` 都是 **0**（8/30 那天「发情」这个中文名还没进别名表，查不到收录表 → 周期与默认时长一起失效），到点直接删掉，所以自动续轮**从来没被跑过一次**。结论：机制齐备，缺的是**产生源**——指望模型在某个回合里想起来报一次生理周期，等于把客观时间事实交给一个只看得到十几行上下文的猫。
+
+**主人拍板**：
+- 姐姐 **30 天一轮**、小玖 **40 天一轮**，每次 **3 天**（旧全局表是 20 天间隔 + 4 天，主人评「24 天里发情 4 天有点过快」）
+- 第一轮**错开**播种：姐姐第 4 天开始、小玖第 9 天（不要开场双发情）
+- 续轮带 **±3 天抖动**并落盘（不然日子能在日历上算出来，家里的事变成打卡）
+- 随机身体状态白名单：精神特别好 / 胃口特别好 / 换毛期 / 失眠 / 落枕 / **生病**（概率压到最低），**默认开**
+- **一天最多一个**随机状态；发情开场那天**独占**，不叠随机状态
+
+**设计要点**：
+
+| 点 | 定法 | 为什么 |
+|---|---|---|
+| 周期记账者 | `home.cycles[charId] = {gapDays, durDays, nextStart, nextEnd, jitterDays, seeded, rounds}`，**单一记账者** | 旧的 `condition.cycleDays` 是第二套续轮逻辑，两套并存必然打架；`estrus` 收录表里的 `cycleDays` 已删除，`condition` 降级成「当前这一轮」的投影 |
+| 倒计时何时进她的上下文 | 只在前 **2 天**（`CYCLE_LEAD_DAYS`）写 pending 进 `conditions` | 提前 40 天挂一行「还有 33 天开始」，模型会一直惦记这件事，比发情本身还出戏。日历给主人看，脑子留给她 |
+| 到点唤醒 | 走既有 **T2**（pending→active 私有 notice「你感觉到身体变了」） | 一个新机制都不加 |
+| 猫自己挂发情 | `setCondition` 命中发情时**把 cycles 表一起挪过去**（`seeded=true`） | 不挪就会出现「日历说下个月、人却现在是发情期」 |
+| 随机池边界 | 只掷**身体自己发生的事**（失眠/生病/换毛/胃口…）；受伤、摔跤、被撞**不进池** | 主人 2026-08-31 定的「主体先于事件」：外界对她做了什么必须由行动产生，天降不公平；身体不听意志，系统代管才成立 |
+| 防重掷 | `home.regime.rolledOn` 落盘当天日期；命中/掷空/独占**都记** | 片是你开几次就几次，一天只掷一次 |
+| 来路 | condition 加 `source: 'self' \| 'system'`，`note` 存那句人话；state 透出，前端徽标 `title` 显示「自己挂的 / 家里给的」 | 「来路可见」是状态控制台四条验收之一，先在数据层就位 |
+| 随机源 | 插件 `config.tickRand` 可注入（默认 `Math.random`） | 12%/天的掷骰会让所有调 `tick()` 的用例偶发飘红（实测挂过一次 T6 门控），测试统一注入 `noRoll = () => 0.5` |
+
+**实现锚点**：
+- **lib.js**：`CYCLE_CONFIG`（moli 30/3/4、kyu 40/3/9）、`CYCLE_NAME`、`CYCLE_JITTER_DAYS`、`CYCLE_LEAD_DAYS`、`DAY_MS`；纯函数 `settleCycles(home, now, rand)`（播种/滚动/临近写 pending，`changed` 含 `cycle-init` / `cycle-next` / `cycle-seed` / `cycle-adopt`）、`cycleView(home, charId, now)`（日历视图，`afterStart` 是虚线预计）、`settleRegime(home, now, rand)`（每日一掷，`REGIME_POOL` 权重 25/25/20/18/8/4，`REGIME_DAILY_CHANCE=0.12`）、`dayKeyOf`；`HOME_VERSION 5→6` 迁移补 `cycles`/`regime`；方法 `tickCycles(rand)` / `tickRegime(rand)`
+- **index.js**：`scheduleTick` 新增第 **1.5 步**（周期结算 → 随机掷骰；命中发私有 notice + 退避清零 + `tryWake(force)`）；`config.tickRand`；`stateView` 每个角色带 `cycle`，condition 带 `source`/`note`；`set_condition` 工具描述与 system prompt 改为「发情不用自己设，家里按周期自动安排」；服务面暴露 `tickCycles`/`tickRegime`
+- **lib/client.js**：新增 `CycleLine`（常驻周期条：本轮/下一次是确定日期，`再下次 X月X日 预计` 是虚线；本地 60s 重算）+ `.cnx-cycle` 样式；发情从 `CondBadge` 里剔除（由周期条承担，免得显示两遍）；徽标 `title` 带来路
+
+**改主意留痕**：9/10 记的是「状态控制台开关**默认关**」，2026-09-17 主人改口**默认开**，本次迁移按默认开落地；离家片也会掷骰（你不在家时家里自己过日子）。
+
+**测试**：基线 **143/143 → 153/153**（lib 82→89：播种错开与幂等 / 滚动带抖动落盘 / 临近写 pending 与认领本人那条 / `cycleView` 三态 / 每日一掷与权重 / 关掉与发情独占 / v5→v6 迁移；index 61→64：首结算播种 + state 日历 / 临近写 pending 与到点 T2 唤醒 / 命中写状态 + 私有 notice + 唤醒 + 一天只一个 + 来路进 state）。连跑两轮全绿。
+
+**没做（留观察 / 下一轮）**：状态控制台那页（姐姐自己那页、开关、来路与按停 UI）、`events.log` 单开、发情前 1 天的**前兆**（主人提过的坡）、发情期注入文本按 9/16 实测的四件套写（欲望指向 / 托词素材 / 失守动作 / 她怎么主动）；概率与白名单先按本节数字跑一周，看实际频率再调（跟墨璃提的「试行一周、不合意无理由改回」是一套）。
+
+**生效**：改动要 dsh web 重启才在线上生效（`~/.dsh/scripts/dsh-web-restart.sh`，先 `--check`）。
