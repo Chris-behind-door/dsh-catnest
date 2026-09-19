@@ -2596,6 +2596,54 @@ test('家当（HOUSE_DESIGN §1）：prompt 只注入自己所在房间的东西
   }
 })
 
+test('家当记账口径（2026-09-19 主人定）：只记长期存在的东西与状态，prompt 写明瞬态不记', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-itemrule-'))
+  const ws = webServerStub()
+  const calls = []
+  const llm = {
+    stream: (opts) => {
+      const stop = hasAssistantToolCall(opts.messages)
+      if (!stop) calls.push({ system: opts.system, tools: opts.tools })
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: '嗯' }) }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
+    await until(() => calls.length >= 1)
+    const { system, tools } = calls[0]
+    assert.ok(system.includes('长期在那儿的东西'), 'system 段写明家当只记长期的东西')
+    assert.ok(system.includes('用完就没的不用记账'), 'system 段写明饭菜茶水不入账')
+    const desc = {}
+    for (const t of tools || []) desc[t.name] = t.description || ''
+    const d = (name) => desc[name] || ''
+    assert.ok(d('set_item_state').includes('转眼就变'), 'set_item_state 写明瞬态状态不记')
+    assert.ok(d('put_item').includes('用完就没的'), 'put_item 写明一次性物品不入账')
+    assert.ok(d('take_item').includes('长期'), 'take_item 写明只管长期的东西')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
 test('家当编辑接口（House §2）：setItems 整表替换 + 快照同步，校验失败报错且不改账本', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-items-'))
   const ws = webServerStub()

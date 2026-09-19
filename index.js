@@ -572,7 +572,7 @@ export default {
     // adjust_relation 阶段二再上（主人拍板）；bash 沙箱阶段三。
 
     const MAX_STEPS = 4
-    const STEP_MAX_TOKENS = 2048
+    const STEP_MAX_TOKENS = 8192
 
     // 工具面（MVP）：say 是唯一发声口；move_to/do_activity/remember 对应
     // 定案「移位置 / 做事件 / 加记忆」。
@@ -644,8 +644,9 @@ export default {
       {
         name: 'take_item',
         description:
-          '从你现在待的房间里拿走或用掉东西（拿一包零食吃掉、用掉一张纸巾）。' +
-          '只能碰你所在房间里的东西：隔壁房间有什么你看不见，也够不着。',
+          '从你现在待的房间里拿走或用掉东西（用掉一张纸巾、拿走一本书）。' +
+          '只能碰你所在房间里的东西：隔壁房间有什么你看不见，也够不着。' +
+          '记账只管长期摆在那儿的东西：饭菜、茶水、零食这类用完就没的，本来就不进账，也就不用拿。',
         parameters: {
           type: 'object',
           properties: {
@@ -658,14 +659,15 @@ export default {
       {
         name: 'put_item',
         description:
-          '往你现在待的房间里放东西（买回来的、做好的、从别处拿过来的）。' +
-          '房间里已经有同名的那就累加数量。',
+          '往你现在待的房间里放长期摆在那儿的东西（买回来的、从别处拿过来的）。' +
+          '房间里已经有同名的那就累加数量。' +
+          '饭菜、茶水这类用完就没的不用记账——摆一会儿它们自己就不在了。',
         parameters: {
           type: 'object',
           properties: {
             name: { type: 'string', description: '东西的名字' },
             count: { type: 'number', description: '可选：放几个，默认 1' },
-            state: { type: 'string', description: '可选：顺手写它的状态（「新的」「还热着」）' },
+            state: { type: 'string', description: '可选：顺手写它的长期状态（「新的」「用旧了」）' },
           },
           required: ['name'],
         },
@@ -673,8 +675,9 @@ export default {
       {
         name: 'set_item_state',
         description:
-          '改你现在待的房间里某件东西的状态（做完饭把灶台写成「脏了」、水壶写成「空的」）。' +
-          '状态是给人看的短语，不是数量；数量用 take_item / put_item。',
+          '改你现在待的房间里某件东西的长期状态（用坏了、换成遮光款了）。' +
+          '只记能留住的：壶里有没有水、水还热不热、菜刚出锅、灯开着还是关着，这些转眼就变，别写。' +
+          '状态是给人看的短语（一二十字），不是数量；数量用 take_item / put_item。',
         parameters: {
           type: 'object',
           properties: {
@@ -1180,6 +1183,12 @@ export default {
     const agentTurn = async (charId, opts = {}) => {
       const home = await nest.home()
       const ch = home.characters && home.characters[charId]
+      // 纵深防御（2026-09-19 事故）：master 是真人、名册外角色不存在——都不该有 agent 回合，
+      // 一律不取人设、不烧 LLM、不产台词（最坏情形宁可空转，也绝不让 AI 替主人开口）。
+      if (charId === 'master' || !ch) {
+        console.log('[dsh-catnest] 拒绝 agent 回合（非名册角色）: ' + charId)
+        return { said: false, error: 'not a roster character: ' + charId, actions: [] }
+      }
       const name = (ch && ch.name) || charId
       let dbgSlice = ''
       try {
@@ -1243,9 +1252,11 @@ export default {
         '想记住什么就调用 remember；身体状态（生病/受伤/疲劳…，可带倒计时）用 set_condition' +
         '（发情不用自己设，家里按周期自动安排，到点你会感觉到）；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
-        '屋里有什么就摆在【屋里有什么】那行里：想拿、想吃、想用掉就用 take_item，' +
-        '想放东西（买回来的、做好的）用 put_item，想把某件东西写成别的状态（灶台脏了、水壶空了）' +
-        '用 set_item_state——只能碰你自己待的那个房间，隔壁有什么你看不见也够不着。' +
+        '屋里有什么就摆在【屋里有什么】那行里，摆的只是长期在那儿的东西（家具、电器、物件）；' +
+        '想拿、想用掉就用 take_item，想放长期的东西用 put_item，想写某件东西的长期状态（用坏了、换了）' +
+        '用 set_item_state。饭菜、茶水这类用完就没的不用记账；状态也只记能留住的，' +
+        '壶里有没有水、灯开着还是关着这种转眼就变的别写。' +
+        '只能碰你自己待的那个房间，隔壁有什么你看不见也够不着。' +
         '同一轮里可以调用多个工具，也该把这一轮要做的事一次调完（比如一边说话一边走去别的房间，就把 say 和 move_to 放在同一轮里调）。' +
         '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
         '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。\n\n' +
@@ -1633,6 +1644,9 @@ export default {
         const st = await nest.status()
         if (!st || !st.open) return null
         const home = await nest.home()
+        // 唤醒名单只认名册角色：master 是真人（即时感知，无 agent 回合），名册外角色不存在。
+        // 2026-09-19 事故：urgent 曾含 master，bypassReady+force 一路穿到 enqueueTurn('master')。
+        if (charId === 'master' || !(home.characters && home.characters[charId])) return null
         if (!opts.bypassReady && !hearReadyOf(home, charId)) return null
         if (hearStaleOf(home, charId, nest.now())) {
           const stale = await nest.dropStaleHear(charId)

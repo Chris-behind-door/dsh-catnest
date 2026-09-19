@@ -1961,7 +1961,10 @@ export class CatNest {
         clear.push(id) // 同房：听得见，也看得见形态（action 给人看）
       } else if (p.level === 'clear') {
         faint.push(id) // 隔壁大声：听得清，但还是隔着一堵墙（看不见形态）
-        if (p.gripped) urgent.push(id) // 真切到当场抓住注意力：喊一声就是为了被听见，不等缓冲攒够
+        // urgent 只收角色：主人是真人（即时感知，没有 agent 回合可唤醒），不进这份名单。
+        // 2026-09-19 事故：主人在隔壁时被 push 进 urgent，调度层拿它当唤醒名单，
+        // enqueueTurn('master') 烧了一次 LLM 替主人回话（tryWakeHear 当时无角色守卫）。
+        if (p.gripped && id !== 'master') urgent.push(id) // 真切到当场抓住注意力：喊一声就是为了被听见，不等缓冲攒够
       } else {
         faint.push(id)
       }

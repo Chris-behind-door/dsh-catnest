@@ -580,6 +580,22 @@ test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切并当场叫�
   }
 })
 
+test('say 的 urgent 绝不含 master（2026-09-19「AI主人回话」事故回归）', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveMaster('kitchen') // 主人在厨房，与客厅相邻
+    await nest.moveCharacter('kyu', 'living')
+    await nest.moveCharacter('moli', 'bedroom') // 远处，排除干扰
+    // 大声 + 隔壁 = gripped：旧版会把 master push 进 urgent，调度层据此给主人排 agent 回合
+    const r = await nest.say('kyu', '开饭啦——！', undefined, undefined, '大声')
+    assert.ok(r.faint.includes('master'), '主人在隔壁确实听得清（audience 名单保留）')
+    assert.ok(!r.urgent.includes('master'), 'urgent 只收角色——主人是真人，没有 agent 回合可唤醒')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('say 攒满阈值触发决策机会：hearReady 报告', async () => {
   const { nest, cleanup } = await mk()
   try {
