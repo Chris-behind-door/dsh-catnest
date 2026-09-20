@@ -4,10 +4,12 @@
      坐标可直接 innerHTML 注入页面。房间几何关系与 home.json 的 adjacent 表一致：
      living 邻 entry/kitchen/balcony/study/bedroom；bedroom 邻 living/bath；bath 只邻 bedroom（最深）。
      角色位置可用 <circle> 叠加（见下方 kyu/moli 示例）。
+     ⚠️ 根元素不要写 width/height 属性：那会盖掉 viewBox 的固有比例，前端按
+     height:auto 算高度时就会跟内容对不上（2026-09-20 实测：全图纵偏 8.6%）。
      大地图 §2（2026-09-20）：右侧那一栏是小区「月见庭」的户外节点（unit_door/path/bench/
      garden/store/gate），与房间同属 home.rooms（outdoor:true）。玄关与单元门口之间那条虚线
      是全图唯一的「门边」：跨它才算出门/回家。屋内几何一个字没动，画布只往右加宽到 1140。 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="720" viewBox="0 0 1140 720" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1140 720" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif">
   <title>猫窝户型平面图</title>
   <desc>七个房间：玄关、客厅、厨房、阳台、书房、卧室、浴室。客厅为中心，浴室为最深私密位。</desc>
 
