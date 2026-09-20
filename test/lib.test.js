@@ -163,7 +163,9 @@ test('moveCharacter：合法移动 + 记 log，非法房间拒绝', async () => 
   try {
     await nest.open()
     const r = await nest.moveCharacter('kyu', 'kitchen')
-    assert.deepEqual(r, { char: 'kyu', from: 'living', to: 'kitchen', door: null, outdoor: false, noticed: [] })
+    assert.deepEqual(r, {
+      char: 'kyu', from: 'living', to: 'kitchen', door: null, outdoor: false, noticed: [], letGo: [],
+    })
     const home = await nest.home()
     assert.equal(home.characters.kyu.room, 'kitchen')
     await assert.rejects(() => nest.moveCharacter('kyu', 'nope'), /地点 "nope" 不存在/)
@@ -737,11 +739,13 @@ test('牵手（大地图 §6）：双向对称 + 声学特例生效 + 松手', a
     const home = await nest.home()
     assert.deepEqual(home.master.walking, ['kyu'], '双向对称（主人那边也记着）')
     assert.equal(nest.handInHand(home, 'kyu', 'master'), true)
-    // 走开 11 步：牵手不断，但不同节点就不算「一起」了（walkingGroup 为空）
-    await nest.moveCharacter('kyu', 'path')
+    // 走开到别处（主人 2026-09-20 定的语义：手牵了就该在一起）→ 自动松开
+    const mv = await nest.moveCharacter('kyu', 'path')
+    assert.deepEqual(mv.letGo, ['master'], '走开就松手')
     const h2 = await nest.home()
-    assert.deepEqual(nest.walkingGroup(h2, 'kyu'), [], '同一节点才叫一起走')
-    assert.equal(nest.handInHand(h2, 'kyu', 'master'), true, '手还牵着')
+    assert.equal(nest.handInHand(h2, 'kyu', 'master'), false, '不同节点不再算牵手')
+    assert.deepEqual(h2.master.walking, [], '双向都清')
+    assert.deepEqual(nest.walkingGroup(h2, 'kyu'), [])
     // 松手
     await nest.walkWith('kyu', '')
     const h3 = await nest.home()

@@ -1754,12 +1754,14 @@ export class CatNest {
       if (!room) throw new Error(`地点 "${roomId}" 不存在`)
       const from = ch.room
       ch.room = roomId
+      // 走开就松手（只清「不再同处一地」的那些，同处一地的牵手保留）
+      const letGo = this.releaseHandsOnLeave(home, id)
       await this.saveHome(home)
       // 跨门边补语义（大地图 §4）：整张图只有 entry↔unit_door 一条门边，
       // 走别的路（屋里换房间、小区里换地方）都不带 door 字段。
       const door = doorMoveLabel(from, roomId)
       await this.log('move', { char: id, from, to: roomId, ...(door ? { door } : {}) })
-      return { char: id, from, to: roomId, door: door || null, outdoor: !!room.outdoor }
+      return { char: id, from, to: roomId, door: door || null, outdoor: !!room.outdoor, letGo }
     })
     // T7 相遇觉察（设计 §8）：走到有人待着的地方，在场的人会看见你
     const home = await this.home()
@@ -2020,6 +2022,7 @@ export class CatNest {
       if (!room) throw new Error(`地点 "${roomId}" 不存在`)
       const kind = room.outdoor ? 'yard' : 'home'
       setMasterPlace(home, { kind, id: roomId })
+      this.releaseHandsOnLeave(home, 'master')
       await this.saveHome(home)
       const door = doorMoveLabel(fromId, roomId)
       await this.log('master-move', { from: fromId, to: roomId, ...(door ? { door } : {}) })
@@ -2083,6 +2086,37 @@ export class CatNest {
             : '牵上了' + label(who) + '的手（一起走的时候，小声说话也听得真切）。',
       }
     })
+  }
+
+  // 清理「已经不在同一节点」的牵手（大地图 §6 收紧）。
+  // 理由（主人 2026-09-20 指出）：手牵了就该在一起 —— 她走开后还挂着 🤝、还能小声传话，
+  // 那是自欺。移动时顺手松开，双向都清。返回被松开的名单，供调用方决定要不要记一笔。
+  releaseHandsOnLeave(home, who) {
+    const listOf = (id) => {
+      if (id === 'master') return Array.isArray(home.master && home.master.walking) ? home.master.walking : []
+      const ch = home.characters && home.characters[id]
+      return ch && Array.isArray(ch.walking) ? ch.walking : []
+    }
+    const setList = (id, list) => {
+      if (id === 'master') {
+        if (home.master) home.master.walking = list
+      } else if (home.characters && home.characters[id]) {
+        home.characters[id].walking = list
+      }
+    }
+    const sameNode = (id) => {
+      const a = who === 'master' ? masterRoomId(home) : (home.characters[who] && home.characters[who].room)
+      const b = id === 'master' ? masterRoomId(home) : (home.characters[id] && home.characters[id].room)
+      return !!a && !!b && a === b
+    }
+    const dropped = []
+    for (const other of [...listOf(who)]) {
+      if (sameNode(other)) continue
+      setList(who, listOf(who).filter((x) => x !== other))
+      setList(other, listOf(other).filter((x) => x !== who))
+      dropped.push(other)
+    }
+    return dropped
   }
 
   // 两人的同行关系（供 say 判定「牵手」与 presence 渲染）。任一方向记着就算牵着。
