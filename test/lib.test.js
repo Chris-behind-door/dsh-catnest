@@ -13,6 +13,18 @@ import {
   RELATION_FIELDS,
   COMPANION_IDS,
   roomRelation,
+  sayPerceive,
+  isOutdoorId,
+  placeScene,
+  crossesDoor,
+  doorMoveLabel,
+  masterPlace,
+  masterAtHome,
+  masterRoomId,
+  masterPlaceLabel,
+  setMasterPlace,
+  DEFAULT_PLACES,
+  YARD_NAME,
   isBusy,
   t6BackoffMs,
   hearReadyOf,
@@ -75,17 +87,18 @@ const mk = async () => {
 
 // ── 种子与幂等 ──
 
-test('ensure 落默认账本：7 房间 / 2 角色 / 3 关系对', async () => {
+test('ensure 落默认账本：家里 7 间 + 小区 6 节点 / 2 角色 / 3 关系对', async () => {
   const { dir, nest, cleanup } = await mk()
   try {
     const home = await nest.home()
-    assert.equal(home.rooms.length, DEFAULT_ROOMS.length)
+    // 大地图 §2（2026-09-20）：户外节点与房间同图（月见庭），所以是「家里 7 间 + 小区 6 个」
+    assert.equal(home.rooms.length, DEFAULT_ROOMS.length + DEFAULT_PLACES.length)
     assert.equal(Object.keys(home.characters).sort().join(','), COMPANION_IDS.slice().sort().join(','))
     for (const ch of Object.values(home.characters)) {
       assert.equal(ch.room, 'living')
       assert.equal(ch.activity, null)
     }
-    assert.deepEqual(home.master, { atHome: false, room: null })
+    assert.deepEqual(home.master, { place: { kind: 'away' }, atHome: false, room: null })
     const rel = await nest.relations()
     assert.deepEqual(Object.keys(rel.pairs).sort(), RELATION_PAIRS.slice().sort())
     for (const p of Object.values(rel.pairs)) assert.deepEqual(p, { intimacy: 50, spice: 0 })
@@ -150,10 +163,10 @@ test('moveCharacter：合法移动 + 记 log，非法房间拒绝', async () => 
   try {
     await nest.open()
     const r = await nest.moveCharacter('kyu', 'kitchen')
-    assert.deepEqual(r, { char: 'kyu', from: 'living', to: 'kitchen' })
+    assert.deepEqual(r, { char: 'kyu', from: 'living', to: 'kitchen', door: null, outdoor: false, noticed: [] })
     const home = await nest.home()
     assert.equal(home.characters.kyu.room, 'kitchen')
-    await assert.rejects(() => nest.moveCharacter('kyu', 'nope'), /房间 "nope" 不存在/)
+    await assert.rejects(() => nest.moveCharacter('kyu', 'nope'), /地点 "nope" 不存在/)
     await assert.rejects(() => nest.moveCharacter('zhua', 'living'), /角色 "zhua" 不存在/)
   } finally {
     await cleanup()
@@ -190,15 +203,28 @@ test('setActivity：设置带时长 / 清除 / 非法参数', async () => {
   }
 })
 
-test('moveMaster：进房 / 离宅', async () => {
+test('moveMaster：进房 / 离宅 / 进小区（三层位置指针）', async () => {
   const { nest, cleanup } = await mk()
   try {
     await nest.open()
-    assert.deepEqual(await nest.moveMaster('living'), { atHome: true, room: 'living' })
-    assert.deepEqual((await nest.home()).master, { atHome: true, room: 'living' })
-    assert.deepEqual(await nest.moveMaster(null), { atHome: false, room: null })
-    assert.deepEqual((await nest.home()).master, { atHome: false, room: null })
-    await assert.rejects(() => nest.moveMaster('nope'), /房间 "nope" 不存在/)
+    // 大地图 §3：place 是权威，atHome/room 是派生值（一起写，旧读法不破）
+    const r1 = await nest.moveMaster('living')
+    assert.deepEqual(r1.place, { kind: 'home', id: 'living' })
+    assert.equal(r1.room, 'living')
+    assert.equal(r1.label, '在客厅')
+    assert.deepEqual(r1.noticed, ['kyu', 'moli']) // T7：屋里两只都看见主人进来了
+    assert.deepEqual((await nest.home()).master, { place: { kind: 'home', id: 'living' }, atHome: true, room: 'living' })
+    // 进小区：可寻址，但不算「在家」（严格意义的 atHome 仍是 false）
+    const r2 = await nest.moveMaster('bench')
+    assert.deepEqual(r2.place, { kind: 'yard', id: 'bench' })
+    assert.equal(r2.label, '在小区·长椅')
+    const h2 = (await nest.home()).master
+    assert.equal(h2.atHome, false)
+    assert.equal(h2.room, 'bench') // room 是「可寻址的节点」，在小区也给（感知/声音靠它）
+    // 出远门 = 退出地图：不可寻址
+    assert.equal((await nest.moveMaster(null)).label, '不在家')
+    assert.deepEqual((await nest.home()).master, { place: { kind: 'away' }, atHome: false, room: null })
+    await assert.rejects(() => nest.moveMaster('nope'), /地点 "nope" 不存在/)
   } finally {
     await cleanup()
   }
@@ -235,7 +261,7 @@ test('状态跨实例延续：close 后新实例读到全部变更 + 片目录�
     const home = await nest2.home()
     assert.equal(home.characters.kyu.room, 'kitchen')
     assert.equal(home.characters.moli.activity, '读书')
-    assert.deepEqual(home.master, { atHome: true, room: 'living' })
+    assert.deepEqual(home.master, { place: { kind: 'home', id: 'living' }, atHome: true, room: 'living' })
     const rel = await nest2.relations()
     assert.equal(rel.pairs['master:kyu'].intimacy, 70)
 
@@ -247,7 +273,8 @@ test('状态跨实例延续：close 后新实例读到全部变更 + 片目录�
     const logText = await readFile(join(dir, 'slices', opened.sliceId, 'log.jsonl'), 'utf8')
     const types = logText.trim().split('\n').map((l) => JSON.parse(l).type).sort()
     // hear = 活动隔墙动静（§9.5）：墨璃读书 → 相邻厨房的小玖攒一条「客厅传来读书的动静」
-    assert.deepEqual(types, ['activity', 'hear', 'master-move', 'move', 'relation'])
+    // notice = T7 相遇觉察（大地图 §8）：kyu/moli 都在客厅，主人进客厅时两只都看见他了
+    assert.deepEqual(types, ['activity', 'hear', 'master-move', 'move', 'notice', 'relation'])
   } finally {
     await cleanup()
   }
@@ -585,6 +612,205 @@ test('say 音量：小声不出屋 / 大声全屋清晰（2026-09-20 简化版�
   }
 })
 
+// ── 大地图（小区）§2–§8：户外声学 / 门边 / 牵手 / T7 相遇觉察 ──
+
+test('户外声学（大地图 §6）：户外相邻听得清 / 小声出不了节点 / 牵手小声也真切 / 大声一跳邻居', () => {
+  const home = {
+    rooms: [...DEFAULT_ROOMS, ...DEFAULT_PLACES].map((r) => ({ ...r, adjacent: [...r.adjacent], items: [] })),
+  }
+  // 相邻两处在户外（步道 ↔ 长椅）：正常音量听得清，不是「隔墙只闻动静」
+  assert.equal(roomRelation(home, 'path', 'bench'), 'adjacent')
+  assert.equal(sayPerceive(home, 'path', 'bench', '正常', false).level, 'clear')
+  assert.equal(sayPerceive(home, 'path', 'bench', '正常', false).steps, 0, '户外相邻不减档')
+  // 小声是贴着耳朵的话：出不了所在的那个节点（风把气声吹散）
+  assert.equal(sayPerceive(home, 'path', 'bench', '小声', false).level, 'silent')
+  // 牵手特例（§6③）：只在「同一个节点」生效——贴着耳朵的悄悄话，旁边那个节点的人还是听不见
+  assert.equal(sayPerceive(home, 'path', 'bench', '小声', false, true).level, 'silent', '特例只管同节点')
+  assert.equal(sayPerceive(home, 'path', 'path', '小声', false, true).level, 'clear', '同节点牵手：小声也真切')
+  assert.equal(sayPerceive(home, 'path', 'path', '小声', false).level, 'clear', '同节点本来就真切（特例是给悄悄话兜底）')
+  // 大声在户外 = 同节点 + 一跳邻居；再远听不见（按各自相邻表判）
+  assert.equal(sayPerceive(home, 'path', 'store', '大声', false).level, 'clear', '一跳邻居听得清')
+  assert.equal(sayPerceive(home, 'store', 'gate', '大声', false).level, 'clear')
+  assert.equal(sayPerceive(home, 'garden', 'gate', '大声', false).level, 'silent', '两跳听不见')
+  // 室内一个字不变：隔一堵墙照旧只闻动静；大声照旧全屋清晰
+  assert.equal(sayPerceive(home, 'living', 'kitchen', '正常', false).level, 'faint')
+  assert.equal(sayPerceive(home, 'living', 'kitchen', '小声', false).level, 'silent')
+  assert.equal(sayPerceive(home, 'living', 'bath', '大声', false).level, 'clear')
+  // 室内相邻 + 牵手不该被特例救活（特例只作用于同节点 steps=0）
+  assert.equal(sayPerceive(home, 'living', 'kitchen', '小声', false, true).level, 'silent')
+})
+
+test('门边（大地图 §4）：整张图只有 entry↔unit_door 一条，跨它才是出门/回家', () => {
+  assert.ok(crossesDoor('entry', 'unit_door'))
+  assert.ok(crossesDoor('unit_door', 'entry'))
+  assert.equal(doorMoveLabel('entry', 'unit_door'), '出家门')
+  assert.equal(doorMoveLabel('unit_door', 'entry'), '回家')
+  // 屋里换房间、小区里换地方都不算跨门
+  assert.equal(crossesDoor('living', 'entry'), false)
+  assert.equal(doorMoveLabel('living', 'kitchen'), null)
+  assert.equal(crossesDoor('path', 'bench'), false)
+  assert.equal(doorMoveLabel('store', 'gate'), null)
+  assert.equal(crossesDoor('entry', 'entry'), false)
+})
+
+test('位置指针（大地图 §3）：place 三态 + atHome/room 派生值同步', () => {
+  const rooms = [...DEFAULT_ROOMS, ...DEFAULT_PLACES].map((r) => ({ ...r, adjacent: [...r.adjacent], items: [] }))
+  const home = { rooms, master: {} }
+  setMasterPlace(home, { kind: 'home', id: 'living' })
+  assert.deepEqual(home.master.place, { kind: 'home', id: 'living' })
+  assert.equal(home.master.atHome, true)
+  assert.equal(home.master.room, 'living')
+  assert.equal(masterAtHome(home), true)
+  assert.equal(masterRoomId(home), 'living')
+  assert.equal(masterPlaceLabel(home), '在客厅')
+  // 在小区：可寻址（room 有值）但不算「在家」
+  setMasterPlace(home, { kind: 'yard', id: 'bench' })
+  assert.equal(masterAtHome(home), false, '在小区不是「在家」')
+  assert.equal(masterRoomId(home), 'bench', '但在小区是可寻址的（声音/感知要它）')
+  assert.equal(masterPlaceLabel(home), '在小区·长椅')
+  // 出远门：退出地图
+  setMasterPlace(home, { kind: 'away' })
+  assert.equal(masterRoomId(home), null)
+  assert.equal(masterPlaceLabel(home), '不在家')
+  assert.equal(masterAtHome(home), false)
+  // 老数据（只有 atHome/room，没有 place）按现推读
+  const old = { master: { atHome: true, room: 'study' } }
+  assert.deepEqual(masterPlace(old), { kind: 'home', id: 'study' })
+  assert.equal(masterRoomId(old), 'study')
+  assert.equal(masterRoomId({ master: { atHome: false, room: null } }), null)
+})
+
+test('在小区走动：账本记 door + T7 相遇觉察（走进有人待着的地方）', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    // 小玖在客厅，墨璃在厨房
+    await nest.moveCharacter('moli', 'kitchen')
+    // 1) 出家门：entry → unit_door 记 door
+    const r1 = await nest.moveCharacter('kyu', 'entry')
+    assert.equal(r1.door, null, '客厅→玄关不算出门')
+    const r2 = await nest.moveCharacter('kyu', 'unit_door')
+    assert.equal(r2.door, '出家门')
+    assert.equal(r2.outdoor, true)
+    // 2) 小区里换地方不带 door
+    const r3 = await nest.moveCharacter('kyu', 'bench')
+    assert.equal(r3.door, null)
+    assert.deepEqual(r3.noticed, [], '长椅上没人')
+    // 3) T7：墨璃一路走过来（厨房 → 客厅 → 玄关 → 单元门口 → 长椅）
+    //    只有跨门那一步带 door，中间的屋里换房间都不带
+    assert.equal((await nest.moveCharacter('moli', 'living')).door, null)
+    assert.equal((await nest.moveCharacter('moli', 'entry')).door, null)
+    const r4 = await nest.moveCharacter('moli', 'unit_door')
+    assert.equal(r4.door, '出家门')
+    await nest.moveCharacter('moli', 'path')
+    const r5 = await nest.moveCharacter('moli', 'bench')
+    assert.deepEqual(r5.noticed, ['kyu'], '在场的人被通告')
+    const rows = (await nest.transcript()).lines
+    const notice = rows.filter((l) => l.type === 'notice' && l.char === 'kyu').pop()
+    assert.equal(notice.private, true, '觉察是私有的（她的眼睛）')
+    // 注意：transcript 会把 notice 的 text 覆写成人话渲染（notice 无渲染→空串），
+    // 事件原文在 rawText 里（与 say/shout 同一套消费口径）
+    assert.match(notice.rawText, /墨璃/)
+    assert.match(notice.rawText, /长椅/)
+    // 4) 主人进小区也是同一套：先记 place=yard，再看觉察
+    const m = await nest.moveMaster('path')
+    assert.deepEqual(m.place, { kind: 'yard', id: 'path' })
+    assert.equal(m.label, '在小区·步道')
+    assert.deepEqual((await nest.home()).master.atHome, false)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('牵手（大地图 §6）：双向对称 + 声学特例生效 + 松手', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveMaster('bench')
+    await nest.moveCharacter('kyu', 'bench')
+    // 没牵手：小声传不到（虽然同节点本来就 clear，这里验的是标记本身）
+    const before = await nest.say('kyu', '悄悄话', undefined, undefined, '小声')
+    assert.ok(before.direct.includes('master'), '同节点小声本来就听得见')
+    const w = await nest.walkWith('kyu', 'master')
+    assert.equal(w.with, 'master')
+    assert.deepEqual(w.walking, ['master'])
+    const home = await nest.home()
+    assert.deepEqual(home.master.walking, ['kyu'], '双向对称（主人那边也记着）')
+    assert.equal(nest.handInHand(home, 'kyu', 'master'), true)
+    // 走开 11 步：牵手不断，但不同节点就不算「一起」了（walkingGroup 为空）
+    await nest.moveCharacter('kyu', 'path')
+    const h2 = await nest.home()
+    assert.deepEqual(nest.walkingGroup(h2, 'kyu'), [], '同一节点才叫一起走')
+    assert.equal(nest.handInHand(h2, 'kyu', 'master'), true, '手还牵着')
+    // 松手
+    await nest.walkWith('kyu', '')
+    const h3 = await nest.home()
+    assert.equal(nest.handInHand(h3, 'kyu', 'master'), false)
+    assert.deepEqual(h3.master.walking, [])
+    await assert.rejects(() => nest.walkWith('kyu', 'kyu'), /不能和自己/)
+    await assert.rejects(() => nest.walkWith('kyu', 'nobody'), /不存在/)
+  } finally {
+    await cleanup()
+  }
+})
+
+test('迁移 v6→v7：户外节点补进图 + atHome 布尔退休成 place（三分支）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    // 老账本：在家（living）
+    await writeFile(
+      join(dir, 'home.json'),
+      JSON.stringify({
+        version: 6,
+        rooms: DEFAULT_ROOMS.map((r) => ({ ...r, items: r.items || [] })),
+        characters: { kyu: { id: 'kyu', name: '小玖', room: 'living', activity: null, activityEndsAt: null } },
+        master: { atHome: true, room: 'living' },
+      }),
+    )
+    await nest.ensure()
+    const home = await nest.home()
+    assert.equal(home.version, HOME_VERSION)
+    // 户外节点补齐（房间没动）
+    for (const p of DEFAULT_PLACES) assert.ok(home.rooms.some((r) => r.id === p.id), p.id)
+    assert.equal(home.rooms.filter((r) => r.outdoor).length, DEFAULT_PLACES.length)
+    assert.equal(YARD_NAME, '月见庭')
+    assert.ok(placeScene(home, 'path').length > 0, '每个户外节点都带一句场景描写')
+    assert.equal(placeScene(home, 'living'), '', '屋里没有这一项（那行走【屋里有什么】）')
+    assert.equal(isOutdoorId(home, 'bench'), true)
+    assert.equal(isOutdoorId(home, 'living'), false)
+    // 在家分支
+    assert.deepEqual(home.master.place, { kind: 'home', id: 'living' })
+    assert.equal(home.master.atHome, true)
+    // 出远门分支
+    const dir2 = await mkdtemp(join(tmpdir(), 'catnest-v7-away-'))
+    try {
+      await writeFile(
+        join(dir2, 'home.json'),
+        JSON.stringify({
+          version: 6,
+          rooms: DEFAULT_ROOMS.map((r) => ({ ...r, items: r.items || [] })),
+          characters: { kyu: { id: 'kyu', name: '小玖', room: 'living' } },
+          master: { atHome: false, room: null },
+        }),
+      )
+      const nest2 = new CatNest(dir2, { now: fixedNow })
+      await nest2.ensure()
+      const h2 = await nest2.home()
+      assert.deepEqual(h2.master.place, { kind: 'away' })
+      assert.equal(h2.master.atHome, false)
+      assert.equal(h2.master.room, null)
+      // 幂等：再 ensure 一次不重复补节点
+      const n1 = h2.rooms.length
+      await nest2.ensure()
+      assert.equal((await nest2.home()).rooms.length, n1, '幂等：不重复补节点')
+    } finally {
+      await rm(dir2, { recursive: true, force: true })
+    }
+  } finally {
+    await cleanup()
+  }
+})
+
 test('say 的 urgent 绝不含 master（2026-09-19「AI主人回话」事故回归）', async () => {
   const { nest, cleanup } = await mk()
   try {
@@ -854,7 +1080,10 @@ test('ensure v1→v2 迁移：补听到缓冲/阈值/版本，旧房间与角色
     assert.deepEqual(home.hearThresholds, HEAR_THRESHOLDS)
     assert.deepEqual(home.characters.a.hear, [])
     assert.equal(home.characters.a.activityLeftMs, null)
-    assert.equal(home.rooms.length, 1) // 自定义房间保留
+    assert.equal(home.rooms.length, 1 + DEFAULT_PLACES.length) // 自定义房间保留 + 小区节点补进来
+    assert.ok(home.rooms.some((r) => r.id === 'bench' && r.outdoor === true))
+    // v6→v7：master 的 atHome 布尔退休成 place 指针（旧数据 atHome:false → 出远门）
+    assert.deepEqual(home.master.place, { kind: 'away' })
   } finally {
     await cleanup()
   }
@@ -1747,6 +1976,30 @@ test('openTopic/endTopic/resolveTopicSay 方法：账本行与状态一致（含
   }
 })
 
+test('§9.20 endTopic 幂等：已收掉的话题再收算成功、不落重复行；没参与过的仍拒绝', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    const KEY = topicKey('那盆花')
+    await nest.openTopic('kyu', '那盆花', '你看那盆花开了')
+    await nest.endTopic('kyu', '那盆花') // 提议收掉 → closing
+    const r1 = await nest.endTopic('moli', '那盆花') // 对方也收 → 双收 → ended
+    assert.equal(r1.verdict, 'accepted')
+    assert.equal((await nest.home()).topics[KEY].status, 'ended')
+    const endsBefore = (await nest.transcript()).lines.filter((l) => l.type === 'topic-end').length
+    // 模型忘了它已经收过，下一轮又去收：幂等成功——不回错误回执（否则它会以为没收成、反复再试）
+    const r2 = await nest.endTopic('kyu', '那盆花')
+    assert.equal(r2.verdict, 'already-ended')
+    assert.equal(r2.said, null)
+    const endsAfter = (await nest.transcript()).lines.filter((l) => l.type === 'topic-end').length
+    assert.equal(endsAfter, endsBefore, '不落重复 topic-end 行')
+    // 门禁不变：压根不存在（或没参与过）的话题仍然拒绝
+    await assert.rejects(() => nest.endTopic('kyu', '月亮'), /没有你参与的/)
+  } finally {
+    await cleanup()
+  }
+})
+
 test('sliceEventsText：topic 行 + say.about 渲染进家史', () => {
   const home = {
     characters: {
@@ -1876,14 +2129,17 @@ test('hearStaleOf：没有 room/t 的旧条目视为可定位，不误判过时'
   assert.equal(hearStaleOf(home, 'kyu'), false, '空缓冲不算过时')
 })
 
-test('autonomyEnabled：离家照旧 / 在家看开关', () => {
-  const at = (atHome, homeOn) =>
-    autonomyEnabled({ master: { atHome }, ...(homeOn === undefined ? {} : { autonomy: { homeOn } }) })
-  assert.equal(at(false, undefined), true, '离家：自动那档不动')
-  assert.equal(at(false, false), true, '离家不受"在家开关"影响')
-  assert.equal(at(true, undefined), false, '在家默认关（省 API、不抢主人模型槽位）')
-  assert.equal(at(true, false), false)
-  assert.equal(at(true, true), true, '打开后才跑')
+test('autonomyEnabled：出远门照旧 / 在家与在小区看开关', () => {
+  // 大地图 §3 口径：只有「出远门」（退出地图）才算离家；主人在小区里仍与在家同一档
+  const at = (kind, homeOn) =>
+    autonomyEnabled({ master: { place: { kind } }, ...(homeOn === undefined ? {} : { autonomy: { homeOn } }) })
+  assert.equal(at('away', undefined), true, '出远门：自动那档不动')
+  assert.equal(at('away', false), true, '出远门不受"在家开关"影响')
+  assert.equal(at('home', undefined), false, '在家默认关（省 API、不抢主人模型槽位）')
+  assert.equal(at('home', false), false)
+  assert.equal(at('home', true), true, '打开后才跑')
+  assert.equal(at('yard', false), false, '主人在小区：跟在家同一档（不然主人刚出单元门家里就开趴）')
+  assert.equal(at('yard', true), true)
 })
 
 test('setAutonomy：默认关、落盘、跨片保留', async () => {

@@ -62,7 +62,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, cycleView, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, isOutdoorId, placeScene, masterPlace, masterPlaceLabel, masterRoomId, masterAtHome, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, cycleView, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -389,7 +389,10 @@ export default {
       const at = Object.values(home.characters || {})
         .filter((c) => c && c.room)
         .map((c) => {
-          let where = (c.name || c.id) + '在' + (roomName(home, c.room) || c.room)
+          // 大地图 §4：地名一律带「小区·」前缀——角色与主人都在同一张图里，
+          // 只写「在步道」会让人分不清是屋里还是外面。
+          const placeName = (roomName(home, c.room) || c.room)
+          let where = (c.name || c.id) + '在' + (isOutdoorId(home, c.room) ? '小区·' + placeName : placeName)
           const conds = (Array.isArray(c.conditions) ? c.conditions : [])
             .filter((x) => conditionPhase(x, nowDate) === 'active')
             .map((x) => conditionLabel(x.name) + '中')
@@ -406,10 +409,9 @@ export default {
           return where
         })
         .join('，')
-      const masterAt =
-        home.master && home.master.atHome && home.master.room
-          ? '主人在' + (roomName(home, home.master.room) || home.master.room)
-          : '主人不在家'
+      // 主人位置用统一的地名口径（大地图 §3）：在家 / 在小区·步道 / 不在家
+      const mLabel = masterPlaceLabel(home)
+      const masterAt = mLabel === '不在家' ? '主人不在家' : '主人' + mLabel
       const topics = home.topics || {}
       const myTopics = Object.values(topics)
         .filter(
@@ -434,7 +436,33 @@ export default {
       const thingsText = things
         ? '\n【屋里有什么】' + (roomName(home, myRoom) || myRoom) + '：' + things
         : ''
-      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + thingsText + topicsText
+      // 大地图 §4 补丁③：户外节点的一句场景描写。散步要有味道，靠的就是这一句
+      // （房间那行是【屋里有什么】，户外没有家当，换成【眼前】）。
+      const scene = myRoom ? placeScene(home, myRoom) : ''
+      const sceneText = scene ? '\n【眼前】' + scene : ''
+      // 大地图 §6：牵着手的时候写明白——小声也听得见的那条特例得让她自己知道
+      const myWalking =
+        home.characters[charId] && Array.isArray(home.characters[charId].walking)
+          ? home.characters[charId].walking
+          : []
+      const heldBy = Object.values(home.characters || {})
+        .filter(
+          (c) =>
+            c &&
+            c.id !== charId &&
+            (myWalking.includes(c.id) || (Array.isArray(c.walking) && c.walking.includes(charId))),
+        )
+        .map((c) => c.name || c.id)
+      const masterHand =
+        myWalking.includes('master') ||
+        (home.master && Array.isArray(home.master.walking) && home.master.walking.includes(charId))
+      const handNames = [...heldBy, ...(masterHand ? ['主人'] : [])]
+      const handText =
+        handNames.length > 0 ? '\n【牵着的手】你正牵着' + handNames.join('、') + '的手（小声说话也听得真切）。' : ''
+      const outText = isOutdoorId(home, myRoom)
+        ? '\n【外面】你现在在小区里（月见庭），不在屋里。'
+        : ''
+      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + thingsText + sceneText + handText + outText + topicsText
     }
 
     // 片内时间线人话化：say 按 audience 名单查表渲染（同房真切/相邻弱化前缀/远处不入）；
@@ -471,6 +499,11 @@ export default {
           pendingMoves.delete(mover)
           if (!mv) continue
           if (mv.from === mv.to) continue // 乱点又回原位：零噪音
+          // 跨门边优先（大地图 §4）：出门 / 回家是叙事节点，比「从玄关挪去了单元门口」重
+          if (mv.door) {
+            out.push((mover === 'master' ? '主人' : nameOf(mover)) + mv.door + '了')
+            continue
+          }
           if (mover === 'master') {
             // 主人位置变化：回家/出门有专属措辞（from/to 为 null 表示进出宅门）
             if (!mv.from && mv.to) out.push('主人回来了，去了' + roomNameOf(mv.to))
@@ -534,7 +567,9 @@ export default {
         if (l.type === 'move' || l.type === 'master-move') {
           const mover = l.type === 'move' ? l.char : l.who || 'master'
           if (!mover) continue
-          pendingMoves.set(mover, { from: l.from, to: l.to })
+          // 跨门边（大地图 §4）：整张图只有 entry↔unit_door 是门，跨它记 door=出家门/回家。
+          // 出门回家的说法由 doorMoveLabel 统一给，这里原样带上。
+          pendingMoves.set(mover, { from: l.from, to: l.to, door: l.door || null })
           continue
         }
         if (l.type !== 'say' && l.type !== 'shout') continue
@@ -610,9 +645,11 @@ export default {
               type: 'string',
               enum: SAY_VOLUMES,
               description:
-                '可选：说话音量（缺省「正常」）。「小声」=悄悄话，只有同一间屋子的人听得见，' +
-                '隔壁什么都不知道，想避开别人说私房话就用它；「大声」=喊一嗓子，全屋都听得清清楚楚，' +
-                '隔壁闲着的姐妹当场就会被叫起来（正埋头做事的那个不被打断，只是听得见）。' +
+                '可选：说话音量（缺省「正常」）。「小声」=悄悄话，只有和你待在同一个地方的人听得见，' +
+                '别处什么都不知道，想避开别人说私房话就用它（牵着手的那个，同在一处时小声也听得真切）；' +
+                '「大声」=喊一嗓子：在屋里全屋都听得清清楚楚，在小区里是这一处和紧邻的一处' +
+                '（她在三楼窗口探出头那种距离），再远就听不见了。' +
+                '隔壁闲着的姐妹会被大声当场叫起来（正埋头做事的那个不被打断，只是听得见）。' +
                 '音量只影响别人听不听得见，不影响你说了什么。',
             },
           },
@@ -621,11 +658,39 @@ export default {
       },
       {
         name: 'move_to',
-        description: '移动去某个房间（房间名用中文，如 客厅 / 卧室 / 厨房 / 浴室）。',
+        description:
+          '移动去某个地方（房间名或小区里的地名，用中文，如 客厅 / 卧室 / 厨房 / 浴室，' +
+          '或者 单元门口 / 步道 / 长椅 / 小花园 / 便利店 / 小区大门）。' +
+          '想去小区里走走就从玄关走到单元门口（这算出门）；屋里屋外是同一张图，走过去就行。',
         parameters: {
           type: 'object',
-          properties: { room: { type: 'string', description: '目标房间名' } },
+          properties: { room: { type: 'string', description: '目标地名' } },
           required: ['room'],
+        },
+      },
+      {
+        name: 'go_home',
+        description:
+          '回家：从小区里走回玄关（出门在外想回来就用它）。本来就在家里的话不用调。' +
+          '主人一个人出远门（不在家也不在小区）时，家里就等你回来，不用着急。',
+        parameters: { type: 'object', properties: {}, required: [] },
+      },
+      {
+        name: 'hold_hands',
+        description:
+          '牵起（或松开）谁的手。牵着手一起走的时候，小声说的话对方也听得真切' +
+          '（贴着他耳朵说悄悄话就靠这个）。牵手**不会**让对方跟着你走——' +
+          '想一起走，是走两步回头喊一声，他自己会跟上来。' +
+          'who 传空字符串 = 松手。',
+        parameters: {
+          type: 'object',
+          properties: {
+            who: {
+              type: 'string',
+              description: '牵谁的手：主人 / 小玖 / 墨璃（角色中文名），空字符串=松开',
+            },
+          },
+          required: ['who'],
         },
       },
       {
@@ -1023,7 +1088,9 @@ export default {
                 ? '话题「' + about + '」聊完了。'
                 : r.verdict === 'solo'
                   ? '话题「' + about + '」收掉了。'
-                  : '已提议收掉话题「' + about + '」，看姐妹接不接。',
+                  : r.verdict === 'already-ended'
+                    ? '话题「' + about + '」之前就已经收掉了，这条线已经结束，不用再收（这次算收成功）。'
+                    : '已提议收掉话题「' + about + '」，看姐妹接不接。',
             effect: { tool: 'end_topic', about, verdict: r.verdict },
           }
         }
@@ -1052,14 +1119,50 @@ export default {
         }
         if (name === 'move_to') {
           const room = typeof args.room === 'string' ? args.room.trim() : ''
-          if (!room) return fail('move_to 需要房间名')
+          if (!room) return fail('move_to 需要地名')
           const home = await nest.home()
           const target = (home.rooms || []).find((r) => r.name === room || r.id === room)
-          if (!target) return fail('没有叫「' + room + '」的房间')
-          await nest.moveCharacter(charId, target.id)
+          if (!target) return fail('没有叫「' + room + '」的地方')
+          const r = await nest.moveCharacter(charId, target.id)
           await nest.resolveTopicAction(charId)
           scheduleSnapshot()
-          return { ok: true, result: '已移动到' + (target.name || target.id) + '。', effect: { tool: 'move_to', room: target.id } }
+          // 跨门边补一句人话（大地图 §4）：出门 / 回家是叙事节点，回执里也该看得见
+          const doorTxt = r && r.door ? '（' + r.door + '了）' : ''
+          const scene = placeScene(home, target.id)
+          return {
+            ok: true,
+            result: '已移动到' + (target.name || target.id) + doorTxt + '。' + (scene ? scene : ''),
+            effect: { tool: 'move_to', room: target.id, ...(r && r.door ? { door: r.door } : {}) },
+          }
+        }
+        if (name === 'go_home') {
+          const home = await nest.home()
+          const ch = home.characters && home.characters[charId]
+          const here = ch && ch.room
+          if (!isOutdoorId(home, here)) {
+            return fail('你本来就在家里（' + (roomName(home, here) || here) + '），不用往回走')
+          }
+          const r = await nest.moveCharacter(charId, 'entry')
+          await nest.resolveTopicAction(charId)
+          scheduleSnapshot()
+          return { ok: true, result: '回到玄关了（' + (r && r.door ? r.door : '回家') + '）。', effect: { tool: 'go_home', room: 'entry' } }
+        }
+        if (name === 'hold_hands') {
+          const raw = typeof args.who === 'string' ? args.who.trim() : ''
+          const home = await nest.home()
+          // who 认中文名（主人 / 小玖 / 墨璃），空字符串 = 松手
+          let target = null
+          if (raw !== '') {
+            if (raw === '主人' || raw === 'master') target = 'master'
+            else {
+              const hit = Object.values(home.characters || {}).find((c) => c && (c.name === raw || c.id === raw))
+              if (!hit) return fail('不认识「' + raw + '」这个名字')
+              target = hit.id
+            }
+          }
+          const r = await nest.walkWith(charId, target)
+          scheduleSnapshot()
+          return { ok: true, result: r.text, effect: { tool: 'hold_hands', who: target } }
         }
         if (name === 'do_activity') {
           const activity = typeof args.activity === 'string' ? args.activity : ''
@@ -1347,6 +1450,28 @@ export default {
       const lostDrafts = [] // 打字机吐过、但没落账的台词（回合末兜底入账）
       let said = false
       let selfChecked = false
+      // ── 回合末统一自查（2026-09-10 主人定案，两处调用点共用）──
+      // 查的是整轮：说出口的位移意图 vs 真调过的工具。不通过就把整轮退回给模型补齐。
+      // 这是判定意义上的驳回，不撤已落账的动作——账本 append-only，台词本身没错，
+      // 撤了反而连坐掉最贵的信息（家人什么都没听见）。一次性触发，补不齐就按沉默收尾。
+      const selfCheckPending = (step) =>
+        selfChecked || step >= MAX_STEPS - 1 ? null : pendingMoveIntent(actions, home, charId)
+      const selfCheckRetry = (miss) => {
+        selfChecked = true
+        void agentDebug(charId, dbgSlice, '自查未通过：说了要去' + miss.name + '但这一轮没有 move_to，退回补齐')
+        messages.push({
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text:
+                '（自查：你刚才说了要去' + miss.name + '，但这一轮没有调用 move_to，你的位置没有变。' +
+                '要过去就在这一轮里把 move_to 调掉，说话和移动可以放在同一步一起调；' +
+                '如果你只是随口说说、并不打算过去，那就不用调。）',
+            },
+          ],
+        })
+      }
       for (let step = 0; step < MAX_STEPS; step++) {
         // 打字机直播：本步 say 的 text 片段 → deltaStart/…/delta；步结束（含超时）发
         // deltaEnd。超时后后台残留的流片段用 live 闸拦掉，不许步外补帧（时序错乱）。
@@ -1355,6 +1480,7 @@ export default {
         let live = true
         let draft = '' // 本步打字机吐出去的 say 文本（已解码），用于兜底入账
         let stepSaid = false
+        let stepFailed = false // 本步有没有工具失败（决定还要不要留一步补救机会）
         const onSayDelta = (frag) => {
           if (!live) return
           if (!started) {
@@ -1387,26 +1513,9 @@ export default {
             dbgSlice,
             t0 ? '本步未调工具，只有文本（家人听不见）：' + t0.slice(0, 150) : '本步未调工具，纯沉默',
           )
-          // ── 回合末统一自查（2026-09-10 主人定案）──
-          // 查的是整轮：说出口的位移意图 vs 真调过的工具。不通过就把整轮退回给模型补齐。
-          // 这是判定意义上的驳回，不撤已落账的动作——账本 append-only，台词本身没错，
-          // 撤了反而连坐掉最贵的信息（家人什么都没听见）。一次性触发，补不齐就按沉默收尾。
-          const miss = selfChecked || step >= MAX_STEPS - 1 ? null : pendingMoveIntent(actions, home, charId)
+          const miss = selfCheckPending(step)
           if (miss) {
-            selfChecked = true
-            void agentDebug(charId, dbgSlice, '自查未通过：说了要去' + miss.name + '但这一轮没有 move_to，退回补齐')
-            messages.push({
-              role: 'user',
-              content: [
-                {
-                  type: 'text',
-                  text:
-                    '（自查：你刚才说了要去' + miss.name + '，但这一轮没有调用 move_to，你的位置没有变。' +
-                    '要过去就在这一轮里把 move_to 调掉，说话和移动可以放在同一步一起调；' +
-                    '如果你只是随口说说、并不打算过去，那就不用调。）',
-                },
-              ],
-            })
+            selfCheckRetry(miss)
             continue
           }
           break // 模型收手（只出文本也算沉默）
@@ -1433,6 +1542,7 @@ export default {
               stepSaid = true
             }
           } else if (!outcome.ok) {
+            stepFailed = true
             // 工具失败落盘（2026-09-15 主人定案）：失败回执本来只回给模型，主人那边什么都看不到，
             // 出了「话说了又没了」这种事只能靠推断。谁、哪个工具、为什么，落一行进 agent-debug.log。
             void agentDebug(charId, dbgSlice, '工具失败 ' + c.name + '：' + outcome.result)
@@ -1444,6 +1554,19 @@ export default {
         }
         // 这一步打字机吐了字，却没有任何 say 成功落账 → 记进兜底清单
         if (draft.trim() && !stepSaid) lostDrafts.push(draft.trim())
+
+        // ── 收手确认取消（§9.20，2026-09-20 主人拍板）──
+        // 这一步已经说出口、且没有任何工具失败，就没必要再问一次「还要不要做事」：实测
+        // 1129 个回合里出现 1127 次「本步未调工具」，绝大多数回合是「第一步干活 + 第二步
+        // 纯沉默收手」，第二步白花一次完整 llm.stream 的 token 与时延（日志里回合耗时
+        // 6–16s，其中相当一部分是它在空转）。有工具失败时不砍，留一步补救机会。
+        // 自查退回的老规矩保留：说了要移动却没调 move_to，仍然退回补齐一次。
+        if (stepSaid && !stepFailed) {
+          const miss = selfCheckPending(step)
+          if (!miss) break
+          selfCheckRetry(miss)
+          continue
+        }
       }
       // ── 打字机兜底入账（§9.17，2026-09-16 主人定案）──
       // 现象（主人实测）：小玖在屏上打了一大段话，气泡随后变半透明「这句话没能说出口，
@@ -1487,11 +1610,20 @@ export default {
       return {
         status: st,
         // HOUSE_DESIGN §1 家当：房间带上物品（主人视角看全屋；角色视角走 roomItemsText，只给自己房间）
-        rooms: (home.rooms || []).map((r) => ({ id: r.id, name: r.name, items: roomItems(home, r.id) })),
+        // 大地图 §2：户外节点与房间在同一张表里，前端用 outdoor 区分「屋里 / 小区」两块显示
+        rooms: (home.rooms || []).map((r) => ({
+          id: r.id,
+          name: r.name,
+          items: roomItems(home, r.id),
+          outdoor: !!r.outdoor,
+          scene: typeof r.scene === 'string' ? r.scene : null,
+        })),
         characters: Object.values(home.characters || {}).map((c) => ({
           id: c.id,
           name: c.name,
           room: c.room,
+          outdoor: isOutdoorId(home, c.room), // 前端标「在小区」
+          walking: Array.isArray(c.walking) ? [...c.walking] : [], // 牵手（大地图 §6）
           activity: c.activity || null,
           activityEndsAt: c.activityEndsAt || null, // §9.14：前端显示活动剩余时间
           activityPaused: !!c.activityPaused, // §9.14：前端标注「放下了，可以接回」
@@ -1512,7 +1644,15 @@ export default {
           // 再下一次是虚线预计）。她自己的上下文只在前 2 天看得到倒计时。
           cycle: cycleView(home, c.id, new Date()),
         })),
-        master: { atHome: !!(home.master && home.master.atHome), room: (home.master && home.master.room) || null },
+        // 主人位置（大地图 §3）：place 是新的一层（在家 / 在小区 / 出远门），
+        // atHome/room 保留给已有前端；label 是给界面直接显示的人话。
+        master: {
+          place: masterPlace(home),
+          atHome: masterAtHome(home),
+          room: masterRoomId(home),
+          label: masterPlaceLabel(home),
+          walking: Array.isArray(home.master && home.master.walking) ? [...home.master.walking] : [],
+        },
         autonomy: { homeOn: !!(home.autonomy && home.autonomy.homeOn) },
         relations: rel.pairs || {},
         recap: sum && typeof sum.text === 'string' ? sum.text : null,
@@ -1667,7 +1807,7 @@ export default {
           // 墨璃在客厅说完再挪去卧室，小玖听到的仍是客厅的动静，别写成"隔壁卧室"。
           let fromRoom = (opts.clamor && opts.clamor.room) || (last && last.room) || null
           if (!fromRoom) {
-            if (from === 'master') fromRoom = home.master && home.master.atHome ? home.master.room : null
+            if (from === 'master') fromRoom = masterRoomId(home)
             else if (home.characters && home.characters[from]) fromRoom = home.characters[from].room
           }
           const fromName = from === 'master' ? '主人' : charName(home, from) || from
@@ -1855,8 +1995,9 @@ export default {
     // llm 缺席/异常推 replyError 可见，超时/空输出视为沉默不拖累伙伴。
     const masterSay = async (text, volume) => {
       const home = await nest.home()
-      if (!(home.master && home.master.atHome)) {
-        throw new Error('主人还不在家，先在地图上点个房间回来喵')
+      // 大地图 §3：主人在小区里也能说话（可寻址）；只有出远门才是「不在」。
+      if (!masterRoomId(home)) {
+        throw new Error('主人还不在家，先在地图上点个房间（或者小区里的一个地方）再说话喵')
       }
       // 音量（§9.16）：面板上选小声=耳语，隔壁听不见；选大声=喊，隔壁听得清并当场被叫醒。
       const vol = sayVolume(volume)

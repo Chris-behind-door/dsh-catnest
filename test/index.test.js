@@ -585,7 +585,15 @@ test('存在感 UI 路由：state 返回家视图 / action 可开片关片移动
     assert.equal(res.code, 200)
     const view = JSON.parse(res.body)
     assert.ok(Array.isArray(view.rooms) && view.rooms.length >= 5)
-    assert.deepEqual(view.master, { atHome: false, room: null })
+    // 大地图 §2–§3：房间表里现在也有小区节点（outdoor），主人位置多一层 place + 人话 label
+    assert.ok(view.rooms.some((r) => r.id === 'bench' && r.outdoor === true), '小区节点在图里')
+    assert.deepEqual(view.master, {
+      place: { kind: 'away' },
+      atHome: false,
+      room: null,
+      label: '不在家',
+      walking: [],
+    })
 
     // POST action open → 状态变开
     res = fakeRes()
@@ -1423,6 +1431,99 @@ const setupNest = async (llm) => {
   return { dir, svc, h }
 }
 
+// ── 大地图（小区）§2–§8：工具面接线 ──
+
+test('move_to 认小区地名 + 场景描写进回执；账本记 door「出家门」', async () => {
+  const n = await setupNest(toolOnceForStub('小玖', 'move_to', { room: '长椅' }))
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我出门走走' })),
+      fakeRes(),
+    )
+    await until(async () => (await n.svc.home()).characters.kyu.room === 'bench')
+    const home = await n.svc.home()
+    assert.equal(home.characters.kyu.room, 'bench')
+    const st = await n.svc.status()
+    const log = await readLog(n.dir, st.sliceId)
+    const mv = log.filter((e) => e.type === 'move' && e.char === 'kyu').pop()
+    assert.equal(mv.to, 'bench')
+    // 收手确认取消（§9.20）下工具回执不进模型，所以这里验的是账本与状态；
+    // 场景描写在工具结果里给模型（那条靠 prompt 捕获桩验，见下一条）
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('go_home：在小区里能回玄关；本来在家就拒绝（不静默瞬移）', async () => {
+  const n = await setupNest(toolOnceForStub('小玖', 'go_home', {}))
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我出门走走' })),
+      fakeRes(),
+    )
+    // 本来在客厅（不是户外）→ 这轮 go_home 会失败，位置不动（判据：回合跑完还留在客厅）
+    await until(async () => (await n.svc.status()).turnPending === 0 || true)
+    await new Promise((r) => setTimeout(r, 250))
+    assert.equal((await n.svc.home()).characters.kyu.room, 'living', '在家调 go_home 不该动她')
+    // 先真的把她挪到小区，主人也跟到同一处（不然喊她听不见、这轮根本不会轮到她）
+    await n.svc.moveCharacter('kyu', 'bench')
+    await n.svc.moveMaster('bench')
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '回来啦' })),
+      fakeRes(),
+    )
+    await until(async () => (await n.svc.home()).characters.kyu.room === 'entry')
+    assert.equal((await n.svc.home()).characters.kyu.room, 'entry', '从小区回玄关')
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('hold_hands：牵上手 → 双方记着 + presence 出现【牵着的手】', async () => {
+  const captured = []
+  const n = await setupNest(captureToolStub(captured, '小玖', 'hold_hands', { who: '主人' }))
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我们出去走走吧' })),
+      fakeRes(),
+    )
+    await until(async () => {
+      const h = await n.svc.home()
+      return Array.isArray(h.master.walking) && h.master.walking.includes('kyu')
+    })
+    const home = await n.svc.home()
+    assert.deepEqual(home.master.walking, ['kyu'])
+    assert.deepEqual(home.characters.kyu.walking, ['master'])
+    const toolMsg = captured
+      .flatMap((c) => c.messages || [])
+      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '')))
+      .join('\n')
+    assert.match(toolMsg, /牵上了主人的手/)
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('小区场景描写进角色上下文：在步道上时【眼前】带那一句', async () => {
+  const captured = []
+  const n = await setupNest(silentCapture(captured))
+  try {
+    await n.svc.moveCharacter('kyu', 'path')
+    await n.svc.moveMaster('path') // 主人也在同一处，才轮得到她答话
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '你到哪儿了' })),
+      fakeRes(),
+    )
+    await until(() => captured.length >= 1)
+    const p = captured[captured.length - 1]
+    assert.match(p.user, /【眼前】/, '户外节点给一句场景描写')
+    assert.match(p.user, /桂花/, '就是节点描述里那一句')
+    assert.match(p.user, /小区·步道/, '位置带小区前缀')
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
 test('adjust_relation：模型调工具 → 亲密度按 delta 增减并入账（阶段二）', async () => {
   const n = await setupNest(toolOnceStub('adjust_relation', { person: '主人', field: 'intimacy', delta: 5 }))
   try {
@@ -1836,7 +1937,12 @@ test('notice 链路：私有只进本人时间线，公共原样进全员；私�
     assert.ok(kyuPrompt && moliPrompt, '两角色的 prompt 都被捕获')
     // 公共 notice：kyu 原样可见；moli 自己带【你注意到】
     assert.ok(kyuPrompt.user.includes('墨璃做完了读书'), 'kyu 应看到公共 notice 原文')
-    assert.ok(!kyuPrompt.user.includes('你注意到'), 'kyu 的时间线不应有【你注意到】')
+    // 大地图 §8 的 T7 入场觉察也是私有 notice（有人走进你在的房间）——这里要排除它，
+    // 只验证「别人的公共/私有 notice 不沾到 kyu」
+    const kyuTimeline = kyuPrompt.user
+      .split('【最近的时间线】')[1]
+      ?.split('【')[0] ?? ''
+    assert.ok(!kyuTimeline.includes('你注意到'), 'kyu 的时间线不应有【你注意到】')
     assert.ok(moliPrompt.user.includes('【你注意到】墨璃做完了读书'), 'moli 自己的公共 notice 带触发前缀')
     // 私有 notice：只进 moli 的时间线
     assert.ok(moliPrompt.user.includes('【你注意到】隔壁客厅传来主人的动静'), 'moli 看到自己的私有 notice')
@@ -1872,8 +1978,10 @@ test('T1 唤醒：缓冲攒满边沿触发 notice+唤醒；in-flight 不重复�
     // 主人第一句：T1 边沿 → 墨璃 notice 入账 + 唤醒入队（门控挂住）
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
     const st = await svc.status()
+    // T7 入场觉察（大地图 §8）也会写 notice 行，这里只数 T1 那条「听到的动静」
+    const hears = (log0) => log0.filter((e) => e.type === 'notice' && /听到的/.test(e.text || ''))
     let log = await readLog(dirT1, st.sliceId)
-    const notices = log.filter((e) => e.type === 'notice')
+    const notices = hears(log)
     assert.equal(notices.length, 1, '第一句触发一次 notice')
     assert.equal(notices[0].char, 'moli')
     assert.equal(notices[0].private, true)
@@ -1881,7 +1989,7 @@ test('T1 唤醒：缓冲攒满边沿触发 notice+唤醒；in-flight 不重复�
     // 主人第二句（墨璃回合 in-flight、队列忙）：不重复入账、不叠加唤醒
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '还在吗' }))
     log = await readLog(dirT1, st.sliceId)
-    assert.equal(log.filter((e) => e.type === 'notice').length, 1, '同批动静只入账一次（hearNotified 防刷屏）')
+    assert.equal(hears(log).length, 1, '同批动静只入账一次（hearNotified 防刷屏）')
     // 放行门控：墨璃唤醒回合 → 小玖两次接话回合
     gated.release()
     await until(() => prompts.length >= 3)
@@ -1936,7 +2044,8 @@ test('T2 唤醒：pending→active 翻转 → 私有 notice + 唤醒；notifiedA
     await svc.tick()
     const st = await svc.status()
     const log = await readLog(dirT2, st.sliceId)
-    const notices = log.filter((e) => e.type === 'notice')
+    // T7 入场觉察也写 notice 行，这里只数身体状态那条（source=body）
+    const notices = log.filter((e) => e.type === 'notice' && e.source === 'body')
     assert.equal(notices.length, 1, '翻转触发一次 notice')
     assert.equal(notices[0].char, 'moli')
     assert.equal(notices[0].source, 'body')
@@ -1957,7 +2066,7 @@ test('T2 唤醒：pending→active 翻转 → 私有 notice + 唤醒；notifiedA
     // 二次 tick：notifiedAt 已确认 → 不重复 notice、不重复唤醒
     await svc.tick()
     const log2 = await readLog(dirT2, st.sliceId)
-    assert.equal(log2.filter((e) => e.type === 'notice').length, 1, '一次性翻转不重复')
+    assert.equal(log2.filter((e) => e.type === 'notice' && e.source === 'body').length, 1, '一次性翻转不重复')
     assert.equal(prompts.length, 1, '不重复唤醒')
   } finally {
     await rmSafe(dirT2)
@@ -1984,6 +2093,9 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
     // 主人在家：T6 自主轻推闸死，T3 单向验证不被自主节奏污染
     await svc.moveMaster('living')
+    // 墨璃挪去厨房：主人这次入场没有她（免得大地图 §8 的 T7 入场觉察污染「他人视角」断言），
+    // 她的活动照旧在厨房里读书、照旧由 T3 到期唤醒
+    await svc.moveCharacter('moli', 'kitchen')
     await svc.setActivity('moli', '读书', 30)
     // 把 activityEndsAt 拨到过去（等价于 30 分钟到期）
     const homeP = join(dirT3, 'home.json')
@@ -1993,7 +2105,8 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
     await svc.tick()
     const st = await svc.status()
     const log = await readLog(dirT3, st.sliceId)
-    const notices = log.filter((e) => e.type === 'notice')
+    // T7 入场觉察也写 notice 行，这里只数 T3 那条公共「做完了事」
+    const notices = log.filter((e) => e.type === 'notice' && e.source === 'moli')
     assert.equal(notices.length, 1)
     assert.equal(notices[0].char, 'moli')
     assert.equal(notices[0].private, false, 'T3 是唯一公共事件')
@@ -2007,12 +2120,14 @@ test('T3 唤醒：activity 到期 → 静默清除 + 公共 notice「做完了�
     const moliPrompt = prompts.find((p) => p.system.includes('你是"猫窝"家里的成员墨璃'))
     assert.ok(moliPrompt && moliPrompt.user.includes('【你注意到】墨璃做完了读书'), '本人 prompt 带触发句')
     // 他人视角：公共 notice 原样进时间线
-    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'moveMaster', room: 'living' }))
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '墨璃忙完了吗' }))
     await until(() => prompts.filter((p) => p.system.includes('你是"猫窝"家里的成员小玖')).length >= 1)
     const kyuPrompt = prompts.find((p) => p.system.includes('你是"猫窝"家里的成员小玖'))
     assert.ok(kyuPrompt.user.includes('墨璃做完了读书'), 'kyu 时间线原样可见公共 notice')
-    assert.ok(!kyuPrompt.user.includes('你注意到'), 'kyu 不应有【你注意到】前缀')
+    // kyu 自己也会有私有 notice（大地图 §8 的 T7 入场觉察带【你注意到】前缀），
+    // 所以要验的是「别人那条公共事件没有被她自己的前缀带着」——按行挑出那一句。
+    const thatLine = kyuPrompt.user.split('\n').find((l) => l.includes('墨璃做完了读书'))
+    assert.ok(!thatLine.includes('你注意到'), '公共 notice 在他人视角不带【你注意到】前缀：' + thatLine)
   } finally {
     await rmSafe(dirT3)
   }
@@ -2081,7 +2196,7 @@ test('end_topic 工具接线：收话题 → topic-end 账本行 + 状态 closin
   }
 })
 
-test('say.about 门禁降级（§9.2 修订）：话题不存在 → 话照说入账，回执只提示这条线收了', async () => {
+test('say.about 门禁降级（§9.2 修订）：话题不存在 → 话照说入账、不当失败（§9.20 一步直调）', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-top2-'))
   const ws = webServerStub()
   const captured = []
@@ -2100,13 +2215,12 @@ test('say.about 门禁降级（§9.2 修订）：话题不存在 → 话照说�
     await svc.moveCharacter('kyu', 'living')
     await svc.moveCharacter('moli', 'bedroom')
     await call('/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖在吗' }))
-    await until(() => captured.filter((c) => c.system.includes('成员小玖')).length >= 2)
+    await until(() => captured.filter((c) => c.system.includes('成员小玖')).length >= 1)
+    await new Promise((r) => setTimeout(r, 120))
     const kyuSteps = captured.filter((c) => c.system.includes('成员小玖'))
-    const toolResult = JSON.stringify(kyuSteps[1].messages)
-    // 注意别用 includes('Error')：消息 JSON 里自带 "isError":false，会误命中
-    assert.ok(!toolResult.includes('Error: '), '不再当失败处理：' + toolResult.slice(0, 300))
-    assert.ok(toolResult.includes('不存在的线'), '回执里点名那条没了的话题，模型可纠正')
-    assert.ok(toolResult.includes('已经收掉'), '回执说明按普通说话记下了')
+    // §9.20 一步直调（2026-09-20 主人拍板）：说了话且没有工具失败即收尾，不再有第二步收手
+    // 调用，所以这里从「2 次 stream」变成「1 次」。门禁降级本身由下面的账本断言保证。
+    assert.equal(kyuSteps.length, 1, '§9.20：说话成功即收尾，不再多问一次')
     const st = await svc.status()
     const log = await readLog(dir, st.sliceId)
     const row = log.find((e) => e.type === 'say' && e.who === 'kyu')
@@ -2375,10 +2489,44 @@ test('回合末自查：对别人说「你去书房」（无自称）不误伤�
       fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖在吗' })),
       fakeRes(),
     )
+    await until(async () => calls >= 1)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(calls, 1, '§9.20 一步直调：say 一步成功即收尾（原来还要一次收手调用），没有自查退回')
+    assert.equal((await n.svc.home()).characters.kyu.room, 'living', '位置不变')
+  } finally {
+    await rmSafe(n.dir)
+  }
+})
+
+test('§9.20：有工具失败时仍留第二步补救机会（收手确认只砍成功的那一步）', async () => {
+  let calls = 0
+  const stub = {
+    stream: (opts) => {
+      calls++
+      const called = hasAssistantToolCall((opts && opts.messages) || [])
+      return (async function* () {
+        if (!called) {
+          // 第一步：说一句 + 拿一个不存在的东西（工具失败 → 必须留一步补救机会）
+          yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: '我去拿那个东西' }) }
+          yield { type: 'tool-call-delta', index: 1, id: 'call_2', name: 'take_item' }
+          yield { type: 'tool-call-delta', index: 1, argumentsDelta: JSON.stringify({ name: '压根不存在的东西' }) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const n = await setupNest(stub)
+  try {
+    await n.h(
+      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖在吗' })),
+      fakeRes(),
+    )
     await until(async () => calls >= 2)
     await new Promise((r) => setTimeout(r, 120))
-    assert.equal(calls, 2, 'say 一步 + 收手一步，没有第三条自查退回')
-    assert.equal((await n.svc.home()).characters.kyu.room, 'living', '位置不变')
+    assert.ok(calls >= 2, '说话那一步里有工具失败，仍然给了第二次调用（补救机会没被砍掉）')
   } finally {
     await rmSafe(n.dir)
   }

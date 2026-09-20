@@ -57,6 +57,33 @@ export const DEFAULT_ROOMS = [
     items: [{ name: '晾衣架' }, { name: '洗衣机' }, { name: '绿植' }, { name: '躺椅' }] },
 ]
 
+// 户外节点表（大地图 §2，2026-09-20 主人定案：范围只做小区「月见庭」）：
+//   玄关 entry ── 单元门口 unit_door ── 步道·路灯 path ─┬─ 长椅 bench
+//                                                       ├─ 小花园 garden
+//                                                       └─ 便利店·快递柜 store ── 小区大门 gate
+// 和家里的房间共用同一张图（都进 home.rooms），移动/声音/时间线/面板整套免费复用
+// ——「一个区域完全等价于一个房间」（主人拍板），只加三处补丁：
+//   ① outdoor: true（声学系数翻转，见 sayPerceive）
+//   ② 门边（整张图只有 entry↔unit_door 一条，见 DOOR_EDGE）
+//   ③ scene 一句场景描写（散步有味道的关键，注入角色上下文；房间里那行是【屋里有什么】）
+// gate 只建节点不建出口：世界到此为止，主人走进来前不接商场/医院（设计 §2 留接口）。
+// items 一律留空（设计 §7：长椅/路灯是节点本身，不是物品；不加物品系统）。
+export const YARD_NAME = '月见庭'
+export const DEFAULT_PLACES = [
+  { id: 'unit_door', name: '单元门口', outdoor: true, adjacent: ['entry', 'path'], items: [],
+    scene: '单元门的玻璃上贴着一张褪色的通知，门口的台阶被磨得发亮。' },
+  { id: 'path', name: '步道', outdoor: true, adjacent: ['unit_door', 'bench', 'garden', 'store'], items: [],
+    scene: '两侧路灯是暖黄色的，风里有桂花味，石板缝里长着细细的草。' },
+  { id: 'bench', name: '长椅', outdoor: true, adjacent: ['path'], items: [],
+    scene: '木头长椅背靠着矮墙，椅面被坐得温润，头顶正好罩着一盏灯。' },
+  { id: 'garden', name: '小花园', outdoor: true, adjacent: ['path'], items: [],
+    scene: '月见草在夜里开成一小片白，喷泉关了，只有水痕还湿着。' },
+  { id: 'store', name: '便利店', outdoor: true, adjacent: ['path', 'gate'], items: [],
+    scene: '便利店的招牌亮着，门口的快递柜闪着绿色的取件灯。' },
+  { id: 'gate', name: '小区大门', outdoor: true, adjacent: ['store'], items: [],
+    scene: '铁艺大门上挂着「月见庭」的牌子，门外是还没修完的路，走过去的路还没通。' },
+]
+
 // 家当编辑上限（HOUSE_DESIGN §2）：一个房间最多几件、名字/状态多长、数量多大。
 // 校验从严：主人手滑当场报错，脏数据别写进账本（账本坏了代价比报错大得多）。
 export const ITEMS_MAX = 50
@@ -85,7 +112,13 @@ export function initialRelationsOf(companionId) {
 // （说话时房间，供唤醒校验与位置描述）
 // v4→v5（2026-09-16 HOUSE_DESIGN §1）：rooms[].items 家当（房间里的东西 + 可选状态）。迁移按
 // 房间 id 补默认稿（主人改 home.json 即可增删），不在默认表里的房间给空数组。
-export const HOME_VERSION = 6
+// v5→v6（2026-09-18 §9.18）：home.cycles 发情周期日历 + home.regime 每日随机身体状态。
+// v6→v7（2026-09-20 大地图 §2–§3）：小区「月见庭」户外节点进 rooms 同图（outdoor/scene），
+// master.atHome 布尔退休成 place 位置指针（三分支：在家 / 在小区 / 出远门）。
+export const HOME_VERSION = 7
+// 位置指针三种形态（设计 §3）。「在家」与「在小区」都是可寻址的（房间节点 / 户外节点），
+// 「出远门」退出地图（不可寻址，只剩「不在家」）——和「在小区」是不同层级，语义不要混。
+export const PLACE_KINDS = ['home', 'yard', 'away']
 // "听到"决策链阈值（草案：小玖3条/姐姐5条，待调——存 home.json 可改）
 export const HEAR_THRESHOLDS = { kyu: 3, moli: 5 }
 // 同房接话顺序：小玖活泼先抢，姐姐谦让（草案 4.5）
@@ -152,7 +185,11 @@ const CLOSE_SNAP_FILE = 'close.snapshot.json'
 function defaultHome() {
   return {
     version: HOME_VERSION,
-    rooms: DEFAULT_ROOMS.map((r) => ({ ...r, adjacent: [...r.adjacent], items: r.items.map((it) => ({ ...it })) })),
+    rooms: [...DEFAULT_ROOMS, ...DEFAULT_PLACES].map((r) => ({
+      ...r,
+      adjacent: [...r.adjacent],
+      items: r.items.map((it) => ({ ...it })),
+    })),
     characters: Object.fromEntries(
       COMPANION_IDS.map((id) => [
         id,
@@ -168,11 +205,14 @@ function defaultHome() {
           mood: null, // 挂状态（心情/神态，字符串；空=无），瞬态随位置进场景动态窗口
           conditions: [], // 持久状态（时间段）：{ id, name, startAt, endAt, cycleDays?, source?, note? }
           hear: [], // "听到"决策链缓冲（相邻动静攒存）
+          walking: [], // 同行（牵手）：此刻手拉着谁（角色 id 列表），见 walkWith；空=没牵谁
         },
       ]),
     ),
     hearThresholds: { ...HEAR_THRESHOLDS },
-    master: { atHome: false, room: null },
+    // 主人位置（§3 三层）：place 是权威，atHome/room 是派生值（兼容旧读法，随 moveMaster 同步写）。
+    // 旧数据迁移见 ensure()。
+    master: { place: { kind: 'away' }, atHome: false, room: null },
     topics: {}, // 话题状态（§9.2，片内作用域：open 时清空；跨片不延续）
     // 发情周期日历（§9.18）：每只猫一条 {gapDays, durDays, nextStart, nextEnd, jitterDays,
     // seeded, rounds}。首次结算由 settleCycles 按 CYCLE_CONFIG 错开播种，所以这里是空对象。
@@ -342,6 +382,84 @@ export function roomRelation(home, fromRoom, toRoom) {
   return room.adjacent.includes(toRoom) ? 'adjacent' : 'far'
 }
 
+// ── 户外节点（大地图 §2–§4，2026-09-20 定案）──
+
+// 整张图里唯一的一条「门」边：跨这条边才是出门 / 回家，其余移动都不算。
+// 设计上因此不用给「出门」写特判逻辑，只需在跨门时额外补语义（见 moveCharacter / moveMaster）。
+export const DOOR_EDGE = ['entry', 'unit_door']
+// 小区大门只到为止：gate 是「世界到此为止」的挂点，没有通向别处的边（设计 §2）。
+// 所以不需要门禁代码——`gate` 的 adjacent 里只有 store，走不过去。日后接商场/医院时，
+// 往这里加一条交通边即可，不返工。
+
+// 这个节点是不是户外（没标 = 室内）
+export function isOutdoorId(home, nodeId) {
+  const r = (home.rooms || []).find((x) => x && x.id === nodeId)
+  return !!(r && r.outdoor)
+}
+
+// 跨门边判定：from → to 是不是那条「门」。同一侧走来走去（屋里换房间、小区里换地方）都不算。
+export function crossesDoor(fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return false
+  return DOOR_EDGE.includes(fromId) && DOOR_EDGE.includes(toId)
+}
+
+// 门边移动的人话（账本语义 + 时间线渲染共用）
+export function doorMoveLabel(fromId, toId) {
+  if (!crossesDoor(fromId, toId)) return null
+  return toId === 'unit_door' ? '出家门' : '回家'
+}
+
+// 户外节点的一句场景描写（房间没有这一项，返回空串）
+export function placeScene(home, nodeId) {
+  const r = (home.rooms || []).find((x) => x && x.id === nodeId)
+  return r && typeof r.scene === 'string' ? r.scene.trim() : ''
+}
+
+// ── 主人位置（大地图 §3，2026-09-20 定案）──
+// place 是权威的三态指针：{kind:'home', id} 在家 / {kind:'yard', id} 在小区 / {kind:'away'} 出远门。
+// atHome / room 是派生值，moveMaster 每次同步写，旧的读法（前端、测试、主人手改的 json）
+// 全部照常可用——「在家」布尔表达不了「在小区」，所以才要加这一层，不是为了删旧的。
+
+// 位置指针（老数据没 place 时按 atHome 现推一份，不落盘）
+export function masterPlace(home) {
+  const m = (home && home.master) || {}
+  if (m.place && PLACE_KINDS.includes(m.place.kind)) return m.place
+  return m.atHome && m.room ? { kind: 'home', id: m.room } : { kind: 'away' }
+}
+
+// 主人在不在家（严格意义：屋里）。在小区不算在家——「出不出门」这件事要分得开。
+export function masterAtHome(home) {
+  return masterPlace(home).kind === 'home'
+}
+
+// 主人此刻所在的节点 id（在家、在小区都给；出远门 null）。感知/声音/时间线一律读它。
+export function masterRoomId(home) {
+  const p = masterPlace(home)
+  return p.kind === 'away' ? null : p.id || null
+}
+
+// 主人的位置人话（进角色上下文与前端状态卡）
+export function masterPlaceLabel(home) {
+  const p = masterPlace(home)
+  if (p.kind === 'away') return '不在家'
+  const where = roomName(home, p.id) || p.id
+  if (p.kind === 'yard') return '在小区·' + where
+  return '在' + where
+}
+
+// 写位置指针（唯一入口：place 与派生值一起写，别的地方不许单独改 master.room）
+export function setMasterPlace(home, place) {
+  const p = place && PLACE_KINDS.includes(place.kind) ? place : { kind: 'away' }
+  const rid = p.kind === 'away' ? null : p.id || null
+  home.master = {
+    ...home.master,
+    place: { ...p },
+    atHome: p.kind === 'home',
+    room: rid,
+  }
+  return home.master.place
+}
+
 // ── 说话音量（§9.16，2026-09-16 落地的 9/15 待办）──
 // 离散三档（连续值语义不清："0.7 的声音是什么声音啊"）：
 //   小声 = 悄悄话，只出这一间屋子（同房听得见，隔壁听不见）
@@ -369,20 +487,41 @@ export function sayVolume(v) {
 // 同房（steps=0）永远真切——同一屋檐下，再小的声音也听得见，小声只是不出屋；
 // 隔墙则看衰减后的档位：≥1 真切 / 0 隐约 / <0 听不见。
 // gripped = 真切到"当场抓住注意力"（隔着一堵墙且不被忙碌削掉）——调度层据此立刻唤醒。
-export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy) {
+//
+// 户外补丁（大地图 §6，2026-09-20 主人定案）：只改两个系数 + 一个特例，三层模型本身不动。
+//   ① 户外相邻 = 听得清：室内「隔一堵墙只闻动静」的直觉（steps 1）在开阔地不成立——
+//      长椅上说的话，步道上的人本来就该听清。所以说话人与听者都在户外时 steps 由 1 降到 0，
+//      只在「正常 / 大声」生效：小声是贴着耳朵的悄悄话，出不了所在的那个节点（风会把气声吹散），
+//      牵手的人同节点听得见靠的是特例③，不是这一条。
+//   ② 大声在户外 = 同节点 + 一跳邻居（不是室内那条「全屋 clear」）：楼下喊一声，
+//      她在三楼窗口探出头；步道那头（两跳）听不见。
+//   ③ 牵手的特例（intimate）：同行成员在同一节点时，小声也算真切——这是「牵手说的悄悄话」
+//      的听觉载体（见 walkWith / walkingGroup）。传的是「说话人与听者此刻牵着手」。
+// 室内一个字都不变：两个 outdoor 判定都要求双方都在户外。
+export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy, intimate) {
   const vol = sayVolume(volume)
   const rel = roomRelation(home, speakingRoom, listenerRoom)
-  const steps = SAY_RELATION_STEPS[rel] === undefined ? 2 : SAY_RELATION_STEPS[rel]
-  // 大声的简化版（2026-09-20 主人定）：喊一嗓子全屋都听得清清楚楚，不再按距离衰减
+  let steps = SAY_RELATION_STEPS[rel] === undefined ? 2 : SAY_RELATION_STEPS[rel]
+  // ① 户外相邻不减档（开阔地，不是隔墙）
+  const bothOutdoor =
+    steps === 1 && isOutdoorId(home, speakingRoom) && isOutdoorId(home, listenerRoom)
+  if (bothOutdoor && vol !== '小声') steps = 0
+  // 大声的简化版（2026-09-20 主人定）：室内喊一嗓子全屋都听得清清楚楚，不再按距离衰减
   // （同房 / 隔壁 / 再远一律 clear）。只有「当场惊动」（gripped）仍看距离与忙碌：
   // 隔壁且不忙 → 当场叫醒；埋头做事的（忙碌降半档）和远处的只听得清、不被打断。
   if (vol === '大声') {
+    // 户外（②）：同节点 + 一跳邻居才听得清，再远听不见。远处的静默不惊动任何人。
+    if (isOutdoorId(home, speakingRoom) && steps >= 2) {
+      return { level: 'silent', steps, notch: SAY_VOLUME_NOTCH[vol] - steps, gripped: false }
+    }
     return { level: 'clear', steps, notch: SAY_VOLUME_NOTCH[vol] - steps, gripped: steps === 1 && !listenerBusy }
   }
   let notch = SAY_VOLUME_NOTCH[vol] - steps
   // 忙碌降半档：只降"真切"那一档（大声）、且只降隔墙听见的（同房不降）
   const damped = steps >= 1 && !!listenerBusy && notch >= 1
   if (damped) notch -= 1
+  // ③ 牵手的特例：同节点同行时，小声也真切（悄悄话贴着耳朵说）
+  if (intimate && steps === 0) notch = Math.max(notch, 1)
   if (notch < 0) return { level: 'silent', steps, notch, gripped: false }
   if (steps === 0) return { level: 'clear', steps, notch, gripped: false }
   if (notch >= 1) return { level: 'clear', steps, notch, gripped: true }
@@ -725,9 +864,10 @@ export function hearReadyOf(home, charId, now) {
 
 // 自主闸门控（纯函数，2026-09-13 主人定）：主人离家 → 照旧跑（不想要就直接待在
 // 离家状态的那个"主人出门"上别切回来）；主人在家 → 只有 homeOn 开关打开才跑。
+// 大地图 §3 口径：只有「出远门」（退出地图）才算离家——主人在小区里还是能寻址的，
+// 跟在家同一档（不然主人刚出单元门，家里的猫就自己开趴了）。
 export function autonomyEnabled(home) {
-  const atHome = !!(home && home.master && home.master.atHome)
-  if (!atHome) return true
+  if (masterPlace(home).kind === 'away') return true
   return !!(home && home.autonomy && home.autonomy.homeOn)
 }
 
@@ -1419,6 +1559,40 @@ export class CatNest {
           changed = true
         }
       }
+      // v6 → v7 迁移（大地图 §3）：户外节点进图 + 主人位置三态。
+      // 户外节点按 id 补进 home.rooms（已有同 id 的以文件为准，主人手改的优先）——
+      // 和小区的名字一样，主人改 home.json 就能改节点名与场景描写。
+      for (const p of DEFAULT_PLACES) {
+        if (!home.rooms.some((r) => r && r.id === p.id)) {
+          home.rooms.push({ ...p, adjacent: [...p.adjacent], items: p.items.map((it) => ({ ...it })) })
+          changed = true
+        }
+      }
+      // 主人位置：旧数据的 atHome 布尔退休成 place 指针。三分支——
+      //   atHome:true + room → 在家；atHome:false → 出远门。**不动主人攒的数据**，
+      //   迁移后 atHome/room 继续当派生值同步写，旧读法照常可用。
+      const m = home.master || {}
+      if (!m.place || typeof m.place !== 'object' || !PLACE_KINDS.includes(m.place.kind)) {
+        m.place = m.atHome && m.room ? { kind: 'home', id: m.room } : { kind: 'away' }
+        changed = true
+      }
+      // 派生值补齐（老文件可能只有 place 没有 atHome；也要防主人手改一半）
+      {
+        const at = m.place && m.place.kind === 'home'
+        const rid = m.place && m.place.kind !== 'away' && m.place.id ? m.place.id : null
+        if (!!m.atHome !== at || (m.room || null) !== rid) {
+          m.atHome = at
+          m.room = rid
+          changed = true
+        }
+      }
+      home.master = m
+      for (const ch of Object.values(home.characters)) {
+        if (ch && typeof ch === 'object' && !Array.isArray(ch.walking)) {
+          ch.walking = []
+          changed = true
+        }
+      }
       if (home.version !== HOME_VERSION) {
         home.version = HOME_VERSION
         changed = true
@@ -1570,19 +1744,27 @@ export class CatNest {
   }
 
   async moveCharacter(id, roomId) {
-    return this.mutate(async () => {
+    // 同 moveMaster：T7 觉察必须在 mutate 链外面发（notice 自己也走 mutate，会自锁）
+    const r = await this.mutate(async () => {
       await this.requireOpen()
       const home = await this.home()
       const ch = home.characters[id]
       if (!ch) throw new Error(`角色 "${id}" 不存在`)
       const room = home.rooms.find((r) => r.id === roomId)
-      if (!room) throw new Error(`房间 "${roomId}" 不存在`)
+      if (!room) throw new Error(`地点 "${roomId}" 不存在`)
       const from = ch.room
       ch.room = roomId
       await this.saveHome(home)
-      await this.log('move', { char: id, from, to: roomId })
-      return { char: id, from, to: roomId }
+      // 跨门边补语义（大地图 §4）：整张图只有 entry↔unit_door 一条门边，
+      // 走别的路（屋里换房间、小区里换地方）都不带 door 字段。
+      const door = doorMoveLabel(from, roomId)
+      await this.log('move', { char: id, from, to: roomId, ...(door ? { door } : {}) })
+      return { char: id, from, to: roomId, door: door || null, outdoor: !!room.outdoor }
     })
+    // T7 相遇觉察（设计 §8）：走到有人待着的地方，在场的人会看见你
+    const home = await this.home()
+    r.noticed = await this.noticeArrival(home, id, r.from, r.to)
+    return r
   }
 
   async setActivity(id, activity, durationMin) {
@@ -1820,24 +2002,132 @@ export class CatNest {
   }
 
   async moveMaster(roomId) {
+    // 注意：moveMaster / moveCharacter 自己就在 mutate 串行链里，**不能再调同样走 mutate 的
+    // 方法**（notice / log 都走）——那会在链上等自己，直接死锁（2026-09-20 实测：
+    // moveMaster('living') 挂住不返回，测试 30s 超时）。所以 T7 觉察放在 mutate 外面。
+    const r = await this.mutate(async () => {
+      await this.requireOpen()
+      const home = await this.home()
+      const fromId = masterRoomId(home)
+      if (roomId === null || roomId === undefined || roomId === '') {
+        // 出远门 = 退出地图（不可寻址）；和「在小区」不是一回事（设计 §3）
+        setMasterPlace(home, { kind: 'away' })
+        await this.saveHome(home)
+        await this.log('master-move', { from: fromId, to: null })
+        return { place: home.master.place, room: null, label: '不在家', from: fromId, to: null }
+      }
+      const room = home.rooms.find((r) => r.id === roomId)
+      if (!room) throw new Error(`地点 "${roomId}" 不存在`)
+      const kind = room.outdoor ? 'yard' : 'home'
+      setMasterPlace(home, { kind, id: roomId })
+      await this.saveHome(home)
+      const door = doorMoveLabel(fromId, roomId)
+      await this.log('master-move', { from: fromId, to: roomId, ...(door ? { door } : {}) })
+      return { place: home.master.place, room: roomId, label: masterPlaceLabel(home), from: fromId, to: roomId }
+    })
+    // T7 相遇觉察（设计 §8）：主人走到有人待着的地方，在场的人会看见他
+    if (r.to) {
+      const home = await this.home()
+      r.noticed = await this.noticeArrival(home, 'master', r.from, r.to)
+    }
+    const { from, to, ...out } = r
+    return out
+  }
+
+  // 牵手 / 松手（大地图 §6，2026-09-20 定案）：不是位置绑定，只是「谁和谁牵着手」。
+  // 效果很小、很确定：同行的人在同一节点时，小声也算真切（说悄悄话贴着耳朵）。
+  // 跟着走是分开的事——她得自己调 move_to（设计 §5：不做瞬移绑定）。
+  async walkWith(id, other) {
     return this.mutate(async () => {
       await this.requireOpen()
       const home = await this.home()
-      if (roomId === null || roomId === undefined || roomId === '') {
-        const from = home.master
-        home.master = { atHome: false, room: null }
-        await this.saveHome(home)
-        await this.log('master-move', { from: from.room, to: null })
-        return { atHome: false, room: null }
+      const who = other === null || other === undefined || other === '' ? null : String(other)
+      const ids = ['master', ...Object.keys(home.characters || {})]
+      if (!ids.includes(id)) throw new Error(`角色 "${id}" 不存在`)
+      if (who !== null && !ids.includes(who)) throw new Error(`角色 "${who}" 不存在`)
+      if (who === id) throw new Error('不能和自己牵手')
+      // 双向对称写：她拉着谁，对方也拉着她（牵手是相互的，不是单方面的跟随标记）。
+      // master 侧记在 home.master.walking（主人在猫窝里没有角色对象）。
+      const setList = (ownerId, list) => {
+        if (ownerId === 'master') {
+          home.master.walking = list
+        } else if (home.characters[ownerId]) {
+          home.characters[ownerId].walking = list
+        }
       }
-      const room = home.rooms.find((r) => r.id === roomId)
-      if (!room) throw new Error(`房间 "${roomId}" 不存在`)
-      const from = home.master.room
-      home.master = { atHome: true, room: roomId }
+      const listOf = (ownerId) =>
+        ownerId === 'master'
+          ? Array.isArray(home.master.walking)
+            ? home.master.walking
+            : []
+          : home.characters[ownerId] && Array.isArray(home.characters[ownerId].walking)
+            ? home.characters[ownerId].walking
+            : []
+      if (who === null) {
+        for (const x of listOf(id)) setList(x, listOf(x).filter((y) => y !== id))
+        setList(id, [])
+      } else {
+        if (!listOf(id).includes(who)) setList(id, [...listOf(id), who])
+        if (!listOf(who).includes(id)) setList(who, [...listOf(who), id])
+      }
       await this.saveHome(home)
-      await this.log('master-move', { from, to: roomId })
-      return { atHome: true, room: roomId }
+      const label = (x) => (x === 'master' ? '主人' : charName(home, x) || x)
+      await this.log('walk', { char: id, with: who, on: who !== null })
+      return {
+        char: id,
+        with: who,
+        walking: [...listOf(id)],
+        text:
+          who === null
+            ? '松开了牵着的手。'
+            : '牵上了' + label(who) + '的手（一起走的时候，小声说话也听得真切）。',
+      }
     })
+  }
+
+  // 两人的同行关系（供 say 判定「牵手」与 presence 渲染）。任一方向记着就算牵着。
+  handInHand(home, a, b) {
+    const listOf = (id) => {
+      if (id === 'master') return Array.isArray(home.master && home.master.walking) ? home.master.walking : []
+      const ch = home.characters && home.characters[id]
+      return ch && Array.isArray(ch.walking) ? ch.walking : []
+    }
+    return listOf(a).includes(b) || listOf(b).includes(a)
+  }
+
+  // 同一节点 + 牵着手的同行成员（presence 渲染「你们正牵着手」用）
+  walkingGroup(home, charId) {
+    const myRoom = (home.characters && home.characters[charId] && home.characters[charId].room) || null
+    const masterRoom = masterRoomId(home)
+    const together = (id) => {
+      if (id === 'master') return !!myRoom && masterRoom === myRoom
+      const ch = home.characters && home.characters[id]
+      return !!(ch && myRoom && ch.room === myRoom)
+    }
+    return (Array.isArray(home.characters[charId] && home.characters[charId].walking)
+      ? home.characters[charId].walking
+      : []
+    ).filter((x) => this.handInHand(home, charId, x) && together(x))
+  }
+
+  // T7（大地图 §8，2026-09-20 定案）：有人走进你在的地方 → 你觉察到了。
+  // 相遇本身就是事件（在长椅那边看见她），现有 T1/T2/T3/T6 里没有这一条。
+  // 只通告「已经在场的人」：走过来的那个人自己看得见在场有谁（presence 里有全员位置），
+  // 不用再给一份。同行的两个人不互相通告（本来就手拉手）。
+  async noticeArrival(home, mover, fromId, toId) {
+    const present = Object.values(home.characters || {}).filter((c) => c && c.id !== mover && c.room === toId)
+    const moverName = mover === 'master' ? '主人' : charName(home, mover) || mover
+    const place = roomName(home, toId) || toId
+    const out = []
+    for (const c of present) {
+      if (this.handInHand(home, mover, c.id)) continue
+      // 通知文案不省略名字：out.of.context 时「你看见主人了」比「走进了客厅」清楚得多
+      // （实测：主人从外面进来那一版少个主语，读起来像半句话）
+      const fromTxt = fromId ? '从' + (roomName(home, fromId) || fromId) : '从外面'
+      await this.notice(c.id, 'scene', fromTxt + '走进来了：' + moverName + '到了' + place + '，你看见' + moverName + '了', true)
+      out.push(c.id)
+    }
+    return out
   }
 
   async adjustRelation(pair, field, delta) {
@@ -1861,10 +2151,7 @@ export class CatNest {
   // ── 家物理：对话流 ──
 
   locateRoom(home, who) {
-    if (who === 'master') {
-      const m = home.master
-      return m && m.atHome ? m.room : null
-    }
+    if (who === 'master') return masterRoomId(home)
     const ch = home.characters && home.characters[who]
     return ch ? ch.room : null
   }
@@ -1884,8 +2171,10 @@ export class CatNest {
       else if (lvl === 'adjacent') adjacent.push(id)
       else far.push(id)
     }
-    if (includeMaster && home.master && home.master.atHome && home.master.room && home.master.room !== excludeWho) {
-      const lvl = roomRelation(home, roomId, home.master.room)
+    // 主人在小区里也是可寻址的（大地图 §3）：声音、时间线、面板一视同仁。
+    const mRoom = masterRoomId(home)
+    if (includeMaster && mRoom && mRoom !== excludeWho) {
+      const lvl = roomRelation(home, roomId, mRoom)
       if (lvl === 'same') direct.push('master')
       else if (lvl === 'adjacent') adjacent.push('master')
       else far.push('master')
@@ -1948,7 +2237,9 @@ export class CatNest {
     for (const [id, ch] of Object.entries(home.characters || {})) {
       if (ch && ch.room) positions[id] = ch.room
     }
-    if (home.master && home.master.atHome && home.master.room) positions.master = home.master.room
+    // 主人在小区里也记位置（大地图 §3）：她走到步道上，账本里就该是「步道上」。
+    const masterRoom = masterRoomId(home)
+    if (masterRoom) positions.master = masterRoom
     const around = this.perceiveAround(home, room, who !== 'master', who)
     // 听觉判定（§9.16 声学模型）：每穿一堵墙降一档；正在忙的听者再降一档（「工作状态下
     // 隔壁的大声降半档」）。≥1 真切 / 0 隐约 / <0 听不见。同房永远真切（同一屋檐下，
@@ -1963,9 +2254,11 @@ export class CatNest {
     // 进缓冲、当场叫醒（urgent）的规矩照旧。
     const loud = []
     for (const id of [...around.direct, ...around.adjacent, ...around.far]) {
-      const lroom = id === 'master' ? (home.master && home.master.room) : (home.characters[id] && home.characters[id].room)
+      const lroom = id === 'master' ? masterRoomId(home) : (home.characters[id] && home.characters[id].room)
       const busy = id === 'master' ? false : isBusy(home.characters[id], now)
-      const p = sayPerceive(home, room, lroom, vol, busy)
+      // 牵手特例（大地图 §6）：说话人与听者此刻牵着手的，小声也算真切
+      const intimate = id !== who && this.handInHand(home, who, id)
+      const p = sayPerceive(home, room, lroom, vol, busy, intimate)
       if (p.level === 'silent') {
         silent.push(id)
       } else if (p.level === 'clear' && p.steps === 0) {
@@ -2378,7 +2671,17 @@ export class CatNest {
       if (!a) throw new Error('about 话题短语不能为空')
       const home = await this.home()
       const r = topicEndState(home, this.now(), charId, a)
-      if (!r.key) throw new Error('没有你参与的「' + a + '」话题')
+      if (!r.key) {
+        // 幂等收（§9.20，2026-09-20 主人拍板）：话题已经收掉了，再收一次算成功。实测
+        // agent-debug.log 里 23 次工具失败有 16 次是模型反复去收同一个已经结束的话题
+        // （「今晚的加菜」「那版曲线」），回执报错只会让它以为没收成、下一轮再试一次。
+        // 只对「确实存在且已 ended」放行：话题不存在、或调用方不是参与方，照旧报错（门禁不变）。
+        const done = (home.topics || {})[topicKey(a)]
+        if (done && done.status === 'ended') {
+          return { char: charId, about: a, verdict: 'already-ended', said: null }
+        }
+        throw new Error('没有你参与的「' + a + '」话题')
+      }
       await this.log('topic-end', { char: charId, about: a, ...(typeof text === 'string' && text.trim() ? { text: text.trim() } : {}) })
       let said = null
       if (typeof text === 'string' && text.trim()) {
@@ -2485,12 +2788,21 @@ export class CatNest {
   async scene(who) {
     const home = await this.home()
     if (who === 'master') {
-      const m = home.master
-      if (!m || !m.atHome) {
+      // 大地图 §3：主人在小区里也能看（可寻址）；只有出远门才是一张空视角。
+      // atHome 保留在回执里（严格意义的「在屋里」），place 是新的一层。
+      const p = masterPlace(home)
+      if (p.kind === 'away') {
         const all = Object.keys(home.characters || {})
-        return { who: 'master', atHome: false, room: null, direct: [], adjacent: [], far: all }
+        return { who: 'master', place: p, atHome: false, room: null, label: '不在家', direct: [], adjacent: [], far: all }
       }
-      return { who: 'master', atHome: true, room: m.room, ...this.perceiveAround(home, m.room, false, 'master') }
+      return {
+        who: 'master',
+        place: p,
+        atHome: p.kind === 'home',
+        room: p.id,
+        label: masterPlaceLabel(home),
+        ...this.perceiveAround(home, p.id, false, 'master'),
+      }
     }
     const ch = home.characters && home.characters[who]
     if (!ch) throw new Error(`角色 "${who}" 不存在`)

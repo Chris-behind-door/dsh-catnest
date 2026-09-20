@@ -3,14 +3,21 @@
      用途：前端存在感 UI / 文档配图。所有房间以 <g id="room-<id>"> 分组，
      坐标可直接 innerHTML 注入页面。房间几何关系与 home.json 的 adjacent 表一致：
      living 邻 entry/kitchen/balcony/study/bedroom；bedroom 邻 living/bath；bath 只邻 bedroom（最深）。
-     角色位置可用 <circle> 叠加（见下方 kyu/moli 示例）。 -->
-<svg xmlns="http://www.w3.org/2000/svg" width="760" height="720" viewBox="0 0 760 720" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif">
+     角色位置可用 <circle> 叠加（见下方 kyu/moli 示例）。
+     大地图 §2（2026-09-20）：右侧那一栏是小区「月见庭」的户外节点（unit_door/path/bench/
+     garden/store/gate），与房间同属 home.rooms（outdoor:true）。玄关与单元门口之间那条虚线
+     是全图唯一的「门边」：跨它才算出门/回家。屋内几何一个字没动，画布只往右加宽到 1140。 -->
+<svg xmlns="http://www.w3.org/2000/svg" width="1140" height="720" viewBox="0 0 1140 720" font-family="'PingFang SC','Noto Sans CJK SC','Microsoft YaHei',sans-serif">
   <title>猫窝户型平面图</title>
   <desc>七个房间：玄关、客厅、厨房、阳台、书房、卧室、浴室。客厅为中心，浴室为最深私密位。</desc>
 
   <!-- 背景 -->
   <rect x="0" y="0" width="760" height="720" fill="#fdf6ec"/>
   <rect x="16" y="16" width="728" height="688" rx="18" fill="#faf0e0" stroke="#e3d3b8" stroke-width="2"/>
+  <!-- 小区那一栏（月见庭）：和屋里同一张图，中间是那条唯一的门边 entry↔unit_door -->
+  <rect x="764" y="16" width="360" height="688" rx="18" fill="#eef3ea" stroke="#c3d3bd" stroke-width="2"/>
+  <text x="944" y="48" text-anchor="middle" font-size="18" font-weight="bold" fill="#4d6b45">月 见 庭</text>
+  <text x="944" y="70" text-anchor="middle" font-size="11" fill="#7d9478">小区 · 黄昏的路灯是暖黄色的</text>
 
   <!-- 房间（底色 + 墙线 + 名称 + 功能） -->
 
@@ -96,6 +103,67 @@
   <g id="door-bath-bedroom">
     <rect x="327" y="524" width="46" height="12" fill="#faf0e0"/>
     <path d="M327 536 q23 26 46 0" fill="none" stroke="#a58a63" stroke-width="2"/>
+  </g>
+
+  <!-- ── 小区「月见庭」（大地图 §2）：户外节点，与房间同图 ── -->
+
+  <!-- 门边（全图唯一）：玄关 → 单元门口。跨这条边才算出门 / 回家 -->
+  <g id="door-entry-unit_door">
+    <path d="M394 105 H 800" fill="none" stroke="#a58a63" stroke-width="2" stroke-dasharray="7 6"/>
+    <rect x="404" y="96" width="18" height="18" rx="3" fill="#faf0e0" stroke="#a58a63" stroke-width="2"/>
+    <text x="470" y="92" text-anchor="middle" font-size="11" fill="#a58a63">门边（出家门 / 回家）</text>
+  </g>
+
+  <!-- 单元门口的连线（步道 → 长椅 / 小花园 / 便利店，便利店 → 小区大门） -->
+  <g id="yard-edges" fill="none" stroke="#b9c9b2" stroke-width="2">
+    <path d="M900 347 V 247"/>
+    <path d="M900 347 H 1090 V 427"/>
+    <path d="M900 347 H 710 V 427"/>
+    <path d="M900 347 H 1010 V 517 H 900 V 607"/>
+  </g>
+
+  <!-- 单元门口：门内是玄关，门外就是小区了 -->
+  <g id="room-unit_door" data-name="单元门口">
+    <rect x="810" y="105" width="180" height="90" rx="12" fill="#e7ecdf" stroke="#8fa884" stroke-width="3"/>
+    <text x="900" y="142" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">单元门口</text>
+    <text x="900" y="166" text-anchor="middle" font-size="11" fill="#718a68">玻璃上贴着褪色的通知</text>
+  </g>
+
+  <!-- 步道·路灯（验收②：有路灯） -->
+  <g id="room-path" data-name="步道">
+    <rect x="810" y="247" width="180" height="100" rx="12" fill="#eef1e0" stroke="#8fa884" stroke-width="3"/>
+    <text x="900" y="286" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">步道 · 路灯</text>
+    <text x="900" y="310" text-anchor="middle" font-size="11" fill="#718a68">暖黄路灯 · 风里有桂花味</text>
+    <circle cx="828" cy="266" r="5" fill="#f6d98a" stroke="#c9a94e" stroke-width="1.5"/>
+    <circle cx="972" cy="266" r="5" fill="#f6d98a" stroke="#c9a94e" stroke-width="1.5"/>
+  </g>
+
+  <!-- 长椅（验收③：有长椅） -->
+  <g id="room-bench" data-name="长椅">
+    <rect x="1000" y="427" width="180" height="90" rx="12" fill="#f3ebdc" stroke="#8fa884" stroke-width="3"/>
+    <text x="1090" y="464" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">长椅</text>
+    <text x="1090" y="488" text-anchor="middle" font-size="11" fill="#718a68">椅面被坐得温润</text>
+  </g>
+
+  <!-- 小花园 -->
+  <g id="room-garden" data-name="小花园">
+    <rect x="620" y="427" width="180" height="90" rx="12" fill="#e8f0e0" stroke="#8fa884" stroke-width="3"/>
+    <text x="710" y="464" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">小花园</text>
+    <text x="710" y="488" text-anchor="middle" font-size="11" fill="#718a68">月见草夜里开成一小片白</text>
+  </g>
+
+  <!-- 便利店 · 快递柜 -->
+  <g id="room-store" data-name="便利店">
+    <rect x="810" y="517" width="180" height="90" rx="12" fill="#eef0e8" stroke="#8fa884" stroke-width="3"/>
+    <text x="900" y="554" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">便利店</text>
+    <text x="900" y="578" text-anchor="middle" font-size="11" fill="#718a68">招牌亮着 · 快递柜亮绿灯</text>
+  </g>
+
+  <!-- 小区大门：世界到此为止（设计 §2：周边留接口不实现） -->
+  <g id="room-gate" data-name="小区大门">
+    <rect x="810" y="607" width="180" height="90" rx="12" fill="#ece6d8" stroke="#8fa884" stroke-width="3" stroke-dasharray="8 5"/>
+    <text x="900" y="644" text-anchor="middle" font-size="17" font-weight="bold" fill="#43583a">小区大门</text>
+    <text x="900" y="668" text-anchor="middle" font-size="11" fill="#718a68">「月见庭」的牌子 · 门外的路还没通</text>
   </g>
 
   <!-- 角色坐标（当前站位示例：小玖、墨璃在客厅；主人外出）
