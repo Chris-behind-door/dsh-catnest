@@ -1,0 +1,79 @@
+{
+  "note": "猫窝家景背景图，Qwen-Image 2.1 生成（2026-09-20）。2K 母版在 ~/.dsh/studio/catnest_<id>.png，本目录是其 1600x900 WebP 版本。",
+  "generator": {
+    "model": "Qwen-Image 2.1 (ComfyUI int8_convrot)",
+    "steps": 25,
+    "cfg": 1.0,
+    "sampler": "euler/simple",
+    "style": "公共风格前缀 + 各房家具描述",
+    "seeds": {
+      "entry": 7003,
+      "other": "111222"
+    }
+  },
+  "rooms": [
+    {
+      "id": "entry",
+      "name": "玄关",
+      "file": "entry.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_entry.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "living",
+      "name": "客厅",
+      "file": "living.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_living.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "study",
+      "name": "书房",
+      "file": "study.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_study.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "kitchen",
+      "name": "厨房",
+      "file": "kitchen.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_kitchen.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "bedroom",
+      "name": "卧室",
+      "file": "bedroom.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_bedroom.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "bath",
+      "name": "浴室",
+      "file": "bath.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_bath.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "balcony",
+      "name": "阳台",
+      "file": "balcony.webp",
+      "width": 1600,
+      "height": 900,
+      "master": "~/.dsh/studio/catnest_balcony.png",
+      "master_size": "2048x1152"
+    }
+  ]
+}
