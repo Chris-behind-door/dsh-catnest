@@ -527,7 +527,7 @@ test('say：同房直接听到 / 相邻进缓冲 / 远处无感，主人视角�
   }
 })
 
-test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切并当场叫人 / 再远隐约 / 忙碌降半档', async () => {
+test('say 音量：小声不出屋 / 大声全屋清晰（2026-09-20 简化版）/ 隔壁当场叫人 / 忙碌不被打断', async () => {
   const { nest, cleanup } = await mk()
   try {
     await nest.open()
@@ -539,39 +539,44 @@ test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切并当场叫�
     assert.equal(r1.volume, '小声')
     assert.deepEqual(r1.faint, [], '隔壁不该隐约听见')
     assert.ok(r1.silent.includes('moli'), r1)
+    assert.deepEqual(r1.loud, [], '小声不进清晰名单')
     assert.equal((await nest.hear('moli')).buffer.length, 0)
     assert.equal(r1.direct.includes('master'), true, '同房照旧听得见（小声不出屋，不是没声音）')
     const row1 = (await nest.transcript()).lines.filter((l) => l.type === 'say').pop()
     assert.equal(row1.volume, '小声', '音量入账，供时间线与字体渲染')
     assert.deepEqual(row1.audience.silent, ['moli'])
-    // 2) 大声 = 喊一声：隔壁听得真切（进缓冲 + urgent 立刻叫人），再远一间的隐约听得到
+    // 2) 大声 = 喊一嗓子：隔壁听得真切（进缓冲 + urgent 立刻叫人），全屋都进清晰名单
     await nest.moveCharacter('kyu', 'living')
     const r2 = await nest.say('kyu', '姐姐——！', undefined, undefined, '大声')
     assert.equal(r2.volume, '大声')
     assert.ok(r2.faint.includes('moli'), '隔壁听得见')
     assert.ok(r2.urgent.includes('moli'), '隔壁真切到当场叫人（不等缓冲攒够）')
+    assert.ok(r2.loud.includes('moli'), '大声：隔壁也进清晰名单')
     assert.equal((await nest.hear('moli')).buffer.length, 1)
-    // 远处（卧室→厨房隔着客厅）
+    // 远处（卧室→厨房隔着客厅）：简化版下也是清清楚楚，只是不当场叫人
     await nest.moveCharacter('moli', 'bedroom')
     await nest.moveCharacter('kyu', 'kitchen')
     const r3 = await nest.say('kyu', '喊一声试试', undefined, undefined, '大声')
-    assert.ok(r3.faint.includes('moli'), '大声到远处变隐约（听得见）')
-    assert.ok(!r3.urgent.includes('moli'), '远处不真切，不当场叫人')
+    assert.ok(r3.faint.includes('moli'), '大声到远处照样听得见（进缓冲）')
+    assert.ok(r3.loud.includes('moli'), '大声：再远一间也听得清清楚楚（不再降成隐约）')
+    assert.ok(!r3.urgent.includes('moli'), '远处不真切，不当场叫人（不打断）')
     await nest.resolveHear('moli', 'ignore')
-    // 3) 忙碌降半档：埋头做事的猫，隔壁的大声落到"隐约"，不被一嗓子打断
+    // 3) 忙碌：埋头做事的猫听见了，但不被一嗓子打断（工作状态下隔壁的大声不降"听没听见"）
     await nest.moveCharacter('kyu', 'living')
     await nest.moveCharacter('moli', 'kitchen')
     await nest.setActivity('moli', '修bug', 60)
     const r4 = await nest.say('kyu', '姐姐，吃饭啦！', undefined, undefined, '大声')
     assert.ok(r4.faint.includes('moli'), '忙也听得见（进缓冲）')
-    assert.ok(!r4.urgent.includes('moli'), '忙 → 不当场叫醒（工作状态下隔壁的大声降半档）')
+    assert.ok(r4.loud.includes('moli'), '忙也听得清清楚楚')
+    assert.ok(!r4.urgent.includes('moli'), '忙 → 不当场叫醒（工作状态下隔壁的大声不打断她）')
     const row4 = (await nest.transcript()).lines.filter((l) => l.type === 'say').pop()
-    assert.ok(!row4.audience.silent.includes('moli'), '降半档不等于听不见——不会变成"一忙就聋"')
+    assert.ok(!row4.audience.silent.includes('moli'), '忙碌不等于听不见，不会变成"一忙就聋"')
     // 正常音量在忙碌时行为不变（老规矩：隐约 + 攒阈值）
     await nest.resolveHear('moli', 'ignore')
     const r5 = await nest.say('kyu', '随口一句', undefined, undefined, '正常')
     assert.ok(r5.faint.includes('moli'))
     assert.deepEqual(r5.urgent, [])
+    assert.deepEqual(r5.loud, [], '正常音量不进清晰名单')
     // 非法音量按正常处理
     const r6 = await nest.say('kyu', '乱传的音量', undefined, undefined, '超级大声')
     assert.equal(r6.volume, '正常')

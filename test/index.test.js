@@ -2918,7 +2918,7 @@ test('say 工具带 volume（§9.16）：角色喊一声 → 隔壁被当场唤�
   }
 })
 
-test('POST say 音量（§9.16）：小声=耳语不出屋；大声=隔壁听得清并当场被叫醒', async () => {
+test('POST say 音量：小声=耳语不出屋；大声=全屋清晰（2026-09-20 简化版）并当场叫醒隔壁', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-mvol-'))
   const ws = webServerStub()
   const prompts = []
@@ -2955,8 +2955,8 @@ test('POST say 音量（§9.16）：小声=耳语不出屋；大声=隔壁听得
     await until(() => prompts.some((p) => p.system.includes('成员墨璃') && p.user.includes('姐姐——！')))
     const moliPrompt = prompts.find((p) => p.system.includes('成员墨璃') && p.user.includes('姐姐——！'))
     assert.ok(
-      moliPrompt.user.includes('（客厅传来主人的喊声：）'),
-      '隔墙的真切在时间线里写成「喊声」，且不显示动作（看不见形态）：' + moliPrompt.user.slice(-400),
+      moliPrompt.user.includes('主人（大声）：姐姐——！'),
+      '2026-09-20 简化版：大声全屋清晰，隔墙也按听得清的口径入账（不再弱化成「传来…的喊声」）：' + moliPrompt.user.slice(-400),
     )
     // 小声那句不进隔壁的时间线（耳语就是耳语）
     assert.ok(!moliPrompt.user.includes('姐姐，只跟你说'), '耳语不出现在隔壁的时间线里')

@@ -370,9 +370,16 @@ export function sayVolume(v) {
 // 隔墙则看衰减后的档位：≥1 真切 / 0 隐约 / <0 听不见。
 // gripped = 真切到"当场抓住注意力"（隔着一堵墙且不被忙碌削掉）——调度层据此立刻唤醒。
 export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy) {
+  const vol = sayVolume(volume)
   const rel = roomRelation(home, speakingRoom, listenerRoom)
   const steps = SAY_RELATION_STEPS[rel] === undefined ? 2 : SAY_RELATION_STEPS[rel]
-  let notch = SAY_VOLUME_NOTCH[sayVolume(volume)] - steps
+  // 大声的简化版（2026-09-20 主人定）：喊一嗓子全屋都听得清清楚楚，不再按距离衰减
+  // （同房 / 隔壁 / 再远一律 clear）。只有「当场惊动」（gripped）仍看距离与忙碌：
+  // 隔壁且不忙 → 当场叫醒；埋头做事的（忙碌降半档）和远处的只听得清、不被打断。
+  if (vol === '大声') {
+    return { level: 'clear', steps, notch: SAY_VOLUME_NOTCH[vol] - steps, gripped: steps === 1 && !listenerBusy }
+  }
+  let notch = SAY_VOLUME_NOTCH[vol] - steps
   // 忙碌降半档：只降"真切"那一档（大声）、且只降隔墙听见的（同房不降）
   const damped = steps >= 1 && !!listenerBusy && notch >= 1
   if (damped) notch -= 1
@@ -1951,6 +1958,10 @@ export class CatNest {
     const faint = []
     const silent = []
     const urgent = []
+    // 大声的「清晰名单」（2026-09-20 简化版）：这句是喊出来的，隔多远都听得清清楚楚。
+    // 它只影响时间线的入账口径（渲染不弱化成「传来…的喊声」），不改缓冲与唤醒——
+    // 进缓冲、当场叫醒（urgent）的规矩照旧。
+    const loud = []
     for (const id of [...around.direct, ...around.adjacent, ...around.far]) {
       const lroom = id === 'master' ? (home.master && home.master.room) : (home.characters[id] && home.characters[id].room)
       const busy = id === 'master' ? false : isBusy(home.characters[id], now)
@@ -1960,7 +1971,8 @@ export class CatNest {
       } else if (p.level === 'clear' && p.steps === 0) {
         clear.push(id) // 同房：听得见，也看得见形态（action 给人看）
       } else if (p.level === 'clear') {
-        faint.push(id) // 隔壁大声：听得清，但还是隔着一堵墙（看不见形态）
+        faint.push(id) // 隔墙：听得清内容，但看不见形态（action 不给人看）
+        if (vol === '大声') loud.push(id) // 喊声穿墙也清晰（只有大声走这条）
         // urgent 只收角色：主人是真人（即时感知，没有 agent 回合可唤醒），不进这份名单。
         // 2026-09-19 事故：主人在隔壁时被 push 进 urgent，调度层拿它当唤醒名单，
         // enqueueTurn('master') 烧了一次 LLM 替主人回话（tryWakeHear 当时无角色守卫）。
@@ -1981,8 +1993,9 @@ export class CatNest {
       ...(about ? { about } : {}),
       positions,
       // audience = 听觉判定结果（权威）：clear 同房真切（看得见形态）/ faint 隔墙闻声
-      // （看不见形态）/ silent 完全没听见（小声不出屋就是这个）。旧行只有 clear/faint。
-      audience: { clear, faint, silent },
+      // （看不见形态）/ silent 完全没听见（小声不出屋就是这个）/ loud 大声的清晰名单
+      // （隔墙也听得清清楚楚，渲染按 clear 口径；旧行无此字段，消费侧容缺省）。
+      audience: { clear, faint, silent, loud },
     })
     const buffered = []
     for (const id of faint) {
@@ -2014,6 +2027,8 @@ export class CatNest {
       clear,
       faint,
       silent,
+      // 大声的清晰名单（2026-09-20 简化版）：隔多远都听得清清楚楚，渲染按 clear 口径
+      loud,
       urgent,
       hearReady: ready,
     }
