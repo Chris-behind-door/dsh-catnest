@@ -1,3 +1,6 @@
 assets/avatars/
 assets/homeplan.preview.png
 assets/rooms/*.webp
+
+# python 沙盒脚本的字节码缓存（2026-09-22）
+__pycache__/

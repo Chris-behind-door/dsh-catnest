@@ -3354,3 +3354,63 @@ test('§9.18 每日随机身体状态：命中写 condition（system + 自确认
     await rmSafe(dir)
   }
 })
+
+// 2026-09-22 埋点：llmStep 每步落一行诊断（首字节/总耗时/帧数/finish/正文与推理字数/usage）。
+// 起因：当天傍晚 18:39~19:00 连撞 8 次 150s 软超时，而旧日志只有「本步无结果」一行，
+// 分不清「首字节根本没来（上游排队）」还是「吐到一半停住（截断）」。
+const usageDiagStub = (text) => ({
+  stream: (opts) => {
+    const stop = hasAssistantToolCall(opts && opts.messages)
+    return (async function* () {
+      if (stop) {
+        yield { type: 'usage', usage: { inputTokens: 11, outputTokens: 22 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield { type: 'reasoning-delta', index: 0, text: '嗯……主人问的是晚饭。' }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text }) }
+      yield {
+        type: 'usage',
+        usage: { inputTokens: 15234, outputTokens: 6120, cacheReadTokens: 14000, reasoningTokens: 4300 },
+      }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
+test('llmStep 落诊断：首字节/帧数/finish 原因/正文与推理字数/usage 都进 agent-debug', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-diag-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: usageDiagStub('姐姐，汤好了') })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    const st = await svc.status()
+    await until(async () => {
+      const lines = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+      return lines.length > 0
+    })
+    const dbg = await readFile(join(dir, 'slices', st.sliceId, 'agent-debug.log'), 'utf8')
+    const tail = '实际：' + dbg.slice(-500)
+    assert.ok(/LLM 步完成：/.test(dbg), '每步落一行诊断，' + tail)
+    assert.ok(/首字节=\d+\.\ds/.test(dbg), '记首字节，' + tail)
+    assert.ok(/帧=\d+/.test(dbg), '记帧数，' + tail)
+    assert.ok(/finish=tool-calls/.test(dbg), 'finish 取 kind 而不是 [object Object]，' + tail)
+    assert.ok(!/\[object Object\]/.test(dbg), '不许出现 [object Object]，' + tail)
+    assert.ok(/推理=11字/.test(dbg), 'reasoning-delta 累计字数（11 字），' + tail)
+    assert.ok(/in=15234/.test(dbg) && /out=6120/.test(dbg) && /cache=14000/.test(dbg), 'usage 落盘，' + tail)
+  } finally {
+    await rmSafe(dir)
+  }
+})

@@ -905,7 +905,9 @@ export default {
     // 单步收集：消费一次 llm.stream，组装出 tool-call 列表 + 文本 + finish 原因。
     // 手写轻量汇聚（零 import，等价 dsh-llm BlockAssembler 的 tool-call 收敛）。
     // onSayDelta(frag)：say 工具 text 字段的解码片段（打字机直播用），可选。
-    const collectStep = async (stream, onSayDelta) => {
+    // stats：可选诊断累加器（2026-09-22 加）——首字节时刻/帧数/正文与推理字数/tool 参数字数/usage，
+    // 由 llmStep 建好传进来，超时那一刻读它就能分清「上游排队没来」还是「吐到一半停住」。
+    const collectStep = async (stream, onSayDelta, stats) => {
       const partials = new Map() // index → { id, name, args }
       const sayTrackers = new Map() // index → feed（仅 say 工具建）
       const doneByBlockEnd = new Set()
@@ -914,6 +916,10 @@ export default {
       let finish = null
       for await (const chunk of stream) {
         if (!chunk) continue
+        if (stats) {
+          stats.chunks += 1
+          if (stats.firstAt === null) stats.firstAt = Date.now()
+        }
         const t = chunk.type
         if (t === 'tool-call-delta') {
           let p = partials.get(chunk.index)
@@ -927,6 +933,7 @@ export default {
           }
           if (chunk.argumentsDelta) {
             p.args += chunk.argumentsDelta
+            if (stats) stats.argsChars += chunk.argumentsDelta.length
             const feed = sayTrackers.get(chunk.index)
             if (feed) {
               const frag = feed(chunk.argumentsDelta)
@@ -939,6 +946,11 @@ export default {
           toolCalls.push({ id: chunk.block.id, name: chunk.block.name, arguments: chunk.block.arguments })
         } else if (t === 'text-delta') {
           text += chunk.text || ''
+          if (stats) stats.textChars += (chunk.text || '').length
+        } else if (t === 'reasoning-delta') {
+          if (stats) stats.reasoningChars += (chunk.text || '').length
+        } else if (t === 'usage') {
+          if (stats && chunk.usage) stats.usage = chunk.usage
         } else if (t === 'finish') {
           finish = chunk.reason
         }
@@ -953,13 +965,51 @@ export default {
 
     // 带工具的单步流式调用：软超时后返回 null（该步视为无动作，不阻塞本轮其余角色）。
     // onSayDelta 透传给 collectStep 做打字机直播。
-    const llmStep = async (system, messages, maxTokens, onSayDelta) => {
+    // onDiag(line)：可选，把这一步的诊断写进时间片 agent-debug（2026-09-22 加）。
+    //   起因：在此之前超时只留一行「本步无结果」，分不清「首字节根本没来（上游排队）」
+    //   与「吐到一半停住（截断）」，9/22 傍晚连撞 8 次 150s 时正好卡在这个盲区，
+    //   只能靠外部复现反推。现在每步落一行：首字节/总耗时/帧数/finish/正文字数/推理字数/usage。
+    const llmStep = async (system, messages, maxTokens, onSayDelta, onDiag) => {
       const llm = ctx.get('llm')
       if (llm === undefined || typeof llm.stream !== 'function') return null
       const { provider, model } = resolveModel()
+      const startedAt = Date.now()
+      const stats = { firstAt: null, chunks: 0, textChars: 0, reasoningChars: 0, argsChars: 0, usage: null }
+      const fmt = (r) => {
+        // finish 是对象（{ kind: stop|tool-calls|max-tokens|aborted }），aborted 还带 failure
+        // 详情——那是「上游主动掐断」和「流挂着不动」的唯一分界，别拼成 [object Object]。
+        let finishText = '-'
+        const f = r && r.finish
+        if (typeof f === 'string') finishText = f
+        else if (f && typeof f === 'object') {
+          finishText = f.kind || '?'
+          if (f.kind === 'aborted' && f.failure) {
+            const fail = f.failure
+            finishText += '(' + String(fail.code || fail.message || JSON.stringify(fail)).slice(0, 80) + ')'
+          }
+        }
+        const parts = [
+          '首字节=' + (stats.firstAt === null ? '未到' : ((stats.firstAt - startedAt) / 1000).toFixed(1) + 's'),
+          '总=' + ((Date.now() - startedAt) / 1000).toFixed(1) + 's',
+          '帧=' + stats.chunks,
+          'finish=' + finishText,
+          '正文=' + stats.textChars + '字',
+          '推理=' + stats.reasoningChars + '字',
+        ]
+        const u = stats.usage
+        if (u) {
+          parts.push('in=' + u.inputTokens, 'out=' + u.outputTokens)
+          if (typeof u.cacheReadTokens === 'number') parts.push('cache=' + u.cacheReadTokens)
+          if (typeof u.reasoningTokens === 'number') parts.push('推理tok=' + u.reasoningTokens)
+        }
+        return provider + '/' + model + ' ' + parts.join(' ')
+      }
+      const diag = (line) => {
+        if (typeof onDiag === 'function') onDiag(line)
+      }
       try {
         const stream = llm.stream({ provider, model, maxTokens, system, messages, tools: AGENT_TOOLS })
-        const consume = collectStep(stream, onSayDelta)
+        const consume = collectStep(stream, onSayDelta, stats)
         let timedOut = false
         const timeoutp = new Promise((resolve) => {
           const timer = setTimeout(() => { timedOut = true; resolve() }, LLM_TIMEOUT_MS)
@@ -968,11 +1018,24 @@ export default {
         await Promise.race([consume, timeoutp])
         if (timedOut) {
           console.log('[dsh-catnest] llm 步软超时（' + LLM_TIMEOUT_MS + 'ms），该步视为无动作')
+          diag('LLM 步软超时（' + LLM_TIMEOUT_MS + 'ms）：' + fmt(null))
+          // 超时只放弃等待，底层流并没有 abort（历史行为，2026-09-22 未改）。把它的最终结局也记下来：
+          // 永远没有这一行 = 流真的挂死了；有这一行 = 其实上游会正常收尾，只是慢过了阈值。
+          void consume
+            .then((r) => {
+              diag('（超时之后）后台流收尾：' + fmt(r))
+            })
+            .catch((error) => {
+              diag('（超时之后）后台流异常结束：' + (error && error.message ? error.message : String(error)))
+            })
           return null
         }
-        return await consume
+        const result = await consume
+        diag('LLM 步完成：' + fmt(result))
+        return result
       } catch (error) {
         console.log('[dsh-catnest] llm step failed: ' + (error && error.message ? error.message : String(error)))
+        diag('LLM 步异常：' + fmt(null) + ' err=' + (error && error.message ? error.message : String(error)))
         return null
       }
     }
@@ -1459,7 +1522,9 @@ export default {
           draft += frag
           broadcast({ kind: 'delta', char: charId, text: frag })
         }
-        const result = await llmStep(system, messages, STEP_MAX_TOKENS, onSayDelta)
+        const result = await llmStep(system, messages, STEP_MAX_TOKENS, onSayDelta, (line) => {
+          void agentDebug(charId, dbgSlice, line)
+        })
         live = false
         if (started) broadcast({ kind: 'deltaEnd', char: charId, name })
         if (!result) {
