@@ -155,71 +155,82 @@ export default {
       return { provider, model }
     }
 
-    // LLM 一次性调用：返回纯文本或 null（服务缺席/失败/空输出各自留诊断日志）。
-    // 注意：推理型模型会先输出 reasoning-delta 思考块，maxTokens 太小会被思考
-    // 吃光导致正文为空，所以预算给足并在空输出时记日志便于排查。
-    // diag（可选）：把失败原因与本次 provider/model 带出来，供收尾蒸馏写进 summary.json
-    // （2026-09-23 加：此前只落 text/at，外部看不出这份摘要是模型写的还是规则拼的）
+    // LLM 一次性调用：返回纯文本或 null，带退避重试。
+    // 起因（2026-09-23 实测，铁证在 summary.json 的 reason 里）：commandcode 网关会中途
+    // TRANSPORT 断连——finish.kind=error、failure.code=TRANSPORT、156 帧里 153 帧是
+    // reasoning、正文一个字没来，十来秒就断。猫窝的调用不过 dsh-llm-retry，一次断就丢整轮，
+    // 所以自己在这一层重试；连试 3 次还不行才回落规则化。
+    // diag（可选）：把失败原因、本次 provider/model 与重试次数带出来，供收尾蒸馏写进 summary.json
+    // （此前只落 text/at，外部看不出这份摘要是模型写的还是规则拼的）
     const llmCall = async (system, user, maxTokens, diag) => {
-      const note = (msg) => {
-        if (diag) diag.error = msg
-      }
       const llm = ctx.get('llm')
       if (llm === undefined || typeof llm.stream !== 'function') {
         console.log('[dsh-catnest] llm 服务不可用（present=' + (llm !== undefined) + '），生成回落规则化')
-        note('llm 服务不可用（present=' + (llm !== undefined) + '）')
+        if (diag) diag.error = 'llm 服务不可用（present=' + (llm !== undefined) + '）'
         return null
       }
       const { provider, model } = resolveModel()
-      if (diag) diag.sel = { provider, model }
-      let out = ''
-      // 空输出诊断（2026-09-23）：只记「空输出」分不清是正文根本没来、还是全被推理吃了。
-      // 记下帧数、各 chunk 类型计数与推理字数，回落时一并写进 reason。
-      const kinds = {}
-      let frames = 0
-      let reasoningChars = 0
-      let finish = null
-      if (diag) diag.inputChars = String(user).length
-      try {
-        const stream = llm.stream({
-          provider,
-          model,
-          maxTokens,
-          system,
-          messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
-        })
-        for await (const chunk of stream) {
-          frames += 1
-          const kind = chunk && typeof chunk.type === 'string' ? chunk.type : '(无 type)'
-          kinds[kind] = (kinds[kind] || 0) + 1
-          if (kind === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
-          if (kind === 'finish') finish = chunk.reason || chunk
-          if (kind === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
+      const attempts = 3
+      const failures = []
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        let out = ''
+        // 空输出诊断：只记「空输出」分不清是正文根本没来、还是全被推理吃了。
+        // 记下帧数、各 chunk 类型计数与推理字数，回落时一并写进 reason。
+        const kinds = {}
+        let frames = 0
+        let reasoningChars = 0
+        let finish = null
+        let error = null
+        try {
+          const stream = llm.stream({
+            provider,
+            model,
+            maxTokens,
+            system,
+            messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
+          })
+          for await (const chunk of stream) {
+            frames += 1
+            const kind = chunk && typeof chunk.type === 'string' ? chunk.type : '(无 type)'
+            kinds[kind] = (kinds[kind] || 0) + 1
+            if (kind === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
+            if (kind === 'finish') finish = chunk.reason || chunk
+            if (kind === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
+          }
+        } catch (err) {
+          error = err && err.message ? err.message : String(err)
         }
-      } catch (error) {
-        const msg = error && error.message ? error.message : String(error)
-        console.log('[dsh-catnest] llm call failed: ' + msg)
-        note('llm call failed: ' + msg)
-        return null
+        const text = out.trim()
+        if (text) {
+          if (diag) {
+            diag.sel = { provider, model }
+            diag.attempts = attempt
+            diag.inputChars = String(user).length
+            diag.frames = frames
+            diag.kinds = kinds
+          }
+          if (attempt > 1) {
+            console.log('[dsh-catnest] llm 第 ' + attempt + ' 次拿到正文（前 ' + (attempt - 1) + ' 次没成）')
+          }
+          return text
+        }
+        const detail = error
+          ? 'llm call failed: ' + error
+          : '空输出（maxTokens=' + maxTokens + '）：帧数=' + frames +
+            ' 推理=' + reasoningChars + '字 输入=' + String(user).length + '字' +
+            ' 类型=' + JSON.stringify(kinds) + ' finish=' + JSON.stringify(finish)
+        failures.push('第' + attempt + '次 ' + detail)
+        console.log('[dsh-catnest] llm 第 ' + attempt + '/' + attempts + ' 次没成：' + detail)
+        if (attempt < attempts) await new Promise((r) => setTimeout(r, 600 * attempt))
       }
+      const msg = '连试 ' + attempts + ' 次都没拿到正文 → ' + failures.join(' | ')
+      console.log('[dsh-catnest] ' + msg)
       if (diag) {
-        diag.frames = frames
-        diag.kinds = kinds
-        diag.reasoningChars = reasoningChars
-        diag.finish = finish
+        diag.sel = { provider, model }
+        diag.attempts = attempts
+        diag.error = msg
       }
-      const text = out.trim()
-      if (!text) {
-        const detail =
-          '帧数=' + frames +
-          ' 推理=' + reasoningChars + '字' +
-          ' 输入=' + String(user).length + '字' +
-          ' 类型=' + JSON.stringify(kinds) +
-          ' finish=' + JSON.stringify(finish)
-        console.log('[dsh-catnest] llm 空输出（maxTokens=' + maxTokens + '）：' + detail)
-        note('空输出（maxTokens=' + maxTokens + '）：' + detail)
-      }
-      return text || null
+      return null
     }
 
     // companion 名册：personas 服务过滤 companion:true 的人设；

@@ -403,6 +403,52 @@ test('distill 显式调用：llm 缺席回落规则化；空片给安静文案',
   }
 })
 
+test('llmCall 重试：第一次 TRANSPORT 断连（正文零字），第二次拿到正文（2026-09-23）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist6-'))
+  let calls = 0
+  const flakyLlm = {
+    stream: () => {
+      calls += 1
+      const first = calls === 1
+      return (async function* () {
+        if (first) {
+          // 复刻实测那一帧：只有推理块，finish 是 error/TRANSPORT，正文一个字都没来
+          yield { type: 'block-start' }
+          yield { type: 'reasoning-delta', text: '让我想想这次家里发生了什么' }
+          yield { type: 'finish', reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'terminated' } } }
+          return
+        }
+        yield { type: 'text-delta', text: '【回顾】第二次才拿到，小玖守着夜。\n\n【小玖】\n- 守了一夜没合眼' }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const learned = []
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    llm: flakyLlm,
+    memory: {
+      learn: async (key, text, tags) => {
+        learned.push({ key, text, tags })
+      },
+    },
+  })
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.say('kyu', '守夜呢')
+    const closed = await svc.close()
+    const d = await svc.distill(closed.sliceId)
+    assert.ok(calls >= 2, '第一次断连后要重试，实际调用 ' + calls + ' 次')
+    assert.equal(d.source, 'llm', JSON.stringify({ source: d.source, reason: d.reason }))
+    assert.ok(d.summary.includes('第二次才拿到'), d.summary)
+    assert.ok(learned.some((l) => l.key === 'kyu' && l.text.includes('守了一夜')), '重试成功后记忆照写')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
 test('回落规则化时不写角色记忆，且 summary.json 记 source/reason（2026-09-23）', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist3-'))
   const learned = []
