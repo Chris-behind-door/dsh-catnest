@@ -255,10 +255,12 @@ export default {
       } else {
         source = 'llm' // 先占位：有事件且尝试过 LLM
         // 一次 LLM 调用，产出【回顾】+ 各角色段
+        // 预算 16k：3k 会被推理块吃光导致正文为空（实测 5 次空输出 → 回落规则化，
+        // 收尾只留下好感度清单）。主人 2026-09-23 拍板开 16k。
         const out = await llmCall(
           DISTILL_SYSTEM,
           '主人不在时家里发生了什么（事件时间线）：\n' + lines.join('\n'),
-          3000,
+          16000,
         )
         const sections = out ? parseDistillSections(out) : {}
         const recapText = (sections['回顾'] || []).join('')
