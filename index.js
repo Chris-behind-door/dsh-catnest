@@ -70,6 +70,11 @@ const PLAN_URL = new URL('./assets/homeplan.svg', import.meta.url)
 // 像素头像随包分发（姐姐手绘，32px；地图标记 + 对话气泡共用）
 const AVATAR_IDS = ['kyu', 'moli', 'master']
 const avatarUrl = (id) => new URL('./assets/avatars/' + id + '.png', import.meta.url)
+// 场景图（Qwen-Image 2.1 生成，1600×900 webp）：屋里 7 间 + 月见庭户外 6 节点。
+// 主人所在的那个场景铺成整屏背景（前端做淡入淡出）。assets/rooms/index.json 是这份
+// 资源的权威清单：加一张图只要落文件 + 在目录里加一条，前后端都不用改代码。
+const ROOMS_INDEX_URL = new URL('./assets/rooms/index.json', import.meta.url)
+const roomImageUrl = (file) => new URL('./assets/rooms/' + file, import.meta.url)
 // 有 delta 打字机看着，慢不再是无反馈的黑等；150s 给免费模型高峰期留足余地。
 const LLM_TIMEOUT_MS = 150000
 // T6 自主节奏轻推（§9.1）：主人最后交互后留 10 分钟过渡；T6 自身 5 分钟说话冷却
@@ -108,6 +113,24 @@ export default {
     // §9.18 周期抖动与每日掷骰的随机源：默认 Math.random；测试注入固定桩，
     // 否则「每天 12% 掷中一个状态」会让调用 tick 的用例偶发飘红。
     const tickRand = config && typeof config.tickRand === 'function' ? config.tickRand : undefined
+
+    // 场景图清单：懒加载一次并常驻（4KB）。读不到就整套降级成纯色底——
+    // 缺一张图不该把猫窝拦住，没有背景图面板照样能用。
+    let sceneFilesPromise = null
+    const sceneFiles = () => {
+      if (sceneFilesPromise === null) {
+        sceneFilesPromise = readFile(ROOMS_INDEX_URL, 'utf8')
+          .then((raw) => {
+            const map = {}
+            for (const r of JSON.parse(raw).rooms || []) {
+              if (r && r.id && r.file) map[String(r.id)] = String(r.file)
+            }
+            return map
+          })
+          .catch(() => ({}))
+      }
+      return sceneFilesPromise
+    }
 
     // ── 角色调度（里程碑三）助手 ──
 
@@ -1553,6 +1576,7 @@ export default {
       const home = await nest.home()
       const rel = await nest.relations()
       const sum = await nest.latestClosedSummary()
+      const sceneMap = await sceneFiles() // 场景图清单（懒加载一次），缺图时是空表
       return {
         status: st,
         // HOUSE_DESIGN §1 家当：房间带上物品（主人视角看全屋；角色视角走 roomItemsText，只给自己房间）
@@ -1563,6 +1587,8 @@ export default {
           items: roomItems(home, r.id),
           outdoor: !!r.outdoor,
           scene: typeof r.scene === 'string' ? r.scene : null,
+          // 场景图文件名（前端拼 /catnest/api/rooms/<file> 当整屏背景）；null=这间没图
+          image: sceneMap[r.id] || null,
         })),
         characters: Object.values(home.characters || {}).map((c) => ({
           id: c.id,
@@ -2209,6 +2235,25 @@ export default {
                 res.end(png)
               } catch {
                 res.writeHead(404).end('avatar not found')
+              }
+              return
+            }
+            if (req.method === 'GET' && route.startsWith('rooms/')) {
+              // 场景图（整屏背景）：白名单就是 assets/rooms/index.json 那份清单，
+              // 不在清单里的一律 404（顺带挡掉目录穿越）。
+              const file = route.slice('rooms/'.length).replace(/[^a-zA-Z0-9_.-]/g, '')
+              const map = await sceneFiles()
+              if (!Object.values(map).includes(file)) {
+                res.writeHead(404).end('scene not found')
+                return
+              }
+              try {
+                const webp = await readFile(roomImageUrl(file))
+                // 静态资源（内容不变）给一天缓存；日后换图换个文件名即可
+                res.writeHead(200, { 'Content-Type': 'image/webp', 'Cache-Control': 'public, max-age=86400' })
+                res.end(webp)
+              } catch {
+                res.writeHead(404).end('scene not found')
               }
               return
             }

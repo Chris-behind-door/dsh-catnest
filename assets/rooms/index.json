@@ -1,5 +1,5 @@
 {
-  "note": "猫窝家景背景图，Qwen-Image 2.1 生成（2026-09-20）。2K 母版在 ~/.dsh/studio/catnest_<id>.png，本目录是其 1600x900 WebP 版本。",
+  "note": "猫窝背景图，Qwen-Image 2.1 生成。2026-09-20 出齐室内 7 间（午后纱帘光）；2026-09-22 出齐小区「月见庭」户外 6 节点（夜色 + 暖黄路灯，同色系）。2K 母版在 ~/.dsh/studio/catnest_<id>.png 与 catnest_yard_<id>.png，本目录是其 1600x900 WebP 版本。",
   "generator": {
     "model": "Qwen-Image 2.1 (ComfyUI int8_convrot)",
     "steps": 25,
@@ -10,7 +10,9 @@
       "entry": 7003,
       "bedroom": 8003,
       "其它房间": 111222
-    }
+    },
+    "yard_seed": 111222,
+    "yard_style": "夜景公共前缀（同色系 pastel 小区 + 暖黄路灯 + 深蓝夜空）"
   },
   "rooms": [
     {
@@ -74,6 +76,66 @@
       "width": 1600,
       "height": 900,
       "master": "~/.dsh/studio/catnest_balcony.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "unit_door",
+      "name": "单元门口",
+      "file": "yard_unit_door.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_unit_door.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "path",
+      "name": "步道",
+      "file": "yard_path.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_path.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "bench",
+      "name": "长椅",
+      "file": "yard_bench.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_bench.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "garden",
+      "name": "小花园",
+      "file": "yard_garden.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_garden.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "store",
+      "name": "便利店",
+      "file": "yard_store.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_store.png",
+      "master_size": "2048x1152"
+    },
+    {
+      "id": "gate",
+      "name": "小区大门",
+      "file": "yard_gate.webp",
+      "width": 1600,
+      "height": 900,
+      "outdoor": true,
+      "master": "~/.dsh/studio/catnest_yard_gate.png",
       "master_size": "2048x1152"
     }
   ]

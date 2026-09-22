@@ -587,6 +587,9 @@ test('存在感 UI 路由：state 返回家视图 / action 可开片关片移动
     assert.ok(Array.isArray(view.rooms) && view.rooms.length >= 5)
     // 大地图 §2–§3：房间表里现在也有小区节点（outdoor），主人位置多一层 place + 人话 label
     assert.ok(view.rooms.some((r) => r.id === 'bench' && r.outdoor === true), '小区节点在图里')
+    // 场景图（2026-09-22）：房间带 image 文件名，前端拼 /catnest/api/rooms/<file> 当整屏背景
+    assert.equal(view.rooms.find((r) => r.id === 'bedroom').image, 'bedroom.webp', '屋里的房间带图')
+    assert.equal(view.rooms.find((r) => r.id === 'bench').image, 'yard_bench.webp', '小区节点也带图')
     assert.deepEqual(view.master, {
       place: { kind: 'away' },
       atHome: false,
@@ -1175,6 +1178,18 @@ test('SSE events：连接即推首帧快照；avatar 路由白名单伺服 PNG',
     const av3 = fakeRes()
     await h5(fakeReq('GET', '/catnest/api/avatar/../index.js'), av3)
     assert.equal(av3.code, 404)
+
+    // 场景图（2026-09-22）：白名单来自 assets/rooms/index.json，不在清单里的一律 404
+    const sc1 = fakeRes()
+    await h5(fakeReq('GET', '/catnest/api/rooms/bedroom.webp'), sc1)
+    assert.equal(sc1.code, 200)
+    assert.match(String(sc1.headers['Content-Type']), /webp/)
+    const sc2 = fakeRes()
+    await h5(fakeReq('GET', '/catnest/api/rooms/nope.webp'), sc2)
+    assert.equal(sc2.code, 404)
+    const sc3 = fakeRes()
+    await h5(fakeReq('GET', '/catnest/api/rooms/../index.js'), sc3)
+    assert.equal(sc3.code, 404)
   } finally {
     await rmSafe(dir5)
   }
