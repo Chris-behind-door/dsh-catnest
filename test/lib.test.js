@@ -164,7 +164,7 @@ test('moveCharacter：合法移动 + 记 log，非法房间拒绝', async () => 
     await nest.open()
     const r = await nest.moveCharacter('kyu', 'kitchen')
     assert.deepEqual(r, {
-      char: 'kyu', from: 'living', to: 'kitchen', door: null, outdoor: false, noticed: [], letGo: [],
+      char: 'kyu', from: 'living', to: 'kitchen', door: null, outdoor: false, noticed: [],
     })
     const home = await nest.home()
     assert.equal(home.characters.kyu.room, 'kitchen')
@@ -614,9 +614,9 @@ test('say 音量：小声不出屋 / 大声全屋清晰（2026-09-20 简化版�
   }
 })
 
-// ── 大地图（小区）§2–§8：户外声学 / 门边 / 牵手 / T7 相遇觉察 ──
+// ── 大地图（小区）§2–§8：户外声学 / 门边 / T7 相遇觉察 ──
 
-test('户外声学（大地图 §6）：户外相邻听得清 / 小声出不了节点 / 牵手小声也真切 / 大声一跳邻居', () => {
+test('户外声学（大地图 §6）：户外相邻听得清 / 小声不出节点 / 大声一跳邻居', () => {
   const home = {
     rooms: [...DEFAULT_ROOMS, ...DEFAULT_PLACES].map((r) => ({ ...r, adjacent: [...r.adjacent], items: [] })),
   }
@@ -626,10 +626,8 @@ test('户外声学（大地图 §6）：户外相邻听得清 / 小声出不了�
   assert.equal(sayPerceive(home, 'path', 'bench', '正常', false).steps, 0, '户外相邻不减档')
   // 小声是贴着耳朵的话：出不了所在的那个节点（风把气声吹散）
   assert.equal(sayPerceive(home, 'path', 'bench', '小声', false).level, 'silent')
-  // 牵手特例（§6③）：只在「同一个节点」生效——贴着耳朵的悄悄话，旁边那个节点的人还是听不见
-  assert.equal(sayPerceive(home, 'path', 'bench', '小声', false, true).level, 'silent', '特例只管同节点')
-  assert.equal(sayPerceive(home, 'path', 'path', '小声', false, true).level, 'clear', '同节点牵手：小声也真切')
-  assert.equal(sayPerceive(home, 'path', 'path', '小声', false).level, 'clear', '同节点本来就真切（特例是给悄悄话兜底）')
+  // 同节点小声本来就真切（小声不出屋，不等于没声音）
+  assert.equal(sayPerceive(home, 'path', 'path', '小声', false).level, 'clear')
   // 大声在户外 = 同节点 + 一跳邻居；再远听不见（按各自相邻表判）
   assert.equal(sayPerceive(home, 'path', 'store', '大声', false).level, 'clear', '一跳邻居听得清')
   assert.equal(sayPerceive(home, 'store', 'gate', '大声', false).level, 'clear')
@@ -638,8 +636,6 @@ test('户外声学（大地图 §6）：户外相邻听得清 / 小声出不了�
   assert.equal(sayPerceive(home, 'living', 'kitchen', '正常', false).level, 'faint')
   assert.equal(sayPerceive(home, 'living', 'kitchen', '小声', false).level, 'silent')
   assert.equal(sayPerceive(home, 'living', 'bath', '大声', false).level, 'clear')
-  // 室内相邻 + 牵手不该被特例救活（特例只作用于同节点 steps=0）
-  assert.equal(sayPerceive(home, 'living', 'kitchen', '小声', false, true).level, 'silent')
 })
 
 test('门边（大地图 §4）：整张图只有 entry↔unit_door 一条，跨它才是出门/回家', () => {
@@ -719,40 +715,6 @@ test('在小区走动：账本记 door + T7 相遇觉察（走进有人待着的
     assert.deepEqual(m.place, { kind: 'yard', id: 'path' })
     assert.equal(m.label, '在小区·步道')
     assert.deepEqual((await nest.home()).master.atHome, false)
-  } finally {
-    await cleanup()
-  }
-})
-
-test('牵手（大地图 §6）：双向对称 + 声学特例生效 + 松手', async () => {
-  const { nest, cleanup } = await mk()
-  try {
-    await nest.open()
-    await nest.moveMaster('bench')
-    await nest.moveCharacter('kyu', 'bench')
-    // 没牵手：小声传不到（虽然同节点本来就 clear，这里验的是标记本身）
-    const before = await nest.say('kyu', '悄悄话', undefined, undefined, '小声')
-    assert.ok(before.direct.includes('master'), '同节点小声本来就听得见')
-    const w = await nest.walkWith('kyu', 'master')
-    assert.equal(w.with, 'master')
-    assert.deepEqual(w.walking, ['master'])
-    const home = await nest.home()
-    assert.deepEqual(home.master.walking, ['kyu'], '双向对称（主人那边也记着）')
-    assert.equal(nest.handInHand(home, 'kyu', 'master'), true)
-    // 走开到别处（主人 2026-09-20 定的语义：手牵了就该在一起）→ 自动松开
-    const mv = await nest.moveCharacter('kyu', 'path')
-    assert.deepEqual(mv.letGo, ['master'], '走开就松手')
-    const h2 = await nest.home()
-    assert.equal(nest.handInHand(h2, 'kyu', 'master'), false, '不同节点不再算牵手')
-    assert.deepEqual(h2.master.walking, [], '双向都清')
-    assert.deepEqual(nest.walkingGroup(h2, 'kyu'), [])
-    // 松手
-    await nest.walkWith('kyu', '')
-    const h3 = await nest.home()
-    assert.equal(nest.handInHand(h3, 'kyu', 'master'), false)
-    assert.deepEqual(h3.master.walking, [])
-    await assert.rejects(() => nest.walkWith('kyu', 'kyu'), /不能和自己/)
-    await assert.rejects(() => nest.walkWith('kyu', 'nobody'), /不存在/)
   } finally {
     await cleanup()
   }

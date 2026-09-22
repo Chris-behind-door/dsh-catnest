@@ -592,7 +592,6 @@ test('存在感 UI 路由：state 返回家视图 / action 可开片关片移动
       atHome: false,
       room: null,
       label: '不在家',
-      walking: [],
     })
 
     // POST action open → 状态变开
@@ -1474,31 +1473,6 @@ test('go_home：在小区里能回玄关；本来在家就拒绝（不静默瞬�
     )
     await until(async () => (await n.svc.home()).characters.kyu.room === 'entry')
     assert.equal((await n.svc.home()).characters.kyu.room, 'entry', '从小区回玄关')
-  } finally {
-    await rmSafe(n.dir)
-  }
-})
-
-test('hold_hands：牵上手 → 双方记着 + presence 出现【牵着的手】', async () => {
-  const captured = []
-  const n = await setupNest(captureToolStub(captured, '小玖', 'hold_hands', { who: '主人' }))
-  try {
-    await n.h(
-      fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '我们出去走走吧' })),
-      fakeRes(),
-    )
-    await until(async () => {
-      const h = await n.svc.home()
-      return Array.isArray(h.master.walking) && h.master.walking.includes('kyu')
-    })
-    const home = await n.svc.home()
-    assert.deepEqual(home.master.walking, ['kyu'])
-    assert.deepEqual(home.characters.kyu.walking, ['master'])
-    const toolMsg = captured
-      .flatMap((c) => c.messages || [])
-      .map((m) => (typeof m.content === 'string' ? m.content : JSON.stringify(m.content || '')))
-      .join('\n')
-    assert.match(toolMsg, /牵上了主人的手/)
   } finally {
     await rmSafe(n.dir)
   }

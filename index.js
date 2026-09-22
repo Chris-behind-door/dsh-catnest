@@ -440,29 +440,10 @@ export default {
       // （房间那行是【屋里有什么】，户外没有家当，换成【眼前】）。
       const scene = myRoom ? placeScene(home, myRoom) : ''
       const sceneText = scene ? '\n【眼前】' + scene : ''
-      // 大地图 §6：牵着手的时候写明白——小声也听得见的那条特例得让她自己知道
-      const myWalking =
-        home.characters[charId] && Array.isArray(home.characters[charId].walking)
-          ? home.characters[charId].walking
-          : []
-      const heldBy = Object.values(home.characters || {})
-        .filter(
-          (c) =>
-            c &&
-            c.id !== charId &&
-            (myWalking.includes(c.id) || (Array.isArray(c.walking) && c.walking.includes(charId))),
-        )
-        .map((c) => c.name || c.id)
-      const masterHand =
-        myWalking.includes('master') ||
-        (home.master && Array.isArray(home.master.walking) && home.master.walking.includes(charId))
-      const handNames = [...heldBy, ...(masterHand ? ['主人'] : [])]
-      const handText =
-        handNames.length > 0 ? '\n【牵着的手】你正牵着' + handNames.join('、') + '的手（小声说话也听得真切）。' : ''
       const outText = isOutdoorId(home, myRoom)
         ? '\n【外面】你现在在小区里（月见庭），不在屋里。'
         : ''
-      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + thingsText + sceneText + handText + outText + topicsText
+      return '【此刻的位置】' + clock + '；' + (at ? at + '，' : '') + masterAt + thingsText + sceneText + outText + topicsText
     }
 
     // 片内时间线人话化：say 按 audience 名单查表渲染（同房真切/相邻弱化前缀/远处不入）；
@@ -646,7 +627,7 @@ export default {
               enum: SAY_VOLUMES,
               description:
                 '可选：说话音量（缺省「正常」）。「小声」=悄悄话，只有和你待在同一个地方的人听得见，' +
-                '别处什么都不知道，想避开别人说私房话就用它（牵着手的那个，同在一处时小声也听得真切）；' +
+                '别处什么都不知道，想避开别人说私房话就用它；' +
                 '「大声」=喊一嗓子：在屋里全屋都听得清清楚楚，在小区里是这一处和紧邻的一处' +
                 '（她在三楼窗口探出头那种距离），再远就听不见了。' +
                 '隔壁闲着的姐妹会被大声当场叫起来（正埋头做事的那个不被打断，只是听得见）。' +
@@ -674,25 +655,6 @@ export default {
           '回家：从小区里走回玄关（出门在外想回来就用它）。本来就在家里的话不用调。' +
           '主人一个人出远门（不在家也不在小区）时，家里就等你回来，不用着急。',
         parameters: { type: 'object', properties: {}, required: [] },
-      },
-      {
-        name: 'hold_hands',
-        description:
-          '牵起（或松开）谁的手。牵着手待在一处时，小声说的话对方也听得真切' +
-          '（贴着他耳朵说悄悄话就靠这个）。牵手**不会**让对方跟着你走——' +
-          '想一起走，是走两步回头喊一声，他自己会跟上来；' +
-          '人一旦走开（不在一处了）手就自动松开了，不用特意去放。' +
-          'who 传空字符串 = 主动松手。',
-        parameters: {
-          type: 'object',
-          properties: {
-            who: {
-              type: 'string',
-              description: '牵谁的手：主人 / 小玖 / 墨璃（角色中文名），空字符串=松开',
-            },
-          },
-          required: ['who'],
-        },
       },
       {
         name: 'do_activity',
@@ -1147,23 +1109,6 @@ export default {
           await nest.resolveTopicAction(charId)
           scheduleSnapshot()
           return { ok: true, result: '回到玄关了（' + (r && r.door ? r.door : '回家') + '）。', effect: { tool: 'go_home', room: 'entry' } }
-        }
-        if (name === 'hold_hands') {
-          const raw = typeof args.who === 'string' ? args.who.trim() : ''
-          const home = await nest.home()
-          // who 认中文名（主人 / 小玖 / 墨璃），空字符串 = 松手
-          let target = null
-          if (raw !== '') {
-            if (raw === '主人' || raw === 'master') target = 'master'
-            else {
-              const hit = Object.values(home.characters || {}).find((c) => c && (c.name === raw || c.id === raw))
-              if (!hit) return fail('不认识「' + raw + '」这个名字')
-              target = hit.id
-            }
-          }
-          const r = await nest.walkWith(charId, target)
-          scheduleSnapshot()
-          return { ok: true, result: r.text, effect: { tool: 'hold_hands', who: target } }
         }
         if (name === 'do_activity') {
           const activity = typeof args.activity === 'string' ? args.activity : ''
@@ -1624,7 +1569,6 @@ export default {
           name: c.name,
           room: c.room,
           outdoor: isOutdoorId(home, c.room), // 前端标「在小区」
-          walking: Array.isArray(c.walking) ? [...c.walking] : [], // 牵手（大地图 §6）
           activity: c.activity || null,
           activityEndsAt: c.activityEndsAt || null, // §9.14：前端显示活动剩余时间
           activityPaused: !!c.activityPaused, // §9.14：前端标注「放下了，可以接回」
@@ -1652,7 +1596,6 @@ export default {
           atHome: masterAtHome(home),
           room: masterRoomId(home),
           label: masterPlaceLabel(home),
-          walking: Array.isArray(home.master && home.master.walking) ? [...home.master.walking] : [],
         },
         autonomy: { homeOn: !!(home.autonomy && home.autonomy.homeOn) },
         relations: rel.pairs || {},

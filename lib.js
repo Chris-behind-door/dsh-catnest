@@ -205,7 +205,6 @@ function defaultHome() {
           mood: null, // 挂状态（心情/神态，字符串；空=无），瞬态随位置进场景动态窗口
           conditions: [], // 持久状态（时间段）：{ id, name, startAt, endAt, cycleDays?, source?, note? }
           hear: [], // "听到"决策链缓冲（相邻动静攒存）
-          walking: [], // 同行（牵手）：此刻手拉着谁（角色 id 列表），见 walkWith；空=没牵谁
         },
       ]),
     ),
@@ -488,17 +487,14 @@ export function sayVolume(v) {
 // 隔墙则看衰减后的档位：≥1 真切 / 0 隐约 / <0 听不见。
 // gripped = 真切到"当场抓住注意力"（隔着一堵墙且不被忙碌削掉）——调度层据此立刻唤醒。
 //
-// 户外补丁（大地图 §6，2026-09-20 主人定案）：只改两个系数 + 一个特例，三层模型本身不动。
+// 户外补丁（大地图 §6，2026-09-20 主人定案）：只改两个系数，三层模型本身不动。
 //   ① 户外相邻 = 听得清：室内「隔一堵墙只闻动静」的直觉（steps 1）在开阔地不成立——
 //      长椅上说的话，步道上的人本来就该听清。所以说话人与听者都在户外时 steps 由 1 降到 0，
-//      只在「正常 / 大声」生效：小声是贴着耳朵的悄悄话，出不了所在的那个节点（风会把气声吹散），
-//      牵手的人同节点听得见靠的是特例③，不是这一条。
+//      只在「正常 / 大声」生效：小声是贴着耳朵的悄悄话，出不了所在的那个节点（风会把气声吹散）。
 //   ② 大声在户外 = 同节点 + 一跳邻居（不是室内那条「全屋 clear」）：楼下喊一声，
 //      她在三楼窗口探出头；步道那头（两跳）听不见。
-//   ③ 牵手的特例（intimate）：同行成员在同一节点时，小声也算真切——这是「牵手说的悄悄话」
-//      的听觉载体（见 walkWith / walkingGroup）。传的是「说话人与听者此刻牵着手」。
 // 室内一个字都不变：两个 outdoor 判定都要求双方都在户外。
-export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy, intimate) {
+export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBusy) {
   const vol = sayVolume(volume)
   const rel = roomRelation(home, speakingRoom, listenerRoom)
   let steps = SAY_RELATION_STEPS[rel] === undefined ? 2 : SAY_RELATION_STEPS[rel]
@@ -520,8 +516,6 @@ export function sayPerceive(home, speakingRoom, listenerRoom, volume, listenerBu
   // 忙碌降半档：只降"真切"那一档（大声）、且只降隔墙听见的（同房不降）
   const damped = steps >= 1 && !!listenerBusy && notch >= 1
   if (damped) notch -= 1
-  // ③ 牵手的特例：同节点同行时，小声也真切（悄悄话贴着耳朵说）
-  if (intimate && steps === 0) notch = Math.max(notch, 1)
   if (notch < 0) return { level: 'silent', steps, notch, gripped: false }
   if (steps === 0) return { level: 'clear', steps, notch, gripped: false }
   if (notch >= 1) return { level: 'clear', steps, notch, gripped: true }
@@ -1587,12 +1581,6 @@ export class CatNest {
         }
       }
       home.master = m
-      for (const ch of Object.values(home.characters)) {
-        if (ch && typeof ch === 'object' && !Array.isArray(ch.walking)) {
-          ch.walking = []
-          changed = true
-        }
-      }
       if (home.version !== HOME_VERSION) {
         home.version = HOME_VERSION
         changed = true
@@ -1754,14 +1742,12 @@ export class CatNest {
       if (!room) throw new Error(`地点 "${roomId}" 不存在`)
       const from = ch.room
       ch.room = roomId
-      // 走开就松手（只清「不再同处一地」的那些，同处一地的牵手保留）
-      const letGo = this.releaseHandsOnLeave(home, id)
       await this.saveHome(home)
       // 跨门边补语义（大地图 §4）：整张图只有 entry↔unit_door 一条门边，
       // 走别的路（屋里换房间、小区里换地方）都不带 door 字段。
       const door = doorMoveLabel(from, roomId)
       await this.log('move', { char: id, from, to: roomId, ...(door ? { door } : {}) })
-      return { char: id, from, to: roomId, door: door || null, outdoor: !!room.outdoor, letGo }
+      return { char: id, from, to: roomId, door: door || null, outdoor: !!room.outdoor }
     })
     // T7 相遇觉察（设计 §8）：走到有人待着的地方，在场的人会看见你
     const home = await this.home()
@@ -2022,7 +2008,6 @@ export class CatNest {
       if (!room) throw new Error(`地点 "${roomId}" 不存在`)
       const kind = room.outdoor ? 'yard' : 'home'
       setMasterPlace(home, { kind, id: roomId })
-      this.releaseHandsOnLeave(home, 'master')
       await this.saveHome(home)
       const door = doorMoveLabel(fromId, roomId)
       await this.log('master-move', { from: fromId, to: roomId, ...(door ? { door } : {}) })
@@ -2037,124 +2022,16 @@ export class CatNest {
     return out
   }
 
-  // 牵手 / 松手（大地图 §6，2026-09-20 定案）：不是位置绑定，只是「谁和谁牵着手」。
-  // 效果很小、很确定：同行的人在同一节点时，小声也算真切（说悄悄话贴着耳朵）。
-  // 跟着走是分开的事——她得自己调 move_to（设计 §5：不做瞬移绑定）。
-  async walkWith(id, other) {
-    return this.mutate(async () => {
-      await this.requireOpen()
-      const home = await this.home()
-      const who = other === null || other === undefined || other === '' ? null : String(other)
-      const ids = ['master', ...Object.keys(home.characters || {})]
-      if (!ids.includes(id)) throw new Error(`角色 "${id}" 不存在`)
-      if (who !== null && !ids.includes(who)) throw new Error(`角色 "${who}" 不存在`)
-      if (who === id) throw new Error('不能和自己牵手')
-      // 双向对称写：她拉着谁，对方也拉着她（牵手是相互的，不是单方面的跟随标记）。
-      // master 侧记在 home.master.walking（主人在猫窝里没有角色对象）。
-      const setList = (ownerId, list) => {
-        if (ownerId === 'master') {
-          home.master.walking = list
-        } else if (home.characters[ownerId]) {
-          home.characters[ownerId].walking = list
-        }
-      }
-      const listOf = (ownerId) =>
-        ownerId === 'master'
-          ? Array.isArray(home.master.walking)
-            ? home.master.walking
-            : []
-          : home.characters[ownerId] && Array.isArray(home.characters[ownerId].walking)
-            ? home.characters[ownerId].walking
-            : []
-      if (who === null) {
-        for (const x of listOf(id)) setList(x, listOf(x).filter((y) => y !== id))
-        setList(id, [])
-      } else {
-        if (!listOf(id).includes(who)) setList(id, [...listOf(id), who])
-        if (!listOf(who).includes(id)) setList(who, [...listOf(who), id])
-      }
-      await this.saveHome(home)
-      const label = (x) => (x === 'master' ? '主人' : charName(home, x) || x)
-      await this.log('walk', { char: id, with: who, on: who !== null })
-      return {
-        char: id,
-        with: who,
-        walking: [...listOf(id)],
-        text:
-          who === null
-            ? '松开了牵着的手。'
-            : '牵上了' + label(who) + '的手（一起走的时候，小声说话也听得真切）。',
-      }
-    })
-  }
-
-  // 清理「已经不在同一节点」的牵手（大地图 §6 收紧）。
-  // 理由（主人 2026-09-20 指出）：手牵了就该在一起 —— 她走开后还挂着 🤝、还能小声传话，
-  // 那是自欺。移动时顺手松开，双向都清。返回被松开的名单，供调用方决定要不要记一笔。
-  releaseHandsOnLeave(home, who) {
-    const listOf = (id) => {
-      if (id === 'master') return Array.isArray(home.master && home.master.walking) ? home.master.walking : []
-      const ch = home.characters && home.characters[id]
-      return ch && Array.isArray(ch.walking) ? ch.walking : []
-    }
-    const setList = (id, list) => {
-      if (id === 'master') {
-        if (home.master) home.master.walking = list
-      } else if (home.characters && home.characters[id]) {
-        home.characters[id].walking = list
-      }
-    }
-    const sameNode = (id) => {
-      const a = who === 'master' ? masterRoomId(home) : (home.characters[who] && home.characters[who].room)
-      const b = id === 'master' ? masterRoomId(home) : (home.characters[id] && home.characters[id].room)
-      return !!a && !!b && a === b
-    }
-    const dropped = []
-    for (const other of [...listOf(who)]) {
-      if (sameNode(other)) continue
-      setList(who, listOf(who).filter((x) => x !== other))
-      setList(other, listOf(other).filter((x) => x !== who))
-      dropped.push(other)
-    }
-    return dropped
-  }
-
-  // 两人的同行关系（供 say 判定「牵手」与 presence 渲染）。任一方向记着就算牵着。
-  handInHand(home, a, b) {
-    const listOf = (id) => {
-      if (id === 'master') return Array.isArray(home.master && home.master.walking) ? home.master.walking : []
-      const ch = home.characters && home.characters[id]
-      return ch && Array.isArray(ch.walking) ? ch.walking : []
-    }
-    return listOf(a).includes(b) || listOf(b).includes(a)
-  }
-
-  // 同一节点 + 牵着手的同行成员（presence 渲染「你们正牵着手」用）
-  walkingGroup(home, charId) {
-    const myRoom = (home.characters && home.characters[charId] && home.characters[charId].room) || null
-    const masterRoom = masterRoomId(home)
-    const together = (id) => {
-      if (id === 'master') return !!myRoom && masterRoom === myRoom
-      const ch = home.characters && home.characters[id]
-      return !!(ch && myRoom && ch.room === myRoom)
-    }
-    return (Array.isArray(home.characters[charId] && home.characters[charId].walking)
-      ? home.characters[charId].walking
-      : []
-    ).filter((x) => this.handInHand(home, charId, x) && together(x))
-  }
-
   // T7（大地图 §8，2026-09-20 定案）：有人走进你在的地方 → 你觉察到了。
   // 相遇本身就是事件（在长椅那边看见她），现有 T1/T2/T3/T6 里没有这一条。
   // 只通告「已经在场的人」：走过来的那个人自己看得见在场有谁（presence 里有全员位置），
-  // 不用再给一份。同行的两个人不互相通告（本来就手拉手）。
+  // 不用再给一份。
   async noticeArrival(home, mover, fromId, toId) {
     const present = Object.values(home.characters || {}).filter((c) => c && c.id !== mover && c.room === toId)
     const moverName = mover === 'master' ? '主人' : charName(home, mover) || mover
     const place = roomName(home, toId) || toId
     const out = []
     for (const c of present) {
-      if (this.handInHand(home, mover, c.id)) continue
       // 通知文案不省略名字：out.of.context 时「你看见主人了」比「走进了客厅」清楚得多
       // （实测：主人从外面进来那一版少个主语，读起来像半句话）
       const fromTxt = fromId ? '从' + (roomName(home, fromId) || fromId) : '从外面'
@@ -2290,9 +2167,7 @@ export class CatNest {
     for (const id of [...around.direct, ...around.adjacent, ...around.far]) {
       const lroom = id === 'master' ? masterRoomId(home) : (home.characters[id] && home.characters[id].room)
       const busy = id === 'master' ? false : isBusy(home.characters[id], now)
-      // 牵手特例（大地图 §6）：说话人与听者此刻牵着手的，小声也算真切
-      const intimate = id !== who && this.handInHand(home, who, id)
-      const p = sayPerceive(home, room, lroom, vol, busy, intimate)
+      const p = sayPerceive(home, room, lroom, vol, busy)
       if (p.level === 'silent') {
         silent.push(id)
       } else if (p.level === 'clear' && p.steps === 0) {
