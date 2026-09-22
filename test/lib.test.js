@@ -1201,6 +1201,21 @@ test('sliceData / summary：收尾摘要落盘与读取', async () => {
     await nest.writeSliceSummary(data.sliceId, '小玖说天气真好喵。')
     const sum = await nest.latestClosedSummary()
     assert.equal(sum.text, '小玖说天气真好喵。')
+    // meta（2026-09-23）：来源可见，回落和模型写的一眼分得清
+    const withMeta = await nest.writeSliceSummary(data.sliceId, '规则化回顾', {
+      source: 'rule',
+      reason: 'llm 服务不可用',
+      llm: { provider: 'p', model: 'm' },
+    })
+    assert.equal(withMeta.source, 'rule')
+    assert.equal(withMeta.reason, 'llm 服务不可用')
+    assert.deepEqual(withMeta.llm, { provider: 'p', model: 'm' })
+    const reread = await nest.sliceSummary(data.sliceId)
+    assert.equal(reread.source, 'rule', 'meta 要真的落盘，不是只在返回值里')
+    assert.equal(reread.text, '规则化回顾')
+    // 不传 meta 时字段不出现（老调用点/老文件读起来行为不变）
+    const plain = await nest.writeSliceSummary(data.sliceId, '没有 meta')
+    assert.ok(!('source' in plain))
     // recapOf 指定片号
     const recap = await nest.recapOf(data.sliceId)
     assert.ok(recap.includes('小玖'))

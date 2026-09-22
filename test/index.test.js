@@ -403,6 +403,106 @@ test('distill 显式调用：llm 缺席回落规则化；空片给安静文案',
   }
 })
 
+test('回落规则化时不写角色记忆，且 summary.json 记 source/reason（2026-09-23）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist3-'))
+  const learned = []
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB, // 无 llm → 必定回落
+    memory: {
+      learn: async (key, text, tags) => {
+        learned.push({ key, text, tags })
+      },
+    },
+  })
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.say('moli', '今天的风好温柔')
+    const closed = await svc.close()
+    const d = await svc.distill(closed.sliceId)
+    assert.equal(d.source, 'rule')
+    assert.ok(d.reason && d.reason.includes('llm'), 'reason 要写明 llm 缺席: ' + d.reason)
+    assert.equal(learned.length, 0, '回落时一条记忆都不该写，实际写了: ' + JSON.stringify(learned))
+    const sum = JSON.parse(await readFile(join(dir, 'slices', closed.sliceId, 'summary.json'), 'utf8'))
+    assert.equal(sum.source, 'rule', 'summary.json 要留下来源，别让人对着文件猜')
+    assert.ok(sum.reason, 'summary.json 要留下失败原因')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('llm 空输出：reason 记空输出并带上预算，记忆照旧不写（2026-09-23）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist4-'))
+  const learned = []
+  const emptyLlm = {
+    stream: async function* () {
+      yield { type: 'text-delta', text: '   ' } // 推理块吃光预算后的空正文
+    },
+  }
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    llm: emptyLlm,
+    memory: {
+      learn: async (key, text, tags) => {
+        learned.push({ key, text, tags })
+      },
+    },
+  })
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.say('kyu', '主人不在家，守着呢')
+    const closed = await svc.close()
+    const d = await svc.distill(closed.sliceId)
+    assert.equal(d.source, 'rule')
+    assert.ok(d.reason.includes('空输出'), 'reason 要指出是空输出: ' + d.reason)
+    assert.ok(d.reason.includes('16000'), 'reason 要带上预算，方便回看是不是又被吃光: ' + d.reason)
+    assert.equal(learned.length, 0, '空输出回落时也不许写记忆')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('HTTP op distill：可手动重跑指定片的收尾蒸馏（2026-09-23）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist5-'))
+  const ws = webServerStub()
+  const learned = []
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    llm: llmStub('【回顾】小玖在客厅守了一夜，天亮才眯着。\n\n【小玖】\n- 守了一夜'),
+    memory: {
+      learn: async (key, text, tags) => {
+        learned.push({ key, text, tags })
+      },
+    },
+  })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await svc.open()
+    await svc.say('kyu', '守夜呢')
+    const closed = await svc.close()
+    const handler = ws.routes[0].handler
+
+    let res = fakeRes()
+    await handler(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'distill', sliceId: closed.sliceId })), res)
+    assert.equal(res.code, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.source, 'llm', JSON.stringify(body))
+    assert.ok(body.summary.includes('守了一夜'), body.summary)
+
+    // 缺 sliceId → 400，不许拿「最近一片」顶替
+    res = fakeRes()
+    await handler(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'distill' })), res)
+    assert.equal(res.code, 400)
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
 test('distill 分角色分条：各角色段分别 learn 各自记忆；回顾段进 summary', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-dist2-'))
   const learned = []

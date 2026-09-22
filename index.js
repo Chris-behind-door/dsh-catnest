@@ -101,6 +101,8 @@ const DISTILL_SYSTEM =
   '然后为每一位家人各写一段，段落头是 TA 的名字（如【小玖】【墨璃】）：站在 TA 自己的视角，' +
   '写 TA 会记住的、与 TA 相关的事（TA 说过的话、做过的事、遇到的开心或失落）。' +
   '每条以「- 」开头单独一行，2~5 条；只写事实和感受，不要评价，不要编造时间线以外的事。\n' +
+  '不愉快的事照写：争执、被驳回、谁的眼泪、谁走开、谁一直没开口，都算发生过的事。' +
+  '不许只挑体面的写，也不许替任何人圆场（主人 2026-09-23 明确要求：哪怕对主人不光彩，也要留下）。\n' +
   '只输出以下格式，不要其他内容：\n' +
   '【回顾】\n...\n\n【小玖】\n- ...\n- ...\n\n【墨璃】\n- ...'
 
@@ -156,13 +158,20 @@ export default {
     // LLM 一次性调用：返回纯文本或 null（服务缺席/失败/空输出各自留诊断日志）。
     // 注意：推理型模型会先输出 reasoning-delta 思考块，maxTokens 太小会被思考
     // 吃光导致正文为空，所以预算给足并在空输出时记日志便于排查。
-    const llmCall = async (system, user, maxTokens) => {
+    // diag（可选）：把失败原因与本次 provider/model 带出来，供收尾蒸馏写进 summary.json
+    // （2026-09-23 加：此前只落 text/at，外部看不出这份摘要是模型写的还是规则拼的）
+    const llmCall = async (system, user, maxTokens, diag) => {
+      const note = (msg) => {
+        if (diag) diag.error = msg
+      }
       const llm = ctx.get('llm')
       if (llm === undefined || typeof llm.stream !== 'function') {
         console.log('[dsh-catnest] llm 服务不可用（present=' + (llm !== undefined) + '），生成回落规则化')
+        note('llm 服务不可用（present=' + (llm !== undefined) + '）')
         return null
       }
       const { provider, model } = resolveModel()
+      if (diag) diag.sel = { provider, model }
       let out = ''
       try {
         const stream = llm.stream({
@@ -176,11 +185,16 @@ export default {
           if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
         }
       } catch (error) {
-        console.log('[dsh-catnest] llm call failed: ' + (error && error.message ? error.message : String(error)))
+        const msg = error && error.message ? error.message : String(error)
+        console.log('[dsh-catnest] llm call failed: ' + msg)
+        note('llm call failed: ' + msg)
         return null
       }
       const text = out.trim()
-      if (!text) console.log('[dsh-catnest] llm 空输出（maxTokens=' + maxTokens + '，可能被推理块耗尽）')
+      if (!text) {
+        console.log('[dsh-catnest] llm 空输出（maxTokens=' + maxTokens + '，可能被推理块耗尽）')
+        note('空输出（maxTokens=' + maxTokens + '，可能被推理块耗尽）')
+      }
       return text || null
     }
 
@@ -247,44 +261,53 @@ export default {
       const lines = sliceEventsText(data.closeSnap.home, data.logText)
       let summary
       let source = 'empty'
+      let reason = '片内没有事件，没什么可总结的'
+      let sel = null
       const memory = ctx.get('memory')
       const learned = []
       const roleItems = {} // roleName → 条目[]
       if (lines.length === 0) {
         summary = '主人不在时家里安安静静的，大家都歇着。'
       } else {
-        source = 'llm' // 先占位：有事件且尝试过 LLM
         // 一次 LLM 调用，产出【回顾】+ 各角色段
         // 预算 16k：3k 会被推理块吃光导致正文为空（实测 5 次空输出 → 回落规则化，
         // 收尾只留下好感度清单）。主人 2026-09-23 拍板开 16k。
+        const diag = {}
         const out = await llmCall(
           DISTILL_SYSTEM,
           '主人不在时家里发生了什么（事件时间线）：\n' + lines.join('\n'),
           16000,
+          diag,
         )
+        sel = diag.sel || null
         const sections = out ? parseDistillSections(out) : {}
         const recapText = (sections['回顾'] || []).join('')
         if (recapText) {
+          source = 'llm'
           summary = recapText
           for (const secName of Object.keys(sections)) {
             if (secName === '回顾') continue
             if (sections[secName].length > 0) roleItems[secName] = sections[secName]
           }
+        } else {
+          reason = diag.error || (out ? '模型输出里没有【回顾】段' : 'llm 无输出')
         }
       }
       if (!summary) {
-        // 空片 / llm 缺席 / 解析失败：回落规则化
+        // 有事件但蒸馏没成：回落规则化（只有计数，没有情节）
         source = 'rule'
         summary = (await nest.recapOf(id)) || '主人不在时家里安安静静的。'
       }
-      await nest.writeSliceSummary(id, summary)
-      if (memory !== undefined && typeof memory.learn === 'function') {
+      await nest.writeSliceSummary(id, summary, { source, reason, llm: sel })
+      // 记忆域写入只认模型产出的分角色段落。规则化文案一律不写：
+      // 它只有「挪了几次窝 / 关系值 +N」，拿它顶替等于用计数冒充记忆
+      // （主人 2026-09-23：宁可不写，也不要假的）。
+      if (memory !== undefined && typeof memory.learn === 'function' && source === 'llm') {
         const { entries } = await companions()
-        // 每角色：有本角色段落就逐条 learn（分条、带视角）；否则照旧共用一份（回落兜底）
         for (const c of entries) {
           const items = roleItems[c.name]
-          const toLearn = items && items.length > 0 ? items : [summary]
-          for (const text of toLearn) {
+          if (!items || items.length === 0) continue
+          for (const text of items) {
             try {
               await memory.learn(c.id, text, ['猫窝', '时间片', id])
             } catch (error) {
@@ -294,7 +317,7 @@ export default {
           learned.push(c.id)
         }
       }
-      return { ok: true, sliceId: id, source, summary, learned }
+      return { ok: true, sliceId: id, source, reason, llm: sel, summary, learned }
     }
 
     const distillRuns = new Map() // sliceId → 进行中的 distill promise
@@ -2436,6 +2459,13 @@ export default {
                 const r = await nest.setRoomItems(String(body.room || ''), body.items)
                 scheduleSnapshot()
                 return json(res, 200, r)
+              }
+              if (op === 'distill') {
+                // 手动重跑某片的收尾蒸馏（2026-09-23 加）：补当年因网关挂掉回落成
+                // 「好感度清单」的片。body { sliceId }；同一片重复调用走内存缓存。
+                const sid = String((body && body.sliceId) || '').replace(/[^a-zA-Z0-9_-]/g, '')
+                if (!sid) return json(res, 400, { error: 'sliceId required' })
+                return json(res, 200, await distill(sid))
               }
               json(res, 400, { error: 'unknown op: ' + String(op) })
               return

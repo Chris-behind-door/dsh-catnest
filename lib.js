@@ -2846,8 +2846,15 @@ export class CatNest {
   }
 
   // 收尾摘要落盘（角色调度层蒸馏产物；open 回顾优先读它）
-  async writeSliceSummary(sliceId, text) {
+  // meta（可选）：{ source, reason, llm } —— 来源可见性（llm=模型写的 / rule=回落规则化 /
+  // empty=空片）。2026-09-23 加：此前只落 text/at，从文件上分不清这份是模型写的还是拼出来的。
+  async writeSliceSummary(sliceId, text, meta) {
     const value = { text: String(text), at: new Date().toISOString() }
+    if (meta && typeof meta === 'object') {
+      if (meta.source) value.source = String(meta.source)
+      if (meta.reason) value.reason = String(meta.reason)
+      if (meta.llm) value.llm = meta.llm
+    }
     await this.writeJsonAtomic(join(this.dir, SLICES_DIR, sliceId, 'summary.json'), value)
     return value
   }
