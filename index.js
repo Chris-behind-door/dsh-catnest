@@ -173,6 +173,13 @@ export default {
       const { provider, model } = resolveModel()
       if (diag) diag.sel = { provider, model }
       let out = ''
+      // 空输出诊断（2026-09-23）：只记「空输出」分不清是正文根本没来、还是全被推理吃了。
+      // 记下帧数、各 chunk 类型计数与推理字数，回落时一并写进 reason。
+      const kinds = {}
+      let frames = 0
+      let reasoningChars = 0
+      let finish = null
+      if (diag) diag.inputChars = String(user).length
       try {
         const stream = llm.stream({
           provider,
@@ -182,7 +189,12 @@ export default {
           messages: [{ role: 'user', content: [{ type: 'text', text: user }] }],
         })
         for await (const chunk of stream) {
-          if (chunk && chunk.type === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
+          frames += 1
+          const kind = chunk && typeof chunk.type === 'string' ? chunk.type : '(无 type)'
+          kinds[kind] = (kinds[kind] || 0) + 1
+          if (kind === 'reasoning-delta' && typeof chunk.text === 'string') reasoningChars += chunk.text.length
+          if (kind === 'finish') finish = chunk.reason || chunk
+          if (kind === 'text-delta' && typeof chunk.text === 'string') out += chunk.text
         }
       } catch (error) {
         const msg = error && error.message ? error.message : String(error)
@@ -190,10 +202,22 @@ export default {
         note('llm call failed: ' + msg)
         return null
       }
+      if (diag) {
+        diag.frames = frames
+        diag.kinds = kinds
+        diag.reasoningChars = reasoningChars
+        diag.finish = finish
+      }
       const text = out.trim()
       if (!text) {
-        console.log('[dsh-catnest] llm 空输出（maxTokens=' + maxTokens + '，可能被推理块耗尽）')
-        note('空输出（maxTokens=' + maxTokens + '，可能被推理块耗尽）')
+        const detail =
+          '帧数=' + frames +
+          ' 推理=' + reasoningChars + '字' +
+          ' 输入=' + String(user).length + '字' +
+          ' 类型=' + JSON.stringify(kinds) +
+          ' finish=' + JSON.stringify(finish)
+        console.log('[dsh-catnest] llm 空输出（maxTokens=' + maxTokens + '）：' + detail)
+        note('空输出（maxTokens=' + maxTokens + '）：' + detail)
       }
       return text || null
     }
