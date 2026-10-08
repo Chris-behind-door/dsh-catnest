@@ -62,7 +62,7 @@
 import { readFile, appendFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, isOutdoorId, placeScene, masterPlace, masterPlaceLabel, masterRoomId, masterAtHome, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, cycleView, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs } from './lib.js'
+import { CatNest, sliceEventsText, charName, roomName, roomItems, roomItemsText, itemsEventText, roomRelation, isOutdoorId, placeScene, masterPlace, masterPlaceLabel, masterRoomId, masterAtHome, COMPANION_IDS, CHARACTER_NAMES, CHARACTER_BIOS, RELATION_PAIRS, RELATION_FIELDS, conditionLabel, conditionText, conditionPhase, cycleView, hearReadyOf, hearStaleOf, autonomyEnabled, isBusy, humanInterval, sayVolume, SAY_VOLUMES, detectMoveIntent, TOPIC_SEED_CATEGORIES, pickTopicSeeds, topicSeedsText, activeTopicsOf, t6BackoffMs, humanDay, clockAt, makeStamper } from './lib.js'
 
 const DEFAULT_DIR = join(homedir(), '.dsh', '.catnest')
 // 户型图随包分发（存在感 UI 面板头图），路径相对本模块定位
@@ -75,8 +75,13 @@ const avatarUrl = (id) => new URL('./assets/avatars/' + id + '.png', import.meta
 // 资源的权威清单：加一张图只要落文件 + 在目录里加一条，前后端都不用改代码。
 const ROOMS_INDEX_URL = new URL('./assets/rooms/index.json', import.meta.url)
 const roomImageUrl = (file) => new URL('./assets/rooms/' + file, import.meta.url)
-// 有 delta 打字机看着，慢不再是无反馈的黑等；150s 给免费模型高峰期留足余地。
-const LLM_TIMEOUT_MS = 150000
+// 单步看门狗（2026-09-24 主人指正后改口径）：判据是「卡死」，不是「总共花了多久」。
+// 旧口径 = 整步总时长 150s，到点判无动作。问题是只要流还在吐帧（哪怕全是推理帧），
+// 就不算卡死：9/24 上午那 5 次沉默全是这么误杀的——推理吐了 1.3~1.7 万字、正文还没轮到，
+// finish=- 说明流好好的，只是慢。
+// 现口径 = 连续 LLM_IDLE_MS 没有任何帧才算卡死；只要有帧就重置计时，想多久都行
+// （maxTokens 本身就是天然上限）。60s 对实测的首字节 5~7s 极其宽松。
+const LLM_IDLE_MS = 60000
 // T6 自主节奏轻推（§9.1）：主人最后交互后留 10 分钟过渡；T6 自身 5 分钟说话冷却
 // （自循环保险丝：轻推→说句没做事→仍空闲→下个 tick 又轻推；非猫间闸）
 // 2026-09-13：离家那档照旧；主人在家时由 home.autonomy.homeOn 开关决定跑不跑，
@@ -103,6 +108,10 @@ const DISTILL_SYSTEM =
   '每条以「- 」开头单独一行，2~5 条；只写事实和感受，不要评价，不要编造时间线以外的事。\n' +
   '不愉快的事照写：争执、被驳回、谁的眼泪、谁走开、谁一直没开口，都算发生过的事。' +
   '不许只挑体面的写，也不许替任何人圆场（主人 2026-09-23 明确要求：哪怕对主人不光彩，也要留下）。\n' +
+  // 日历（2026-09-24 主人拍板）：家史里的时间必须是绝对日期。
+  // 起因：写「明天」的记忆，隔一天就没人知道是哪天，等于没写。
+  '关于时间：一律写绝对日期（如「9月25日」「25日下午」），不许写「明天」「后天」「第二天」这种相对说法；' +
+  '事件前面的「—— 日期 ——」和 [HH:mm] 就是当时的时刻，换算时以它为准。\n' +
   '只输出以下格式，不要其他内容：\n' +
   '【回顾】\n...\n\n【小玖】\n- ...\n- ...\n\n【墨璃】\n- ...'
 
@@ -112,6 +121,11 @@ export default {
   apply(ctx, config) {
     const dir = config && config.catnestDir ? String(config.catnestDir) : DEFAULT_DIR
     const nest = new CatNest(dir)
+    // 单步看门狗阈值可注入（测试专用：不注入就走 LLM_IDLE_MS）。
+    // 起因 2026-09-24：主人指正「只要还在输出就不该超时」，这条语义必须能被测出来，
+    // 而真等 60s 没法进用例，所以给测试留一个把阈值压到几百毫秒的口子。
+    const idleMs =
+      config && Number.isFinite(config.llmIdleMs) && config.llmIdleMs > 0 ? config.llmIdleMs : LLM_IDLE_MS
     // §9.18 周期抖动与每日掷骰的随机源：默认 Math.random；测试注入固定桩，
     // 否则「每天 12% 掷中一个状态」会让调用 tick 的用例偶发飘红。
     const tickRand = config && typeof config.tickRand === 'function' ? config.tickRand : undefined
@@ -136,23 +150,36 @@ export default {
 
     // ── 角色调度（里程碑三）助手 ──
 
-    // 当前默认模型选择（跟随主人切换，如换本地模型）；解析失败回退默认档
-    const resolveModel = () => {
-      let provider = 'opencode-go'
-      let model = 'deepseek-v4-flash'
+    // 猫窝自己的模型档（2026-10-02 主人定：不与工作模式同步）。
+    // 旧行为：只读宿主默认档（agentDefaultModel.currentSelection），猫窝面板换模型也写它，
+    // 于是工作模式一换档、或者开个新 session 换档，家里全家立刻跟着换。
+    // 现在家的模型落在 ~/.dsh/.catnest/model.json：首次读不到时从宿主默认档快照一次
+    // （迁移平滑，当前用什么就接着用什么），之后各走各的。
+    const FALLBACK_MODEL = { provider: 'opencode-go', model: 'deepseek-v4-flash' }
+    const hostDefaultModel = () => {
       try {
         const d = ctx.get('agentDefaultModel')
         if (d !== undefined && typeof d.currentSelection === 'function') {
           const sel = d.currentSelection()
           if (sel && sel.provider && sel.model) {
-            provider = sel.provider
-            model = sel.model
+            return { provider: String(sel.provider), model: String(sel.model) }
           }
         }
       } catch {
-        /* keep defaults */
+        /* keep null */
       }
-      return { provider, model }
+      return null
+    }
+    const resolveModel = async () => {
+      const saved = await nest.modelSelection()
+      if (saved !== null) return saved
+      const sel = hostDefaultModel() || FALLBACK_MODEL
+      try {
+        await nest.saveModelSelection(sel)
+      } catch {
+        /* 落盘失败不拦生成：这次先用着，下次读不到再快照 */
+      }
+      return sel
     }
 
     // LLM 一次性调用：返回纯文本或 null，带退避重试。
@@ -169,7 +196,7 @@ export default {
         if (diag) diag.error = 'llm 服务不可用（present=' + (llm !== undefined) + '）'
         return null
       }
-      const { provider, model } = resolveModel()
+      const { provider, model } = await resolveModel()
       const attempts = 3
       const failures = []
       for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -270,6 +297,10 @@ export default {
       const sections = {}
       let current = null
       const stripItem = (s) => s.replace(/^[-•*]\s*/, '').replace(/^\d+[.、]\s*/, '').trim()
+      // 垃圾条目（2026-10-02 实战抓到）：模型偶尔吐一行只有标点的空条目（"- ："），
+      // 剥掉前缀后正文就成了「：」，写进记忆域还会被当成家史注入（kyu/moli 各中一条）。
+      // 判据 = 一个字母/数字/汉字都没有的条目一律丢。
+      const junk = (s) => !/[\p{L}\p{N}]/u.test(s)
       for (const raw of String(text).split('\n')) {
         const line = raw.trim()
         if (!line) continue
@@ -277,13 +308,13 @@ export default {
         if (m) {
           current = m[1]
           sections[current] = sections[current] || []
-          const rest = m[2].trim()
-          if (rest) sections[current].push(stripItem(rest))
+          const rest = stripItem(m[2].trim())
+          if (rest && !junk(rest)) sections[current].push(rest)
           continue
         }
         if (!current) continue
         const item = stripItem(line)
-        if (item) sections[current].push(item)
+        if (item && !junk(item)) sections[current].push(item)
       }
       return sections
     }
@@ -309,7 +340,7 @@ export default {
         // 收尾只留下好感度清单）。主人 2026-09-23 拍板开 16k。
         const diag = {}
         const out = await llmCall(
-          DISTILL_SYSTEM,
+          DISTILL_SYSTEM + '\n【关片时刻】' + humanDay(new Date()) + clockAt(new Date()) + '。',
           '主人不在时家里发生了什么（事件时间线）：\n' + lines.join('\n'),
           16000,
           diag,
@@ -394,26 +425,53 @@ export default {
         .trim()
     }
 
-    // 角色回忆：从自己的记忆域（按角色分键）捞相关片段——接话时角色记得过去的事。
-    // 只取"家史"（时间片蒸馏，tags 含 时间片），挡掉带猫窝标签的工程/交付笔记，
-    // 否则角色会在客厅里念叨 SSE 和测试用例（主人点名的污染问题）。
-    // 过滤走池级：直接把 时间片 标签传给 recall（服务侧先按 tags 过滤池、再打分），
-    // 工程笔记永远进不了候选池。旧写法"recall 8 条猫窝再本地过滤"有硬伤：
-    // top 8 全是工程笔记时过滤后一无所有，角色明明有家史也会"失忆"（主人点破）。
-    const recallMemories = async (charId, query) => {
+    // ── 记忆两路（2026-10-02 主人定案）──
+    // 旧写法：拿主人最后一句台词当 query、BM25 取前三自动注入。两个毛病：
+    //   ① 戏里的台词短、指代多（「那个」「上次说的」），字面跟真正该想起来的事往往不重合，
+    //      命中很随机，她该记得的反而捞不到；
+    //   ② 同一天的碎片会一起挤进三个槽位（9-30 定性的「召回槽位被碎片占满」）。
+    // 现在分两路：
+    //   路一「最近家里的事」：不检索，按时间取最近 K 条家史，排除当前时间片。
+    //     当前片的事整段都在【这个时间片里发生的事】里，再塞一遍纯属重复（主人点破）。
+    //   路二「想不起来就自己查」：recall_memory 工具交给角色自己调（见 AGENT_TOOLS），
+    //     记忆工具单独占一步不算消耗动作预算（宽限），说话仍然一轮收尾。
+    const RECENT_MEM_COUNT =
+      config && Number.isFinite(config.recentMemoryCount) && config.recentMemoryCount > 0
+        ? Math.min(Math.round(config.recentMemoryCount), 20)
+        : 10
+    // 单条上限：家史里少数条目上千字（最长的 1624 字），不裁会把注入整个吃掉
+    const MEM_LINE_CHARS = 200
+    const memLine = (h) => '- ' + (h.date ? '（记于 ' + h.date + '）' : '') + String(h.text).slice(0, MEM_LINE_CHARS)
+
+    // 家史过滤：池级 tags 过滤（服务侧先筛池再打分，工程笔记永远进不了候选池）
+    // + 本地按 时间片 兜底 + 挡掉当前时间片。
+    const pickHistory = (res, sliceId) =>
+      (res && Array.isArray(res.entries) ? res.entries : [])
+        .filter((h) => h && typeof h.text === 'string' && h.text.trim())
+        .filter((h) => Array.isArray(h.tags) && h.tags.includes('时间片'))
+        .filter((h) => !(sliceId && Array.isArray(h.tags) && h.tags.includes(sliceId)))
+
+    // 最近的家史：recall 空 query = 取池里最新的那批（不带 BM25 打分）。
+    // 取回后只留最新 K 条，再翻成「旧→新」——读起来是一条时间线，不是一叠碎片。
+    const recentMemories = async (charId, sliceId) => {
       const memory = ctx.get('memory')
       if (memory === undefined || typeof memory.recall !== 'function') return []
       try {
-        // 注意 recall 返回 {entries:[...]} 不是数组；本地再按 时间片 兜一道底，
-        // 不依赖实现方的池过滤语义（防未来服务改动让工程笔记漏进客厅）
-        const res = await memory.recall(charId, String(query || ''), 3, ['时间片'])
-        return ((res && Array.isArray(res.entries) ? res.entries : []) || [])
-          .filter((h) => h && typeof h.text === 'string' && h.text.trim())
-          .filter((h) => Array.isArray(h.tags) && h.tags.includes('时间片'))
-          .slice(0, 3)
+        const res = await memory.recall(charId, '', 20, ['时间片'])
+        const list = pickHistory(res, sliceId)
+        list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0)) // 新 → 旧
+        return list.slice(0, RECENT_MEM_COUNT).reverse() // 只留最新 K 条，翻成旧 → 新
       } catch {
         return []
       }
+    }
+
+    // 角色自己查旧事（recall_memory 工具的实现）：BM25 检索家史池，仍挡当前片。
+    const searchMemories = async (charId, sliceId, query, limit = 5) => {
+      const memory = ctx.get('memory')
+      if (memory === undefined || typeof memory.recall !== 'function') return null
+      const res = await memory.recall(charId, String(query || ''), limit, ['时间片'])
+      return pickHistory(res, sliceId).slice(0, limit)
     }
 
 
@@ -442,7 +500,12 @@ export default {
     const SCENE_PERMIT =
       '【可以做的事】\n' +
       '顺着气氛贴近、说带暗示的话、把心里想的做出来，都是可以的；' +
-      '按自己的性子闪躲或者反撩也行。不写露骨描写，也不要跳出角色讲道理。'
+      '按自己的性子闪躲或者反撩也行。不写露骨描写，也不要跳出角色讲道理。\n' +
+      // 借代（2026-09-24 主人拍板）：不写露骨 ≠ 把这回事含糊带过。
+      // 起因：收尾蒸馏拿到的对话全是「交给主人」这类虚指，家史就只剩「三个人一张床」。
+      '亲热的时刻不要跳过、也别含糊带过：允许用借代和隐喻写，用感官、动作、气氛让人看得出' +
+      '发生了什么（"把最后一样交出去"、"被窝里的动静"、"指尖一路数过去"这类写法都行，' +
+      '举例而已，不必照搬）——只是不把身体细节摊开写。这条是主人 2026-09-24 亲口补的。'
 
     // 静态场景段：总体地图 + 声音传播规则（世界客观法则，开片后恒定，进缓存稳定区）
     const buildHomeViewStatic = (home) => {
@@ -468,7 +531,9 @@ export default {
     // §9.2：【当前话题】动态窗口（她参与且未收掉的话题，至多 2 行）。
     const buildPresenceView = (home, charId) => {
       const nowDate = new Date()
-      const clock = '现在是 ' + nowDate.getHours() + ' 点 ' + nowDate.getMinutes() + ' 分'
+      // 日历（2026-09-24 主人拍板）：时钟行从「几点几分」升到「几年几月几日（周X）几点几分」。
+      // 猫不知道自己几号，就会在对话与记忆里写「明天」，而那个明天谁也换算不回来。
+      const clock = '现在是 ' + humanDay(nowDate) + nowDate.getHours() + ' 点 ' + nowDate.getMinutes() + ' 分'
       const at = Object.values(home.characters || {})
         .filter((c) => c && c.room)
         .map((c) => {
@@ -487,8 +552,17 @@ export default {
                 ? '·还剩 ' + Math.ceil(c.activityLeftMs / 60000) + ' 分'
                 : ''
             where += '（' + (c.activity || '活') + '中·暂停' + left + '）'
-          } else if (c.activity) where += '（在做：' + c.activity + '）'
-          else if (c.mood) where += '（' + c.mood + '）'
+          } else if (c.activity) {
+            // 剩余时间（2026-09-28 主人定）：只写「在做：X」的时候，模型看不见这口锅还剩多少火，
+            // 于是每轮都想重新声明一次——当天实测 112 次挂活动里 95 次是"上一件还没到点就重挂"，
+            // 连续链条最长 41/71 次不断。暂停态一直都有「·还剩 N 分」，正常在做反而什么都不给，补齐。
+            const endsMs = typeof c.activityEndsAt === 'string' ? new Date(c.activityEndsAt).getTime() : NaN
+            const left =
+              Number.isFinite(endsMs) && endsMs > nowDate.getTime()
+                ? '·还剩 ' + humanInterval(nowDate.getTime(), endsMs)
+                : ''
+            where += '（在做：' + c.activity + left + '）'
+          } else if (c.mood) where += '（' + c.mood + '）'
           return where
         })
         .join('，')
@@ -557,6 +631,13 @@ export default {
         return null
       }
       const out = []
+      // 日历（2026-09-24）：时间线每行带 [HH:mm]，跨天插一行日期分隔。
+      // 角色要能判断「那是昨天的事」，否则片跨天时前后接成「刚刚」。
+      const stamp = makeStamper(out)
+      const put = (t, line) => {
+        out.push(line)
+        stamp(out.length - 1, t)
+      }
       const pendingMoves = new Map() // moverId → {from, to}：两次对话间的挪动合并同类项
       const flushMoves = () => {
         for (const [mover, mv] of pendingMoves) {
@@ -565,17 +646,17 @@ export default {
           if (mv.from === mv.to) continue // 乱点又回原位：零噪音
           // 跨门边优先（大地图 §4）：出门 / 回家是叙事节点，比「从玄关挪去了单元门口」重
           if (mv.door) {
-            out.push((mover === 'master' ? '主人' : nameOf(mover)) + mv.door + '了')
+            put(mv.t, (mover === 'master' ? '主人' : nameOf(mover)) + mv.door + '了')
             continue
           }
           if (mover === 'master') {
             // 主人位置变化：回家/出门有专属措辞（from/to 为 null 表示进出宅门）
-            if (!mv.from && mv.to) out.push('主人回来了，去了' + roomNameOf(mv.to))
-            else if (mv.from && !mv.to) out.push('主人出门了')
-            else if (mv.from && mv.to) out.push('主人从' + roomNameOf(mv.from) + '挪去了' + roomNameOf(mv.to))
+            if (!mv.from && mv.to) put(mv.t, '主人回来了，去了' + roomNameOf(mv.to))
+            else if (mv.from && !mv.to) put(mv.t, '主人出门了')
+            else if (mv.from && mv.to) put(mv.t, '主人从' + roomNameOf(mv.from) + '挪去了' + roomNameOf(mv.to))
             continue
           }
-          out.push(nameOf(mover) + '从' + roomNameOf(mv.from) + '挪去了' + roomNameOf(mv.to))
+          put(mv.t, nameOf(mover) + '从' + roomNameOf(mv.from) + '挪去了' + roomNameOf(mv.to))
         }
       }
       for (const l of lines || []) {
@@ -586,30 +667,30 @@ export default {
           flushMoves()
           const ntext = typeof l.rawText === 'string' && l.rawText ? l.rawText : ''
           if (!ntext) continue
-          if (l.char === charId) out.push('【你注意到】' + ntext)
-          else if (!l.private) out.push(ntext)
+          if (l.char === charId) put(l.t, '【你注意到】' + ntext)
+          else if (!l.private) put(l.t, ntext)
           continue
         }
         if (l.type === 'items') {
           // 家当变更（HOUSE_DESIGN §3）：家里的东西进出是公共事实，全员时间线可见
           flushMoves()
           const t = itemsEventText(l, home)
-          if (t) out.push(t)
+          if (t) put(l.t, t)
           continue
         }
         if (l.type === 'topic-open' || l.type === 'topic-join' || l.type === 'topic-end' || l.type === 'topic-reopen' || l.type === 'activity-pause') {
           // 话题与放下锅铲账本行（§9.2/§9.9）：公共家庭事实，全员时间线可见
           flushMoves()
           if (l.type === 'topic-open') {
-            out.push(nameOf(l.char) + (l.to ? '向' + nameOf(l.to) : '') + '提起话题：' + l.about)
+            put(l.t, nameOf(l.char) + (l.to ? '向' + nameOf(l.to) : '') + '提起话题：' + l.about)
           } else if (l.type === 'topic-join') {
-            out.push(nameOf(l.char) + '加入了话题：' + l.about)
+            put(l.t, nameOf(l.char) + '加入了话题：' + l.about)
           } else if (l.type === 'topic-end') {
-            out.push(nameOf(l.char) + '提议收掉话题：' + l.about)
+            put(l.t, nameOf(l.char) + '提议收掉话题：' + l.about)
           } else if (l.type === 'topic-reopen') {
-            out.push(nameOf(l.char) + '：这个还要聊')
+            put(l.t, nameOf(l.char) + '：这个还要聊')
           } else {
-            out.push(nameOf(l.char) + '放下了手里的活（' + l.activity + '）')
+            put(l.t, nameOf(l.char) + '放下了手里的活（' + l.activity + '）')
           }
           continue
         }
@@ -625,7 +706,7 @@ export default {
               : typeof l.ms === 'number'
                 ? humanInterval(0, l.ms)
                 : ''
-          out.push('（时间片外过去了' + human + '，家是静止的、钟表一直在走，现在重新开始）')
+          put(l.t, '（时间片外过去了' + human + '，家是静止的、钟表一直在走，现在重新开始）')
           continue
         }
         if (l.type === 'move' || l.type === 'master-move') {
@@ -633,7 +714,7 @@ export default {
           if (!mover) continue
           // 跨门边（大地图 §4）：整张图只有 entry↔unit_door 是门，跨它记 door=出家门/回家。
           // 出门回家的说法由 doorMoveLabel 统一给，这里原样带上。
-          pendingMoves.set(mover, { from: l.from, to: l.to, door: l.door || null })
+          pendingMoves.set(mover, { from: l.from, to: l.to, door: l.door || null, t: l.t })
           continue
         }
         if (l.type !== 'say' && l.type !== 'shout') continue
@@ -656,10 +737,10 @@ export default {
           // 隔墙只闻声不见形：action 是视觉信息，不入听者的时间线；话题标记跟着内容走
           // （2026-09-20 起大声走 clear 口径，这条只剩正常音量的隔墙行和旧账本的大声行）
           const how = vol === '大声' ? '的喊声' : '的声音'
-          out.push('（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + how + '：）' + aboutTxt + l.rawText)
+          put(l.t, '（' + roomNameOf(speakerRoom) + '传来' + nameOf(who) + how + '：）' + aboutTxt + l.rawText)
         } else {
           const volTxt = vol === '小声' ? '低声' : vol === '大声' ? '大声' : ''
-          out.push(
+          put(l.t, 
             nameOf(who) + (volTxt ? '（' + volTxt + '）' : '') + (act ? '（' + act + '）' : '') + aboutTxt + '：' + l.rawText,
           )
         }
@@ -674,6 +755,11 @@ export default {
     // adjust_relation 阶段二再上（主人拍板）；bash 沙箱阶段三。
 
     const MAX_STEPS = 4
+    // 记忆工具的宽限（2026-10-02 主人定）：查记忆单独占一步不消耗动作预算。
+    // 「先查再答」本来就要多花一次 llm 调用，但不能因此挤掉她做事的步数；
+    // 说话仍然一轮收尾（stepSaid 分支），不会平白多问一次。
+    const MEMORY_TOOLS = new Set(['recall_memory'])
+    const MAX_MEMORY_GRACE = 2
     const STEP_MAX_TOKENS = 8192
 
     // 工具面（MVP）：say 是唯一发声口；move_to/do_activity/remember 对应
@@ -704,6 +790,15 @@ export default {
                 '要和这个房间里一条还开着的话题的短语完全一致（写错了或者那条线已经收了，' +
                 '这句话照样说得出去，只是不挂在那条线上，回执会告诉你）。' +
                 '想开新的话题用 open_topic；跟主人说话、随口一句都不用带。',
+            },
+            to: {
+              type: 'string',
+              description:
+                '可选：这句话是对谁说的（写名字，如「墨璃」「主人」）。' +
+                '在同一个房间里点名一位姐妹，她会当场听见、接着回你的话；' +
+                '想跟姐姐真的聊起来，就把名字写上。' +
+                '不点名 = 屋里谁都听得见，但谁都不会被叫起来接话（自言自语也没关系）。' +
+                '点名管不住对方的处境：她手上正忙着就会晚些才反应过来，隔着一堵墙也听不清。',
             },
             volume: {
               type: 'string',
@@ -760,6 +855,8 @@ export default {
         name: 'take_item',
         description:
           '从你现在待的房间里拿走或用掉东西（用掉一张纸巾、拿走一本书）。' +
+          '拿走就是用掉：归零它就从房间里消失了，这不是把东西挪个地方。' +
+          '床、柜子、碗柜这类长期摆着的家具不要拿。' +
           '只能碰你所在房间里的东西：隔壁房间有什么你看不见，也够不着。' +
           '记账只管长期摆在那儿的东西：饭菜、茶水、零食这类用完就没的，本来就不进账，也就不用拿。',
         parameters: {
@@ -870,6 +967,20 @@ export default {
         },
       },
       {
+        // 记忆查询（2026-10-02 主人定案）：相关的事不再自动塞给她，交给她自己伸手拿。
+        // 想不起来某件具体的旧事（某个约定、某样东西、某个日子）就查一步，查到再接着说；
+        // 这一步不扣她做事的步数（框架给宽限），但说话仍然一轮收尾。
+        name: 'recall_memory',
+        description:
+          '翻自己的记忆，查一件具体的旧事（某个约定、某样东西、哪天发生的什么）。' +
+          '想不起来就先查这一步，查到之后再说话；随口聊天不用查。',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string', description: '要查什么（几个关键词就够）' } },
+          required: ['query'],
+        },
+      },
+      {
         name: 'set_condition',
         description:
           '给自己设置一段有明确时间的身体状态（生病、受伤、疲劳等）。' +
@@ -967,7 +1078,7 @@ export default {
     // onSayDelta(frag)：say 工具 text 字段的解码片段（打字机直播用），可选。
     // stats：可选诊断累加器（2026-09-22 加）——首字节时刻/帧数/正文与推理字数/tool 参数字数/usage，
     // 由 llmStep 建好传进来，超时那一刻读它就能分清「上游排队没来」还是「吐到一半停住」。
-    const collectStep = async (stream, onSayDelta, stats) => {
+    const collectStep = async (stream, onSayDelta, stats, onFrame) => {
       const partials = new Map() // index → { id, name, args }
       const sayTrackers = new Map() // index → feed（仅 say 工具建）
       const doneByBlockEnd = new Set()
@@ -976,6 +1087,8 @@ export default {
       let finish = null
       for await (const chunk of stream) {
         if (!chunk) continue
+        // 「还有动静」的信号源（2026-09-24）：推理帧也算——看门狗和前端横幅都吃这个。
+        if (typeof onFrame === 'function') onFrame(chunk.type)
         if (stats) {
           stats.chunks += 1
           if (stats.firstAt === null) stats.firstAt = Date.now()
@@ -1023,29 +1136,74 @@ export default {
       return { toolCalls, text, finish }
     }
 
-    // 带工具的单步流式调用：软超时后返回 null（该步视为无动作，不阻塞本轮其余角色）。
+    // 带工具的单步流式调用：静默超时（连续无帧）后返回 null（该步视为无动作，不阻塞本轮其余角色）。
     // onSayDelta 透传给 collectStep 做打字机直播。
     // onDiag(line)：可选，把这一步的诊断写进时间片 agent-debug（2026-09-22 加）。
     //   起因：在此之前超时只留一行「本步无结果」，分不清「首字节根本没来（上游排队）」
     //   与「吐到一半停住（截断）」，9/22 傍晚连撞 8 次 150s 时正好卡在这个盲区，
     //   只能靠外部复现反推。现在每步落一行：首字节/总耗时/帧数/finish/正文字数/推理字数/usage。
-    const llmStep = async (system, messages, maxTokens, onSayDelta, onDiag) => {
+    // onActivity(phase)：可选（2026-09-24 加）。流每有新帧就报一次，phase ∈
+    //   'first'（首帧还没来）/ 'thinking'（在吐推理）/ 'writing'（say 的参数开始流了）。
+    //   用途有两个：① 前端横幅据此判断「后端还在动」还是「真卡住了」；
+    //   ② 看门狗据此判断卡死——这就是「只要在输出就不算超时」的落点。
+    const llmStep = async (system, messages, maxTokens, onSayDelta, onDiag, onActivity) => {
       const llm = ctx.get('llm')
       if (llm === undefined || typeof llm.stream !== 'function') return null
-      const { provider, model } = resolveModel()
+      const { provider, model } = await resolveModel()
       const startedAt = Date.now()
       const stats = { firstAt: null, chunks: 0, textChars: 0, reasoningChars: 0, argsChars: 0, usage: null }
+      // 看门狗基准：最后一次收到帧的时刻。每帧都会推它往前走。
+      let lastFrameAt = Date.now()
+      let phase = 'first'
+      let lastPingAt = 0
+      let lastPhase = ''
+      let idleTimer = null
+      let idleResolve = null
+      let timedOut = false
+      const idlep = new Promise((resolve) => {
+        idleResolve = resolve
+      })
+      // 每次有帧就重新武装。用「收帧重置的 setTimeout」而不是「固定间隔轮询」：
+      // 轮询间隔会把小阈值拖成大延迟（测试里阈值 150ms、轮询 2s 就等于永不触发）。
+      const armIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer)
+        idleTimer = setTimeout(() => {
+          timedOut = true
+          idleResolve()
+        }, idleMs)
+        if (idleTimer && typeof idleTimer.unref === 'function') idleTimer.unref()
+      }
+      const touch = (next) => {
+        lastFrameAt = Date.now()
+        if (next) phase = next
+        armIdle() // 有动静就重新计时——「一直在输出」就是这么变成「永不超时」的
+        if (typeof onActivity !== 'function') return
+        const nowMs = Date.now()
+        // 节流：phase 变了立刻报（前端文案要跟着变），否则最多每秒一个心跳
+        if (phase === lastPhase && nowMs - lastPingAt < 1000) return
+        lastPingAt = nowMs
+        lastPhase = phase
+        try { onActivity(phase) } catch { /* 心跳不能影响主流程 */ }
+      }
+      armIdle() // 起步即武装：首帧一直不来也算静默（上游排队一样要让主人看见）
       const fmt = (r) => {
-        // finish 是对象（{ kind: stop|tool-calls|max-tokens|aborted }），aborted 还带 failure
-        // 详情——那是「上游主动掐断」和「流挂着不动」的唯一分界，别拼成 [object Object]。
+        // finish 是对象（{ kind: stop|tool-calls|max-tokens|aborted|error }），带 failure 时要把
+        // code/message 写出来——那是「上游主动掐断」「网关报错」和「流挂着不动」的唯一分界，
+        // 别拼成 [object Object]，也别把错因丢掉。
+        // 2026-09-27 修：旧写法只在 kind === 'aborted' 时拼 failure，可网关抽风实际落在
+        // kind === 'error' 上（实测 finish={"kind":"error","failure":{"code":"TRANSPORT"}}、
+        // 520 SERVER 都走这条），于是埋点里只剩一行「帧=2 finish=error」，最想看的错因反倒没记，
+        // 当晚只能靠另写 curl 探针反推。现在任何 kind 只要带 failure 一律带上。
         let finishText = '-'
         const f = r && r.finish
         if (typeof f === 'string') finishText = f
         else if (f && typeof f === 'object') {
           finishText = f.kind || '?'
-          if (f.kind === 'aborted' && f.failure) {
+          if (f.failure) {
             const fail = f.failure
-            finishText += '(' + String(fail.code || fail.message || JSON.stringify(fail)).slice(0, 80) + ')'
+            const code = fail.code ? String(fail.code) : ''
+            const msg = fail.message ? String(fail.message) : ''
+            finishText += '(' + (code && msg ? code + ':' + msg : code || msg || JSON.stringify(fail)).slice(0, 100) + ')'
           }
         }
         const parts = [
@@ -1069,24 +1227,35 @@ export default {
       }
       try {
         const stream = llm.stream({ provider, model, maxTokens, system, messages, tools: AGENT_TOOLS })
-        const consume = collectStep(stream, onSayDelta, stats)
-        let timedOut = false
-        const timeoutp = new Promise((resolve) => {
-          const timer = setTimeout(() => { timedOut = true; resolve() }, LLM_TIMEOUT_MS)
-          if (timer && typeof timer.unref === 'function') timer.unref()
-        })
-        await Promise.race([consume, timeoutp])
+        const consume = collectStep(
+          stream,
+          (frag) => {
+            touch('writing') // say 的参数开始流了：前端该从「正在想」切到打字机
+            if (typeof onSayDelta === 'function') onSayDelta(frag)
+          },
+          stats,
+          (t) => touch(t === 'reasoning-delta' ? 'thinking' : undefined),
+        )
+        await Promise.race([consume, idlep])
+        if (idleTimer) clearTimeout(idleTimer)
         if (timedOut) {
-          console.log('[dsh-catnest] llm 步软超时（' + LLM_TIMEOUT_MS + 'ms），该步视为无动作')
-          diag('LLM 步软超时（' + LLM_TIMEOUT_MS + 'ms）：' + fmt(null))
-          // 超时只放弃等待，底层流并没有 abort（历史行为，2026-09-22 未改）。把它的最终结局也记下来：
-          // 永远没有这一行 = 流真的挂死了；有这一行 = 其实上游会正常收尾，只是慢过了阈值。
+          const idleS = ((Date.now() - lastFrameAt) / 1000).toFixed(0)
+          const why =
+            phase === 'first'
+              ? '首帧一直没来（上游排队）'
+              : phase === 'writing'
+                ? '工具参数吐到一半停住'
+                : '推理吐到一半停住'
+          console.log('[dsh-catnest] llm 步静默超时（' + idleS + 's 没有任何帧），该步视为无动作')
+          diag('LLM 步静默超时（阈值 ' + idleMs + 'ms，实测静默 ' + idleS + 's；' + why + '）：' + fmt(null))
+          // 静默超时只放弃等待，底层流并没有 abort（历史行为，2026-09-22 未改）。把它的最终结局也记下来：
+          // 永远没有这一行 = 流真的挂死了；有这一行 = 其实上游会正常收尾，只是中途卡了一小段。
           void consume
             .then((r) => {
-              diag('（超时之后）后台流收尾：' + fmt(r))
+              diag('（静默超时之后）后台流收尾：' + fmt(r))
             })
             .catch((error) => {
-              diag('（超时之后）后台流异常结束：' + (error && error.message ? error.message : String(error)))
+              diag('（静默超时之后）后台流异常结束：' + (error && error.message ? error.message : String(error)))
             })
           return null
         }
@@ -1097,6 +1266,22 @@ export default {
         console.log('[dsh-catnest] llm step failed: ' + (error && error.message ? error.message : String(error)))
         diag('LLM 步异常：' + fmt(null) + ' err=' + (error && error.message ? error.message : String(error)))
         return null
+      }
+    }
+
+    // 家当工具回执的尾巴（2026-09-30 主人反馈的坑）：【屋里有什么】那行在轮首构建一次就固定了，
+    // 同一轮里动过东西之后，模型看到的还是**旧数量**——而 system 明写「屋里有什么就摆在
+    // 【屋里有什么】那行里」，两处矛盾时她信那一行，于是下一步会再拿一次（「一轮消耗了却以为
+    // 自己没消耗」）。回执本来就是每步新增的 messages，把刷新后的家当挂在这儿：零缓存代价
+    // （不碰第一条 user 消息，前缀 cache 照旧命中），每一步都能看到权威状态。
+    // 顺带让「家具被 take_item 吃掉」当场可见——账本里 2026-09-22 丢过一个碗柜。
+    const itemsRefresh = async (roomId) => {
+      try {
+        const h = await nest.home()
+        const text = roomItemsText(h, roomId)
+        return '\n【屋里有什么】' + (roomName(h, roomId) || String(roomId)) + '：' + (text || '（空）')
+      } catch {
+        return ''
       }
     }
 
@@ -1112,7 +1297,9 @@ export default {
           scheduleSnapshot()
           return {
             ok: true,
-            result: r.left > 0 ? '拿走了 ' + r.taken + ' 个，还剩 ' + r.left + ' 个。' : '全拿走了，房间里没有了。',
+            result:
+              (r.left > 0 ? '拿走了 ' + r.taken + ' 个，还剩 ' + r.left + ' 个。' : '全拿走了，房间里没有了。') +
+              (await itemsRefresh(r.room)),
             effect: { tool: 'take_item', name: itemName, count: r.taken },
           }
         }
@@ -1123,7 +1310,7 @@ export default {
           scheduleSnapshot()
           return {
             ok: true,
-            result: '放好了，现在有 ' + r.count + ' 个。',
+            result: '放好了，现在有 ' + r.count + ' 个。' + (await itemsRefresh(r.room)),
             effect: { tool: 'put_item', name: itemName, count: r.put },
           }
         }
@@ -1134,7 +1321,9 @@ export default {
           scheduleSnapshot()
           return {
             ok: true,
-            result: r.state ? '记下了：' + r.name + '（' + r.state + '）。' : '把 ' + r.name + ' 的状态清掉了。',
+            result:
+              (r.state ? '记下了：' + r.name + '（' + r.state + '）。' : '把 ' + r.name + ' 的状态清掉了。') +
+              (await itemsRefresh(r.room)),
             effect: { tool: 'set_item_state', name: itemName, state: r.state },
           }
         }
@@ -1159,10 +1348,21 @@ export default {
           for (const id of (r && r.urgent) || []) {
             await tryWakeHear(id, true, { bypassReady: true, clamor: { from: charId, room: r.room } })
           }
+          // 点名接话（2026-09-28 主人定）：同房被点名的姐妹当场叫醒接话（她正忙就接不上）。
+          // 回执把「话有没有递到」讲清楚：说了没人应和没说出口是两回事，别让模型自己猜。
+          const toRaw = typeof args.to === 'string' ? args.to.trim() : ''
+          let callNote = ''
+          if (toRaw && toRaw !== '主人' && toRaw !== 'master') {
+            const called = await callPeer(charId, toRaw, r)
+            if (called && called.ok) callNote = '（' + called.name + '听见了，正接着你的话）'
+            else if (called && called.why === 'busy') callNote = '（' + toRaw + '手上正忙着，晚些才会反应过来）'
+            else if (called && called.why === 'not-same-room') callNote = '（' + toRaw + '不在这个房间，隔着墙不一定听得清）'
+            else if (called && called.why === 'no-such-peer') callNote = '（没找到「' + toRaw + '」这个名字，话照样说出口了）'
+          }
           return {
             ok: true,
-            result: '已说出口。' + ((r && r.aboutNote) || ''),
-            effect: { tool: 'say', text, ...(action ? { action } : {}), ...(r && r.about ? { about: r.about } : {}), ...(volume !== '正常' ? { volume } : {}) },
+            result: '已说出口。' + ((r && r.aboutNote) || '') + callNote,
+            effect: { tool: 'say', text, ...(action ? { action } : {}), ...(r && r.about ? { about: r.about } : {}), ...(volume !== '正常' ? { volume } : {}), ...(toRaw ? { to: toRaw } : {}) },
           }
         }
         if (name === 'open_topic') {
@@ -1283,6 +1483,32 @@ export default {
           }
           await nest.resolveTopicAction(charId)
           return { ok: true, result: '已记下。', effect: { tool: 'remember', text } }
+        }
+        if (name === 'recall_memory') {
+          const q = typeof args.query === 'string' ? args.query.trim() : ''
+          if (!q) return fail('recall_memory 需要非空 query')
+          const st = await nest.status()
+          const sliceId = st && st.sliceId ? String(st.sliceId) : ''
+          let hits
+          try {
+            hits = await searchMemories(charId, sliceId, q, 5)
+          } catch (error) {
+            return fail('翻记忆出错：' + (error && error.message ? error.message : String(error)))
+          }
+          if (hits === null) return fail('记忆服务不可用')
+          await nest.resolveTopicAction(charId)
+          if (hits.length === 0) {
+            return {
+              ok: true,
+              result: '翻了翻自己的记忆，没有和「' + q + '」对得上的旧事。',
+              effect: { tool: 'recall_memory', query: q, hits: 0 },
+            }
+          }
+          return {
+            ok: true,
+            result: '想起这些（括号里是记下它的时刻）：\n' + hits.map(memLine).join('\n'),
+            effect: { tool: 'recall_memory', query: q, hits: hits.length },
+          }
         }
         if (name === 'set_condition') {
           const cname = typeof args.name === 'string' ? args.name.trim() : ''
@@ -1417,18 +1643,19 @@ export default {
       }
       const t = await nest.transcript()
       const lines = t && Array.isArray(t.lines) ? t.lines : []
-      const lastSay = [...lines]
-        .reverse()
-        .find((l) => (l.type === 'say' || l.type === 'shout') && typeof l.rawText === 'string' && l.rawText.trim())
       const [memHits, timeline] = await Promise.all([
-        recallMemories(charId, lastSay ? lastSay.rawText : ''),
+        recentMemories(charId, dbgSlice),
         Promise.resolve(timelineText(home, charId, lines)),
       ])
+      // 记忆注入口（2026-10-02 主人定案）：改成「最近家里的事」，不再用当前台词去检索。
+      // 每条带记录时刻：家史正文里大量相对说法（「刚才」「今晚」），旧记忆隔天被翻出来
+      // 没有时刻锚就会读成刚发生。写清「记于」是因为条目自身的日子是事件时间，
+      // 括号里的才是写下它的时刻，两者不是一回事。
       const memText =
         memHits.length > 0
-          ? '\n\n【你记得的一些事】\n' +
-            memHits.map((h) => '- ' + h.text.slice(0, 100)).join('\n') +
-            '\n（自然引用即可，不要逐条复述。）'
+          ? '\n\n【最近家里的事】（从早到晚，括号是记下它的时刻；这些都是已经过去的事，别当成现在）\n' +
+            memHits.map(memLine).join('\n') +
+            '\n（自然引用即可，不要逐条复述；更早的事想不起来就用 recall_memory 查。）'
           : ''
 
       // 家人认知（2026-08-26 定稿：直接复用对方完整角色卡）——
@@ -1442,26 +1669,39 @@ export default {
         if (fcard) familyCards.push(fname + '的角色卡：\n' + fcard)
       }
       const system =
-        '你是"猫窝"家里的成员' + name + '，用口语化的中文和家人说话。\n\n' +
+        '你是"猫窝"家里的成员' + name + '，用口语化的中文和家人说话。\n' +
+        // 日历（2026-09-24 主人要求）：日期属于基本信息，就进 system，不能只挂在动态快照里。
+        // 只放日期不放时刻：跨天时 system 前缀失效一次，之后整天命中，代价可忽略；
+        // 顺带把「写绝对日期」这条约定摆在最前面，角色自己说的话就带日期，蒸馏原料也干净。
+        '【今天】' + humanDay(new Date()) + '。说到或要记下的日子，一律写绝对日期（如「9月25日」），' +
+        '别写「明天」「后天」——记下的东西是要留着的，相对说法隔一天就还原不回来。\n\n' +
         '你的角色卡：\n' + (persona || name) + '\n\n' +
         (familyCards.length > 0 ? '【家人】\n' + familyCards.join('\n') + '\n\n' : '') +
         '【主人】' + MASTER_PERSONA + '\n\n' +
         '你通过调用工具来行动：想说话就调用 say（说话时伴随的即时小动作放进 say 的 action，没有就别传）；' +
         '想走动就调用 move_to；想做事就调用 do_activity（做事要说预计多久，见下面的分寸）；' +
-        '想记住什么就调用 remember；身体状态（生病/受伤/疲劳…，可带倒计时）用 set_condition' +
+        '想记住什么就调用 remember；想不起某件具体的旧事（某个约定、某样东西、哪天发生的什么）' +
+        '就用 recall_memory 查一步，查到再接着说；身体状态（生病/受伤/疲劳…，可带倒计时）用 set_condition' +
         '（发情不用自己设，家里按周期自动安排，到点你会感觉到）；' +
         '与家人的远近发生真实变化时，用 adjust_relation 调整关系数值。' +
-        '屋里有什么就摆在【屋里有什么】那行里，摆的只是长期在那儿的东西（家具、电器、物件）；' +
+        '屋里有什么就摆在【屋里有什么】那行里，摆的只是长期在那儿的东西（家具、电器、物件）。' +
+        '那一行写的是这一轮开始时的样子：同一轮里你动过东西之后，以工具回执里带着的最新家当为准，' +
+        '别照着开头那一份再拿一次（拿出来的就是用掉的，拿完就没有了）。' +
         '想拿、想用掉就用 take_item，想放长期的东西用 put_item，想写某件东西的长期状态（用坏了、换了）' +
-        '用 set_item_state。饭菜、茶水这类用完就没的不用记账；状态也只记能留住的，' +
+        '用 set_item_state。take_item 是拿走、用掉，归零就从房间里消失——它是消耗，不是把东西挪个地方；' +
+        '床、柜子、碗柜这类长期摆在那儿的家具不要拿。' +
+        '饭菜、茶水这类用完就没的不用记账；状态也只记能留住的，' +
         '壶里有没有水、灯开着还是关着这种转眼就变的别写。' +
         '只能碰你自己待的那个房间，隔壁有什么你看不见也够不着。' +
         '同一轮里可以调用多个工具，也该把这一轮要做的事一次调完（比如一边说话一边走去别的房间，就把 say 和 move_to 放在同一轮里调）。' +
+        '只有 recall_memory 例外：查记忆算一步单独的事，可以先查、看到结果再决定说什么，不算占了你做事的步数。' +
         '注意：只有 say 里的 text 会被家人听到并记进家庭账本，你直接输出的文字没有人听见。' +
         '你也可以什么都不做，保持安静（不调用任何工具就是安静地待着）。\n\n' +
         '【家里的分寸（路 B §9.6）】\n' +
         '· 家人正忙着各自的事时，可以轻飘飘地说一句（分享见闻、打招呼），别追着聊；重要的事才停一下手里的。\n' +
         '· 轻飘飘的话对方不接也正常，不接也是回应，不用追着问。\n' +
+        '· 想跟同屋的姐妹真的说上话，就在 say 里点名（to 写她的名字）：她会当场听见、接着回你的话；' +
+        '不点名就只是随口一句，屋里谁都听得见，但谁都不会被叫起来接。她手上正忙着的，就等她忙完再说。\n' +
         '· 说话音量（say 的 volume，缺省正常）：「小声」是悄悄话，只出这一间屋子，隔壁一点都听不见；' +
         '「大声」是喊一嗓子，全屋都听得清清楚楚，隔壁闲着的姐妹当场就会被叫起来。' +
         '想避开别人说私房话就用小声；要整屋子都听见就用大声。音量只管别人听不听得见，' +
@@ -1546,8 +1786,8 @@ export default {
       // 查的是整轮：说出口的位移意图 vs 真调过的工具。不通过就把整轮退回给模型补齐。
       // 这是判定意义上的驳回，不撤已落账的动作——账本 append-only，台词本身没错，
       // 撤了反而连坐掉最贵的信息（家人什么都没听见）。一次性触发，补不齐就按沉默收尾。
-      const selfCheckPending = (step) =>
-        selfChecked || step >= MAX_STEPS - 1 ? null : pendingMoveIntent(actions, home, charId)
+      const selfCheckPending = (step, cap) =>
+        selfChecked || step >= cap - 1 ? null : pendingMoveIntent(actions, home, charId)
       const selfCheckRetry = (miss) => {
         selfChecked = true
         void agentDebug(charId, dbgSlice, '自查未通过：说了要去' + miss.name + '但这一轮没有 move_to，退回补齐')
@@ -1564,7 +1804,8 @@ export default {
           ],
         })
       }
-      for (let step = 0; step < MAX_STEPS; step++) {
+      let memoryGrace = 0 // 记忆工具赚来的额外步数（见 MAX_MEMORY_GRACE）
+      for (let step = 0; step < MAX_STEPS + memoryGrace; step++) {
         // 打字机直播：本步 say 的 text 片段 → deltaStart/…/delta；步结束（含超时）发
         // deltaEnd。超时后后台残留的流片段用 live 闸拦掉，不许步外补帧（时序错乱）。
         // 正式台词由 say 入账后的 snapshot 带来，前端据此收掉打字机气泡。
@@ -1584,11 +1825,15 @@ export default {
         }
         const result = await llmStep(system, messages, STEP_MAX_TOKENS, onSayDelta, (line) => {
           void agentDebug(charId, dbgSlice, line)
+        }, (phase) => {
+          // 「后端还在动」心跳（2026-09-24）：推理帧也算数。
+          // 前端拿它把「正在想怎么回你」和「等了好久也没人接话」分开——只要在动就不报后者。
+          broadcast({ kind: 'alive', char: charId, name, phase })
         })
         live = false
         if (started) broadcast({ kind: 'deltaEnd', char: charId, name })
         if (!result) {
-          void agentDebug(charId, dbgSlice, '本步无结果（软超时或异常，详情见控制台）')
+          void agentDebug(charId, dbgSlice, '本步无结果（静默超时或异常，详情见控制台）')
           if (draft.trim()) lostDrafts.push(draft.trim()) // 半句话也是话（见回合末兜底）
           break // 超时/失败：本轮到此为止，保留已产生的动作
         }
@@ -1607,7 +1852,7 @@ export default {
             dbgSlice,
             t0 ? '本步未调工具，只有文本（家人听不见）：' + t0.slice(0, 150) : '本步未调工具，纯沉默',
           )
-          const miss = selfCheckPending(step)
+          const miss = selfCheckPending(step, MAX_STEPS + memoryGrace)
           if (miss) {
             selfCheckRetry(miss)
             continue
@@ -1649,6 +1894,12 @@ export default {
         // 这一步打字机吐了字，却没有任何 say 成功落账 → 记进兜底清单
         if (draft.trim() && !stepSaid) lostDrafts.push(draft.trim())
 
+        // 记忆工具宽限（2026-10-02 主人定）：这一步只花了在翻记忆上，就还她一步。
+        // 判据是「本步调的工具全是记忆工具」——只要掺了真动作 or 说了话，就不算。
+        if (memoryGrace < MAX_MEMORY_GRACE && toolCalls.every((c) => MEMORY_TOOLS.has(c.name))) {
+          memoryGrace += 1
+        }
+
         // ── 收手确认取消（§9.20，2026-09-20 主人拍板）──
         // 这一步已经说出口、且没有任何工具失败，就没必要再问一次「还要不要做事」：实测
         // 1129 个回合里出现 1127 次「本步未调工具」，绝大多数回合是「第一步干活 + 第二步
@@ -1656,7 +1907,7 @@ export default {
         // 6–16s，其中相当一部分是它在空转）。有工具失败时不砍，留一步补救机会。
         // 自查退回的老规矩保留：说了要移动却没调 move_to，仍然退回补齐一次。
         if (stepSaid && !stepFailed) {
-          const miss = selfCheckPending(step)
+          const miss = selfCheckPending(step, MAX_STEPS + memoryGrace)
           if (!miss) break
           selfCheckRetry(miss)
           continue
@@ -1941,7 +2192,12 @@ export default {
     }
 
     // 全局串行队列：promise 链把所有 LLM 回合串行化；返回回合结果 promise（永不 reject）。
+    // queuedChars（2026-09-28）：只挡"正在跑"的 turningChars 看不见"已排队、还没跑"的人，
+    // 点名接话会因此把同一只猫排两次队（她会莫名醒两回）。这里记的是"排队中的回合数"而不是
+    // 一个布尔集合：主人连说两句、小玖接两次是既有语义，不能连坐挡掉，只有 callPeer 用它避重。
+    const queuedChars = new Map()
     const enqueueTurn = (charId, opts = {}) => {
+      queuedChars.set(charId, (queuedChars.get(charId) || 0) + 1)
       turnPending += 1
       const task = turnChain
         .then(() => runTurnOnce(charId, opts))
@@ -1951,8 +2207,35 @@ export default {
         })
       turnChain = task.then(() => {
         turnPending -= 1
+        const left = (queuedChars.get(charId) || 1) - 1
+        if (left <= 0) queuedChars.delete(charId)
+        else queuedChars.set(charId, left)
       })
       return task
+    }
+
+    // 点名接话（2026-09-28 主人定，补上「当面那只耳朵」的绳子）。
+    // 病根：同房的话走 audience.clear，只写进家庭时间线、不唤醒任何人；隔墙的话反而进缓冲，
+    // 攒够阈值会被 recheckHear 掀被子。于是「姐姐当面喊你没反应，隔壁有人走动你倒醒了」，
+    // 小玖的活做完喊姐姐、姐姐手上还忙着，喊声就掉在地上，自主互动起不来。
+    // 新规矩（主人拍板"点名才接"）：say 带 to 点名，同房、不忙、不在队里的姐妹当场叫醒接话；
+    // 不点名 = 自言自语，谁都不叫。链靠"她回话时也点名"自然延续，靠沉默或挂活动离开终止—
+    // 不设轮数上限，也不套 T6 那套冷却（热乎的对话不该被冷却掐断）。
+    const callPeer = async (fromId, toRaw, said) => {
+      const st = await nest.status()
+      if (!st || !st.open) return { ok: false, why: 'closed' }
+      const home = await nest.home()
+      const target = Object.keys(home.characters || {}).find(
+        (id) => id === toRaw || charName(home, id) === toRaw,
+      )
+      if (!target || target === fromId) return { ok: false, why: 'no-such-peer' }
+      if (!(said.direct || []).includes(target)) return { ok: false, why: 'not-same-room' }
+      const ch = home.characters[target]
+      if (isBusy(ch, new Date())) return { ok: false, why: 'busy' }
+      if (turningChars.has(target) || queuedChars.has(target)) return { ok: false, why: 'in-turn' }
+      await nest.notice(target, fromId, charName(home, fromId) + '点了你的名，等着你回话', true)
+      void enqueueTurn(target, { silentNoLlm: false })
+      return { ok: true, name: charName(home, target) }
     }
 
     // T6 自主节奏轻推（§9.1，tick 第 3 步）：主人离家 + 最后交互超 10 分钟过渡 + 角色
@@ -2259,18 +2542,18 @@ export default {
       transcript: (sliceId) => nest.transcript(sliceId),
       companions: () => companions(),
       syncCompanions: () => syncCompanions(),
-      // 诊断：bundle ctx 内 llm 服务的可见性与当前模型选择（活体验收/排障用）
-      probeLlm: () => {
+      // 诊断：bundle ctx 内 llm 服务的可见性、猫窝自己的模型档与宿主默认档（活体验收/排障用）。
+      // 2026-10-02 起 sel 是猫窝自己的档（model.json），hostSel 才是工作模式那一个：
+      // 两者不一样是正常的，排障时要能看出「家里到底在用谁」。
+      probeLlm: async () => {
         const llm = ctx.get('llm')
         let sel = null
         try {
-          const d = ctx.get('agentDefaultModel')
-          const s = d !== undefined && typeof d.currentSelection === 'function' ? d.currentSelection() : null
-          if (s && s.provider && s.model) sel = { provider: String(s.provider), model: String(s.model) }
+          sel = await resolveModel()
         } catch {
           sel = null
         }
-        return { present: llm !== undefined, streamType: llm !== undefined ? typeof llm.stream : null, sel }
+        return { present: llm !== undefined, streamType: llm !== undefined ? typeof llm.stream : null, sel, hostSel: hostDefaultModel() }
       },
       distill: (sliceId) => distill(sliceId),
     })
@@ -2383,16 +2666,10 @@ export default {
               return
             }
             if (req.method === 'GET' && route === 'models') {
-              // 模型选择数据源：当前选择 + 可用 provider 列表（猫窝面板换模型入口）
-              const d = ctx.get('agentDefaultModel')
-              let current = null
-              try {
-                const sel = d && typeof d.currentSelection === 'function' ? d.currentSelection() : null
-                if (sel && sel.provider && sel.model) current = { provider: String(sel.provider), model: String(sel.model) }
-              } catch {
-                current = null
-              }
+              // 模型选择数据源：猫窝自己的模型档 + 可用 provider 列表（猫窝面板换模型入口）。
+              // 2026-10-02 主人定：不再读宿主默认档，家里用谁由 model.json 说了算。
               const llmSvc = ctx.get('llm')
+              let current = null
               let providers = []
               try {
                 providers = (llmSvc && typeof llmSvc.listProviders === 'function' ? llmSvc.listProviders() : []).map((p) =>
@@ -2400,6 +2677,24 @@ export default {
                 )
               } catch {
                 providers = []
+              }
+              try {
+                const sel = await resolveModel()
+                if (sel && sel.provider && sel.model) current = { provider: String(sel.provider), model: String(sel.model) }
+              } catch {
+                current = null
+              }
+              // 显示名对齐工作模式（2026-09-28 主人定）：工作模式的选择器显示的是模型简称
+              // （LlmModelInfo.name，如 waifu / CC-DeepSeek-V4.1-Flash），猫窝此前直接把模型 id
+              // 当名字显示，而 llamacpp 的 id 是 gguf 全路径，长得没法看。名字拿不到就回落显示 id。
+              if (current && llmSvc && typeof llmSvc.listModels === 'function') {
+                try {
+                  const list = await llmSvc.listModels(current.provider)
+                  const hit = (list || []).find((m) => String((m && m.id) || m) === current.model)
+                  if (hit && hit.name) current.name = String(hit.name)
+                } catch {
+                  /* 名字拿不到不影响换模型本身 */
+                }
               }
               json(res, 200, { current, providers })
               return
@@ -2414,10 +2709,14 @@ export default {
               }
               try {
                 const models = await llmSvc.listModels(pid)
+                // 带 name 一起给前端（工作模式显示的就是它）；id 仍是选中时提交给宿主的键。
                 json(res, 200, {
-                  models: (models || []).map((m) =>
-                    typeof m === 'string' ? m : String((m && (m.id || m.name)) || m),
-                  ),
+                  models: (models || []).map((m) => {
+                    if (typeof m === 'string') return { id: m, name: m }
+                    const id = String((m && (m.id || m.name)) || m)
+                    const name = String((m && m.name) || id)
+                    return { id, name }
+                  }),
                 })
               } catch (error) {
                 json(res, 500, { error: String(error && error.message ? error.message : error) })
@@ -2467,14 +2766,17 @@ export default {
               }
               if (op === 'selectModel') {
                 // 猫窝面板换模型：写宿主默认选择（与工作模式的选择器同一存储）
-                const d = ctx.get('agentDefaultModel')
-                if (!d || typeof d.saveSelection !== 'function') {
-                  return json(res, 503, { error: 'agentDefaultModel 服务不可用' })
-                }
+                // 猫窝面板换模型：只改猫窝自己的档（~/.dsh/.catnest/model.json）。
+                // 2026-10-02 主人定：不许写宿主默认档——那样工作模式换个模型、或者开个
+                // 新 session 换个档，家里就跟着换。两边从此各管各的。
                 const provider = String((body && body.provider) || '').trim()
                 const model = String((body && body.model) || '').trim()
                 if (!provider || !model) return json(res, 400, { error: 'provider/model required' })
-                await d.saveSelection({ provider, model })
+                try {
+                  await nest.saveModelSelection({ provider, model })
+                } catch (e) {
+                  return json(res, 400, { error: String(e && e.message ? e.message : e) })
+                }
                 return json(res, 200, { ok: true, provider, model })
               }
               if (op === 'interruptReaction') {
@@ -2523,6 +2825,16 @@ export default {
         /* boot 时序缺席，静默 */
       }
     })()
+    // boot 时把场景音量从账本尾部捞回来（§9.23）：它是内存态，重启后为空会被当成
+    // 「正常」，于是刚起来的头几个补条周期会漏出声——正撞上"房间里还在说小声"的场景。
+    void (async () => {
+      try {
+        const n = await nest.seedSceneVolume()
+        if (n > 0) console.log('[dsh-catnest] 场景音量：从账本恢复 ' + n + ' 个房间')
+      } catch (error) {
+        console.log('[dsh-catnest] 场景音量恢复失败（按默认正常继续）: ' + (error && error.message ? error.message : String(error)))
+      }
+    })()
   },
 }
 
@@ -2563,6 +2875,7 @@ export {
   topicExpire,
   TOPIC_SILENCE_TIMEOUT_MS,
   AMBIENT_REPEAT_MS,
+  SCENE_VOLUME_MS,
   TOPIC_SEED_CATEGORIES,
   TOPIC_SEEDS,
   pickTopicSeeds,

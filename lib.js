@@ -4,6 +4,7 @@
 //   home.json          家状态（房间布局 / 角色位置与活动 / 主人位置 / 听到缓冲）
 //   relations.json     三对角色对数值（intimacy 亲密度 / spice 色色度，0..100）
 //   current.json       当前打开时间片指针（close 后删除）
+//   model.json         猫窝说话用的模型档（provider/model，与工作模式解耦）
 //   slices/<sliceId>/  每个时间片一个目录：meta.json / log.jsonl / open.snapshot.json / close.snapshot.json
 //
 // 语义（猫窝设计草案，随仓库 docs/ 分发）：
@@ -176,6 +177,8 @@ export function conditionKey(name) {
 const HOME_FILE = 'home.json'
 const RELATIONS_FILE = 'relations.json'
 const CURRENT_FILE = 'current.json'
+// 猫窝自己的模型档（2026-10-02）：不与工作模式共用宿主默认档，见 modelSelection()
+const MODEL_FILE = 'model.json'
 const SLICES_DIR = 'slices'
 const META_FILE = 'meta.json'
 const LOG_FILE = 'log.jsonl'
@@ -666,6 +669,53 @@ export function dayKeyOf(date) {
   return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
 }
 
+// ── 日历（2026-09-24 主人拍板：家里不能没有日历）──
+// 起因：猫的上下文里只有「几点几分」，没有年月日；喂给蒸馏器的事件流也只有先后顺序。
+// 于是「明早」「明天」这类相对说法一写进记忆就永久悬空，谁也换算不回来。
+// 三处口径统一走这里（本地时区，与 sliceId/dayKeyOf 同一套时钟观）：
+//   ① 角色的时钟行（buildPresenceView）② 片内时间线与蒸馏喂料（每行前缀）
+//   ③ 两条蒸馏提示词（注入当天日期并要求写绝对日期）
+const WEEKDAY_CN = ['日', '一', '二', '三', '四', '五', '六']
+
+// 人话日期：2026年9月24日（周四）
+export function humanDay(date) {
+  const d = date instanceof Date ? date : new Date(date)
+  if (!Number.isFinite(d.getTime())) return ''
+  return d.getFullYear() + '年' + (d.getMonth() + 1) + '月' + d.getDate() + '日（周' + WEEKDAY_CN[d.getDay()] + '）'
+}
+
+// 一天里的时刻：10:33
+export function clockAt(date) {
+  const d = date instanceof Date ? date : new Date(date)
+  if (!Number.isFinite(d.getTime())) return ''
+  const p = (n) => String(n).padStart(2, '0')
+  return p(d.getHours()) + ':' + p(d.getMinutes())
+}
+
+// 时间线打戳器：把 out 里从 mark 起的新增行统一加上 [HH:mm] 前缀，跨天时先插一行日期分隔。
+// 做成闭包是因为时间线与家史渲染的分支太多（say/notice/items/move/gap…），
+// 与其在每个 push 点重复判断，不如让调用方「先记 mark，push 完再整段打戳」。
+// 拿不到合法时间的行原样保留（旧账本没有 t 字段，不能因此丢行）。
+export function makeStamper(out) {
+  let lastDay = ''
+  return (mark, t) => {
+    const added = out.splice(mark)
+    if (added.length === 0) return
+    const ms = typeof t === 'number' ? t : t ? new Date(t).getTime() : NaN
+    if (!Number.isFinite(ms)) {
+      for (const line of added) out.push(line)
+      return
+    }
+    const day = dayKeyOf(new Date(ms))
+    if (day !== lastDay) {
+      lastDay = day
+      out.push('—— ' + humanDay(new Date(ms)) + ' ——')
+    }
+    const hhmm = clockAt(new Date(ms))
+    for (const line of added) out.push('[' + hhmm + '] ' + line)
+  }
+}
+
 // 周期结算（纯函数，就地把结果写回 home）：
 //   ① 首次播种：没有周期档的猫按 firstDelayDays 错开排第一轮（家里不会开场双发情）
 //   ② 滚动：本轮整段过去 → 排下一轮（gapDays + 抖动，抖动落盘）
@@ -950,6 +1000,20 @@ export function detectMoveIntent(text, action, home, selfId) {
 export const TOPIC_SILENCE_TIMEOUT_MS = 10 * 60000
 // 活动隔墙动静「持续中」补条间隔（§9.5）：每 10min tick 补一条，同窗不重复
 export const AMBIENT_REPEAT_MS = 10 * 60000
+
+// 场景音量（2026-10-07 主人定案）：房间里最近一次说话的音量，代表此刻这间屋子有多安静。
+// 由来：活动隔墙动静（§9.5）历来无条件 push，于是主人和小玖都在说小声，隔壁照样收到
+// 「客厅传来在客厅里和主人缠绵的动静」，睡着的姐姐被 T1 反复掀被子（实测片
+// 20261007T093415：22:09、22:36 两次，攒满阈值的 5 条里 3 条来自「每回合重新声明活动」）。
+// 现在 ambient 不再无条件出声：带上这个音量过一遍 sayPerceive 的同一套声学模型，
+// 小声隔一堵墙 = 0 档 - 1 步 = -1 → silent → 不投条（主人要的「隔壁的小声传不过去」）。
+// 口径是「最后一次说话说了算」：小声之后有人正常说了话，房间立刻恢复成不安静。
+// 有效窗口给到 2 小时：这条窗口要压住的是一条持续通道（补条周期本身 10min），
+// 窗口若与它同量级，每个补条周期都会恰好落在窗口外、tick 那条路按周期稳定漏条
+// （第一版取 10min，被自己的用例当场抓住）。反过来也没有永久静音的风险——
+// 房间里只要有人正常说一句话就恢复，2 小时只是兜底。
+// 内存态、不落盘：这是场景瞬态，重启回到默认，不需要 home 版本迁移。
+export const SCENE_VOLUME_MS = 2 * 60 * 60000
 
 export function topicKey(about) {
   return String(about)
@@ -1331,61 +1395,68 @@ export function relationSync(rel, companionIds) {
 export function sliceEventsText(home, logText) {
   const events = parseLog(logText)
   const lines = []
+  const stamp = makeStamper(lines)
+  // 每行带 [HH:mm]，跨天插日期分隔（2026-09-24 日历改造）：蒸馏器拿到的家史必须能自己
+  // 换算「明天」是哪一天。旧账本缺 t 时 makeStamper 原样保留该行，不丢事件。
+  const put = (t, line) => {
+    lines.push(line)
+    stamp(lines.length - 1, t)
+  }
   for (const e of events) {
     switch (e.type) {
       case 'say':
-        lines.push(
+        put(e.t, 
           `${charName(home, e.who)}${e.action ? `（${e.action}）` : ''}${typeof e.about === 'string' && e.about ? `（聊${e.about}）` : ''}：${e.text}`,
         )
         break
       case 'shout':
-        lines.push(`${charName(home, e.char)}朝${charName(home, e.target)}喊话：${e.text}`)
+        put(e.t, `${charName(home, e.char)}朝${charName(home, e.target)}喊话：${e.text}`)
         break
       case 'hear-ignore':
-        lines.push(`${charName(home, e.char)}掂量了一下，没理会动静`)
+        put(e.t, `${charName(home, e.char)}掂量了一下，没理会动静`)
         break
       case 'topic-open':
-        lines.push(`${charName(home, e.char)}${e.to ? '向' + charName(home, e.to) : ''}提起话题：${e.about}`)
+        put(e.t, `${charName(home, e.char)}${e.to ? '向' + charName(home, e.to) : ''}提起话题：${e.about}`)
         break
       case 'topic-join':
-        lines.push(`${charName(home, e.char)}加入了话题：${e.about}`)
+        put(e.t, `${charName(home, e.char)}加入了话题：${e.about}`)
         break
       case 'topic-end':
-        lines.push(`${charName(home, e.char)}提议收掉话题：${e.about}`)
+        put(e.t, `${charName(home, e.char)}提议收掉话题：${e.about}`)
         break
       case 'topic-reopen':
-        lines.push(`${charName(home, e.char)}：这个还要聊`)
+        put(e.t, `${charName(home, e.char)}：这个还要聊`)
         break
       case 'activity-pause':
-        lines.push(`${charName(home, e.char)}放下了手里的活（${e.activity}）`)
+        put(e.t, `${charName(home, e.char)}放下了手里的活（${e.activity}）`)
         break
       case 'items': {
         const t = itemsEventText(e, home)
-        if (t) lines.push(t)
+        if (t) put(e.t, t)
         break
       }
       case 'move':
-        lines.push(`${charName(home, e.char)}从${roomName(home, e.from)}挪去了${roomName(home, e.to)}`)
+        put(e.t, `${charName(home, e.char)}从${roomName(home, e.from)}挪去了${roomName(home, e.to)}`)
         break
       case 'activity':
-        if (e.activity) lines.push(`${charName(home, e.char)}开始${e.activity}`)
-        else lines.push(`${charName(home, e.char)}做完了事`)
+        if (e.activity) put(e.t, `${charName(home, e.char)}开始${e.activity}`)
+        else put(e.t, `${charName(home, e.char)}做完了事`)
         break
       case 'master-move':
-        if (e.to) lines.push(`主人回来，去了${roomName(home, e.to)}`)
-        else lines.push(`主人出门了`)
+        if (e.to) put(e.t, `主人回来，去了${roomName(home, e.to)}`)
+        else put(e.t, `主人出门了`)
         break
       case 'relation':
-        lines.push(`${e.pair} 的${e.field === 'intimacy' ? '亲密度' : '色色度'}从 ${e.from} 变到 ${e.to}`)
+        put(e.t, `${e.pair} 的${e.field === 'intimacy' ? '亲密度' : '色色度'}从 ${e.from} 变到 ${e.to}`)
         break
       case 'interrupt':
-        lines.push(
+        put(e.t, 
           `${charName(home, e.by)}叫住了${charName(home, e.char)}${e.activity ? `（当时正在${e.activity}）` : ''}`,
         )
         break
       case 'notice':
         // 调度层事件行：公共=家庭事实原样；私有=该角色的感知（「墨璃被发情叫醒」也是家史）
-        lines.push(e.private ? `${charName(home, e.char)}注意到：${e.text}` : e.text)
+        put(e.t, e.private ? `${charName(home, e.char)}注意到：${e.text}` : e.text)
         break
       case 'hear':
         // 缓冲攒存是过程细节，不进蒸馏（避免噪音）
@@ -1402,6 +1473,9 @@ export class CatNest {
     this.dir = dir
     this.now = opts.now || (() => new Date())
     this.chain = Promise.resolve() // 写操作串行化
+    // 场景音量（2026-10-07）：roomId → { vol, at }。房间最近一次说话的音量，供活动隔墙
+    // 动静判定可闻性用（小声传不过墙）。内存态不落盘，理由见 SCENE_VOLUME_MS 注释。
+    this.sceneVolume = new Map()
   }
 
   // ── 文件原语 ──
@@ -1606,6 +1680,30 @@ export class CatNest {
     await this.writeJsonAtomic(join(this.dir, RELATIONS_FILE), rel)
   }
 
+  // ── 猫窝自己的模型档（2026-10-02 主人定：与工作模式解耦）──
+  // 起因：此前猫窝面板的选择器直接读写宿主默认档（agentDefaultModel），于是工作模式
+  // 换一次模型、或者开新 session 换了档，家里全家跟着换。家的模型该由家里自己说了算。
+  // 首次读不到时由 index.js 从宿主默认档快照一次，之后各走各的。
+  modelPath() {
+    return join(this.dir, MODEL_FILE)
+  }
+
+  async modelSelection() {
+    const v = await this.readJson(this.modelPath(), null)
+    if (v && typeof v.provider === 'string' && typeof v.model === 'string' && v.provider && v.model) {
+      return { provider: v.provider, model: v.model }
+    }
+    return null
+  }
+
+  async saveModelSelection(sel) {
+    const provider = String((sel && sel.provider) || '').trim()
+    const model = String((sel && sel.model) || '').trim()
+    if (!provider || !model) throw new Error('provider/model required')
+    await this.writeJsonAtomic(this.modelPath(), { provider, model, at: this.now().toISOString() })
+    return { provider, model }
+  }
+
   // ── 读 ──
 
   async home() {
@@ -1755,6 +1853,87 @@ export class CatNest {
     return r
   }
 
+  // ── 场景音量（2026-10-07）：这间屋子此刻有多安静 ──
+  // 只认「最近一次说话」：小声之后又正常说了话，房间就恢复成不安静。
+  noteSceneVolume(roomId, vol, at) {
+    if (!roomId) return
+    const ms = at instanceof Date ? at.getTime() : new Date(at).getTime()
+    if (!Number.isFinite(ms)) return
+    this.sceneVolume.set(roomId, { vol: sayVolume(vol), at: ms })
+  }
+
+  // 某房间此刻的场景音量：窗口内最近一次说话的音量；没记录或已过期 → 默认「正常」。
+  sceneVolumeOf(roomId, now) {
+    const rec = roomId ? this.sceneVolume.get(roomId) : null
+    if (!rec) return SAY_VOLUME_DEFAULT
+    const nowMs = now instanceof Date ? now.getTime() : Number(now)
+    if (!Number.isFinite(nowMs) || nowMs - rec.at > SCENE_VOLUME_MS) return SAY_VOLUME_DEFAULT
+    return rec.vol
+  }
+
+  // 重启后场景音量是空的（内存态不落盘），默认「正常」会让刚起来的头几个补条周期漏出声来。
+  // 实测（2026-10-07 23:13 重启）：客厅最后一次说话是 23:00 的小声，新进程不知道，
+  // 下一个 tick 就会往睡着的墨璃缓冲里补第 4 条。所以启动时从当前片账本尾部把每个房间
+  // 最后一次说话的音量读回来。账本按时间追加，只往回扫 SCENE_VOLUME_MS 以内的行，
+  // 更早的反正已经过期，不必读全文件（长片也就 2 小时的量）。
+  async seedSceneVolume() {
+    const st = await this.status()
+    if (!st || !st.open || !st.sliceId) return 0
+    let text
+    try {
+      text = await readFile(join(this.dir, SLICES_DIR, st.sliceId, LOG_FILE), 'utf8')
+    } catch {
+      return 0
+    }
+    const nowMs = this.now().getTime()
+    const lines = text.split('\n')
+    const seen = new Set()
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      if (!lines[i]) continue
+      let e
+      try {
+        e = JSON.parse(lines[i])
+      } catch {
+        continue
+      }
+      const ms = e && e.t ? new Date(e.t).getTime() : NaN
+      if (!Number.isFinite(ms)) continue
+      if (nowMs - ms > SCENE_VOLUME_MS) break // 时间追加：更早的都过期了
+      if (e.type !== 'say' || !e.room || seen.has(e.room)) continue
+      this.noteSceneVolume(e.room, e.volume || SAY_VOLUME_DEFAULT, e.t)
+      seen.add(e.room)
+    }
+    return seen.size
+  }
+
+  // 活动隔墙动静投条（§9.5，唯一实现）：活动开始一条 + 每 10min tick 补一条，都走这里。
+  // 2026-10-07 起不再无条件 push：带房间的场景音量过一遍 sayPerceive，逐相邻听众算可闻度，
+  // silent 的不投（小声隔墙听不见）。只投相邻房——同房当面说话，从来不走这条通道。
+  // 返回真的收到条子的听众 id；调用方照旧推进 lastAmbientAt（去重窗不因静音而停摆）。
+  async emitActivityAmbient(home, actorId, now) {
+    const ch = home.characters && home.characters[actorId]
+    if (!ch || !ch.activity || !ch.room) return []
+    const room = ch.room
+    const vol = this.sceneVolumeOf(room, now)
+    const around = this.perceiveAround(home, room, false, actorId)
+    const roomTxt = roomName(home, room) || room
+    const text = roomTxt + '传来' + ch.activity + '的动静'
+    const t = now.toISOString()
+    const out = []
+    for (const aid of around.adjacent) {
+      if (aid === 'master') continue // 主人不攒缓冲（人是即时感知的）
+      const ach = home.characters && home.characters[aid]
+      if (!ach) continue
+      if (sayPerceive(home, room, ach.room, vol, isBusy(ach, now)).level === 'silent') continue
+      ach.hear = ach.hear || []
+      // room = 声源房间（与 say 的缓冲条目同口径）：hearStaleOf 的空间判据要这个字段
+      ach.hear.push({ t, from: actorId, room, text })
+      await this.log('hear', { char: aid, from: actorId, room, text })
+      out.push(aid)
+    }
+    return out
+  }
+
   async setActivity(id, activity, durationMin) {
     return this.mutate(async () => {
       await this.requireOpen()
@@ -1804,23 +1983,30 @@ export class CatNest {
         clamped = true
       }
       const endsAt = new Date(this.now().getTime() + minutes * 60000).toISOString()
+      // 覆盖播报（2026-09-28 主人定）：旧活动被顶掉时历来一个字都不留。实测当天 112 次挂活动里
+      // 95 次是"上一件还没到点就重挂"，而片内时间线只看得见 T3 的「做完了」（覆盖率仅 12%），
+      // 于是她感知到的世界是"锅的标签自己变，从来没人说这锅端走了"。这里补一条公共事件。
+      // 同名重挂不播（那不是换了件事）；事件名往往不同名（吃饭 / 吃午饭 / 陪主人吃午饭），
+      // 所以按"名字变了"判定而不是做幂等。
+      const replaced =
+        typeof ch.activity === 'string' && ch.activity !== '' && ch.activity !== activity ? ch.activity : null
       ch.activity = activity
       ch.activityEndsAt = endsAt
-      // 活动隔墙动静（§9.5，切片 2）：开始时相邻房角色 hear 缓冲加一条（主体先于事件）
-      const around = this.perceiveAround(home, ch.room, false, id)
-      const roomTxt = roomName(home, ch.room) || ch.room
-      const text = roomTxt + '传来' + activity + '的动静'
-      for (const aid of around.adjacent) {
-        if (aid === 'master') continue // 主人不攒缓冲（人是即时感知的）
-        const ach = home.characters && home.characters[aid]
-        if (!ach) continue
-        ach.hear = ach.hear || []
-        ach.hear.push({ t: this.now().toISOString(), from: id, text })
-        await this.log('hear', { char: aid, from: id, text })
-      }
+      // 活动隔墙动静（§9.5，切片 2）：开始时相邻房角色 hear 缓冲加一条（主体先于事件）。
+      // 2026-10-07：改走 emitActivityAmbient，带上房间的场景音量——屋里在说小声就不出声。
+      await this.emitActivityAmbient(home, id, this.now())
       ch.lastAmbientAt = this.now().toISOString()
       await this.saveHome(home)
       await this.log('activity', { char: id, activity, endsAt })
+      // 覆盖时的结束播报：直接落 log，不能调 this.notice（它自己也走 mutate，在这个 mutate 里会自锁）
+      if (replaced) {
+        await this.log('notice', {
+          char: id,
+          source: id,
+          text: (ch.name || CHARACTER_NAMES[id] || id) + '撂下了「' + replaced + '」，转去做「' + activity + '」',
+          private: false,
+        })
+      }
       return { char: id, activity, activityEndsAt: endsAt, minutes, defaulted, clamped }
     })
   }
@@ -2156,6 +2342,9 @@ export class CatNest {
     // 隔壁的大声降半档」）。≥1 真切 / 0 隐约 / <0 听不见。同房永远真切（同一屋檐下，
     // 再小的声音也听得见），所以忙碌降档只对隔壁和远处生效。
     const now = this.now()
+    // 场景音量（2026-10-07）：这间屋子此刻的音量。活动隔墙动静据此判可闻性——
+    // 都在说小声，隔壁就不该收到「客厅传来…的动静」。
+    this.noteSceneVolume(room, vol, now)
     const clear = []
     const faint = []
     const silent = []
@@ -2664,27 +2853,20 @@ export class CatNest {
 
   // 活动隔墙动静（§9.5，切片 2）：活动持续中每 10min tick 给相邻房角色补一条
   // （lastAmbientAt 去重，同窗不重复）。阈值/边沿触发复用 T1 现有链路。
+  // 2026-10-07：投条改走 emitActivityAmbient（带场景音量，小声不出声）；去重窗照旧推进，
+  // 免得房间静音期间窗口停摆、一旦转响就被 tick 连补好几条。
   async ambientTick() {
     return this.mutate(async () => {
       await this.requireOpen()
       const home = await this.home()
-      const nowT = this.now().getTime()
+      const nowDate = this.now()
+      const nowT = nowDate.getTime()
       const dropped = []
       for (const ch of Object.values(home.characters || {})) {
         if (!ch || !ch.activity || ch.activityPaused || !ch.activityEndsAt) continue
         if (!ch.lastAmbientAt) continue // 旧数据无条目：不补
         if (nowT - new Date(ch.lastAmbientAt).getTime() <= AMBIENT_REPEAT_MS) continue
-        const around = this.perceiveAround(home, ch.room, false, ch.id)
-        const roomTxt = roomName(home, ch.room) || ch.room
-        const text = roomTxt + '传来' + ch.activity + '的动静'
-        for (const aid of around.adjacent) {
-          if (aid === 'master') continue
-          const ach = home.characters && home.characters[aid]
-          if (!ach) continue
-          ach.hear = ach.hear || []
-          ach.hear.push({ t: new Date(nowT).toISOString(), from: ch.id, room: ch.room, text })
-          await this.log('hear', { char: aid, from: ch.id, room: ch.room, text })
-        }
+        await this.emitActivityAmbient(home, ch.id, nowDate)
         ch.lastAmbientAt = new Date(nowT).toISOString()
         dropped.push(ch.id)
       }

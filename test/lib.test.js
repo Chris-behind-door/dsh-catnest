@@ -205,6 +205,40 @@ test('setActivity：设置带时长 / 清除 / 非法参数', async () => {
   }
 })
 
+test('setActivity：覆盖未到期的旧活动要补一条公共播报（撂下X转去做Y）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  const readNotices = async () => {
+    const sid = sliceIdOf(FIXED)
+    const log = await readFile(join(dir, 'slices', sid, 'log.jsonl'), 'utf8')
+    return log
+      .split('\n')
+      .filter(Boolean)
+      .map((l) => JSON.parse(l))
+      .filter((e) => e.type === 'notice')
+  }
+  try {
+    await nest.open()
+    await nest.setActivity('moli', '吃饭', 60)
+    await nest.setActivity('moli', '陪主人吃午饭', 60) // 换了件事 → 播报
+    await nest.setActivity('moli', '陪主人吃午饭', 30) // 同名重挂 → 不播
+    const notices = await readNotices()
+    assert.equal(notices.length, 1, '只有换了一件事才播报：' + JSON.stringify(notices))
+    assert.equal(notices[0].text, '墨璃撂下了「吃饭」，转去做「陪主人吃午饭」')
+    assert.equal(notices[0].private, false, '这是家庭事实，公共可见')
+    assert.equal(notices[0].char, 'moli')
+    assert.equal(notices[0].source, 'moli')
+    // 第一次挂（手上本来没活）没有"撂下"可播
+    await nest.setActivity('kyu', '读书', 30)
+    assert.equal((await readNotices()).length, 1, '首次挂活动不该多出播报')
+    // 主动停下之后再挂，也不算覆盖（中间隔着一次结束）
+    await nest.setActivity('moli', null)
+    await nest.setActivity('moli', '发呆', 30)
+    assert.equal((await readNotices()).length, 1, '停下之后再挂，没有旧活可撂')
+  } finally {
+    await cleanup()
+  }
+})
+
 test('moveMaster：进房 / 离宅 / 进小区（三层位置指针）', async () => {
   const { nest, cleanup } = await mk()
   try {
@@ -912,7 +946,8 @@ test('say action：即时动作随台词入账（视觉信息）；hear 缓冲�
     assert.equal(tl.action, '蹭了蹭主人', 'transcript 行应透传 action 供前端渲染')
     // 蒸馏喂料同样带动作
     const events = sliceEventsText(await nest.home(), logText)
-    assert.ok(events.includes('小玖（蹭了蹭主人）：主人，我在呢～'), events.join('|'))
+    // 2026-09-24 日历改造：家史每行带 [HH:mm] 前缀，断言改看结尾
+    assert.ok(events.some((l) => l.endsWith('小玖（蹭了蹭主人）：主人，我在呢～')), events.join('|'))
     // 不带 action 的 say：log 无该字段（旧形状兼容），人话化无括号
     await nest.say('kyu', '嗯嗯')
     const logText2 = await readFile(join(dir, 'slices', cur.sliceId, 'log.jsonl'), 'utf8')
@@ -1551,7 +1586,7 @@ test('notice：私有默认只进本人时间线；公共例外全员可见；�
     // 蒸馏可见：私有=「X注意到：」，公共=原样
     const lines = sliceEventsText(await nest.home(), log.join('\n'))
     assert.ok(lines.some((t) => t.includes('墨璃注意到：')), lines.join('|'))
-    assert.ok(lines.some((t) => t === '墨璃做完了读书'), lines.join('|'))
+    assert.ok(lines.some((t) => t.endsWith('墨璃做完了读书')), lines.join('|'))
   } finally {
     await cleanup()
   }
@@ -1881,6 +1916,89 @@ test('活动隔墙动静（§9.5）：开始时相邻房攒一条；同房不攒
     nest.now = () => new Date(FIXED.getTime() + 44 * 60000)
     await nest.ambientTick()
     assert.equal((await nest.hear('kyu')).buffer.length, 3, '暂停期间不补')
+  } finally {
+    await cleanup()
+  }
+})
+
+// ── 场景音量（2026-10-07 主人定案）：隔壁的小声传不过去 ──
+// 活动隔墙动静不再无条件 push：带房间最近的说话音量过一遍 sayPerceive，
+// 小声隔一堵墙 = 0 档 - 1 步 = -1 → silent → 不投条。
+
+test('场景音量：说小声的房间，活动隔墙动静投不出去；窗口过期后回到默认正常', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('moli', 'bedroom') // 卧室与客厅相邻
+    await nest.say('kyu', '（气声）小声点……', undefined, undefined, '小声')
+    await nest.setActivity('kyu', '在客厅里和主人缠绵', 60)
+    assert.equal((await nest.hear('moli')).buffer.length, 0, '小声的房间：活动开始条投不出去')
+    // 持续补条同样不出声（今天就是被这两路喂满阈值 5 的）
+    nest.now = () => new Date(FIXED.getTime() + 11 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('moli')).buffer.length, 0, '小声的房间：tick 补条也不出声')
+    nest.now = () => new Date(FIXED.getTime() + 22 * 60000)
+    await nest.ambientTick()
+    assert.equal((await nest.hear('moli')).buffer.length, 0, '连着几个周期都不出声')
+    // 兜底窗口（2 小时）过去 → 场景音量回到默认「正常」，屋里那件活的动静恢复
+    nest.now = () => new Date(FIXED.getTime() + 133 * 60000)
+    await nest.ambientTick()
+    const buf = (await nest.hear('moli')).buffer
+    assert.equal(buf.length, 1, '离开兜底窗口后回到默认正常，动静照旧播报')
+    assert.equal(buf[0].room, 'living', 'hear 条目带声源房间（hearStaleOf 的空间判据要用它）')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('场景音量：最后一次说话的音量说了算（小声之后又正常说话，房间就不安静了）', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('moli', 'bedroom')
+    await nest.say('kyu', '（气声）', undefined, undefined, '小声')
+    await nest.setActivity('kyu', '缠绵', 60)
+    assert.equal((await nest.hear('moli')).buffer.length, 0, '小声 → 动静不投，这句耳语也进不了隔壁缓冲')
+    await nest.say('kyu', '哎呀', undefined, undefined, '正常')
+    const afterNormal = (await nest.hear('moli')).buffer.length
+    await nest.setActivity('kyu', '聊天', 60)
+    assert.equal((await nest.hear('moli')).buffer.length, afterNormal + 1, '又说正常话 → 房间恢复，动静照投')
+    await nest.say('kyu', '（气声）', undefined, undefined, '小声')
+    const afterQuiet = (await nest.hear('moli')).buffer.length
+    await nest.setActivity('kyu', '抱抱', 60)
+    assert.equal((await nest.hear('moli')).buffer.length, afterQuiet, '再说小声 → 又安静下来')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('场景音量按房间分开：客厅说小声不影响卧室里那件活的动静', async () => {
+  const { nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('moli', 'bedroom')
+    await nest.say('kyu', '（气声）别出声……', undefined, undefined, '小声') // 客厅转安静
+    await nest.setActivity('moli', '看书', 60) // 卧室没说过小声 → 正常
+    assert.equal((await nest.hear('kyu')).buffer.length, 1, '卧室的动静照旧传给客厅（音量按房间分开）')
+  } finally {
+    await cleanup()
+  }
+})
+
+test('场景音量：重启后从账本尾部捞回来（新实例不用等到下一句小声）', async () => {
+  const { dir, nest, cleanup } = await mk()
+  try {
+    await nest.open()
+    await nest.moveCharacter('moli', 'bedroom')
+    await nest.say('kyu', '（气声）小声点……', undefined, undefined, '小声')
+    // 模拟重启：同一片目录上换一个新实例（内存里的场景音量是空的）
+    const reborn = new CatNest(dir, { now: fixedNow })
+    assert.equal(reborn.sceneVolumeOf('living', FIXED), '正常', '前置：新实例默认正常（旧写法这里就会漏声）')
+    const n = await reborn.seedSceneVolume()
+    assert.equal(n, 1, '从账本捞回 1 个房间的音量')
+    assert.equal(reborn.sceneVolumeOf('living', FIXED), '小声', '客厅恢复成安静')
+    await reborn.setActivity('kyu', '缠绵', 60)
+    assert.equal((await reborn.hear('moli')).buffer.length, 0, '新实例同样不出声')
   } finally {
     await cleanup()
   }

@@ -558,9 +558,11 @@ test('distill 分角色分条：各角色段分别 learn 各自记忆；回顾�
       return { id: 'm-' + learned.length }
     },
   }
+  // 第三行是垃圾条目（只有标点）——2026-10-02 实战里模型真吐过「- ：」，
+  // 剥掉前缀就成了正文「：」写进记忆域，注入时看着像坏账。解析层要直接丢掉。
   const llmSegments = '【回顾】小玖和墨璃在客厅玩了一晚的游戏，主人回来的时候家里还亮着灯。\n' +
-    '\n【小玖】\n- 和小玖……不，和墨璃联机赢了两把\n- 给主人留了宵夜\n' +
-    '\n【墨璃】\n- 画画画到一半被小玖拉去玩游戏\n- 答应了明天教小玖调色'
+    '\n【小玖】\n- 和小玖……不，和墨璃联机赢了两把\n- 给主人留了宵夜\n- ：\n' +
+    '\n【墨璃】\n- 画画画到一半被小玖拉去玩游戏\n- 答应了明天教小玖调色\n- ……'
   const { ctx, provided } = mkCtx({
     personas: PERSONAS_STUB,
     llm: llmStub(llmSegments),
@@ -585,6 +587,8 @@ test('distill 分角色分条：各角色段分别 learn 各自记忆；回顾�
     assert.ok(!kyuLearns.some((l) => l.text.includes('调色')), '墨璃的记忆不进小玖域（分视角）')
     for (const l of [...kyuLearns, ...moliLearns]) {
       assert.ok(l.tags.includes('时间片') && l.tags.includes(d.sliceId), 'tags 照旧')
+      // 垃圾条目不得落进记忆域（只有标点、没有字）
+      assert.ok(/[\p{L}\p{N}]/u.test(l.text), '垃圾条目不写记忆: ' + JSON.stringify(l.text))
     }
   } finally {
     await rmSafe(dir)
@@ -936,22 +940,25 @@ test('接话提示词：不设风格限制（无行数/字数/格式约束），
   }
 })
 
-test('接话回忆：recall 直接按 时间片 标签池级过滤（防先 recall 后过滤空手），工程笔记不进客厅', async () => {
+test('最近的家史：不检索、按时间注入、排除当前时间片；工程笔记不进客厅', async () => {
   const dir7 = await mkdtemp(join(tmpdir(), 'catnest-idx-mem-'))
   const ws7 = webServerStub()
   const recallCalls = []
+  let currentSlice = ''
   // 记忆桩：域里同时有家史（带 时间片 标签）和工程笔记（无）——
-  // 故意把工程笔记也回给调用方，验证 catnest 本地还有兜底过滤
+  // 故意把工程笔记也回给调用方，验证 catnest 本地还有兜底过滤；
+  // 再故意塞一条"属于当前时间片"的家史，验证被挡掉（当前片整段已在时间线里）
   const memoryStub = {
     recall: async (charId, query, limit, tags) => {
       recallCalls.push({ charId, query, limit, tags: tags ? tags.slice() : tags })
       return {
         entries: [
-          { id: 'h1', text: '上次主人在客厅夸小玖修好了路由器', tags: ['猫窝', '时间片', '20260822T130543'] },
-          { id: 'h2', text: '上片收尾时墨璃在卧室小憩', tags: ['猫窝', '时间片', '20260821T220000'] },
+          { id: 'h1', text: '上次主人在客厅夸小玖修好了路由器', createdAt: 2, date: '8月22日 13:05', tags: ['猫窝', '时间片', '20260822T130543'] },
+          { id: 'h2', text: '上片收尾时墨璃在卧室小憩', createdAt: 1, date: '8月21日 22:00', tags: ['猫窝', '时间片', '20260821T220000'] },
+          { id: 'cur', text: '当前片里刚发生的事不该重复出现', createdAt: 3, date: '10月2日 20:30', tags: ['猫窝', '时间片', currentSlice] },
           { id: 'e1', text: 'SSE 交付时 res.write 链式调用要留意', tags: ['猫窝', 'dsh', '里程碑'] },
         ],
-        total: 3,
+        total: 4,
       }
     },
   }
@@ -982,21 +989,122 @@ test('接话回忆：recall 直接按 时间片 标签池级过滤（防先 reca
       return h7(fakeReq(method, url, body), r).then(() => r)
     }
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    currentSlice = String((await svc.status()).sliceId)
     await svc.moveMaster('living')
     await svc.moveCharacter('kyu', 'living')
     await svc.moveCharacter('moli', 'bedroom')
     await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '还记得路由器的事吗？' }))
     await until(() => userMsgs.length >= 1)
-    // recall 直接带 时间片 标签（服务侧先过滤池再打分），不再是"recall 8 条猫窝再本地过滤"
+    // 2026-10-02 主人定案：不再拿当前台词去 BM25 检索（空 query = 取最新的那批），
+    // 也不再只取 3 条——最近的家史要够铺出"在场感"。
     const kyuRecall = recallCalls.find((c) => c.charId === 'kyu')
-    assert.ok(kyuRecall, '接话应触发回忆')
-    assert.deepEqual(kyuRecall.tags, ['时间片'], '直接把 时间片 标签传给 recall 做池级过滤')
-    assert.equal(kyuRecall.limit, 3, 'limit 直接给 3，不再放宽到 8')
+    assert.ok(kyuRecall, '接话应触发记忆注入')
+    assert.deepEqual(kyuRecall.tags, ['时间片'], '池级过滤仍然带 时间片 标签')
+    assert.equal(kyuRecall.query, '', '最近的家史不检索：不给查询词')
+    assert.equal(kyuRecall.limit, 20, '多取一批再本地裁到最近 K 条')
     // 家史进了提示词；工程笔记（无 时间片 标签）被本地兜底挡在客厅外
+    assert.ok(userMsgs[0].includes('最近家里的事'), '注入段换成了最近的家史: ' + userMsgs[0])
     assert.ok(userMsgs[0].includes('路由器'), '家史应注入接话提示词: ' + userMsgs[0])
     assert.ok(!userMsgs[0].includes('SSE'), '工程笔记不得注入接话提示词')
+    assert.ok(!userMsgs[0].includes('当前片里刚发生的事'), '当前时间片的家史不得重复注入（片内时间线已经有了）')
+    // 日期锚：家史正文里大量相对说法（「刚才」「今晚」），注入必须带记录时刻，
+    // 而且要说清那是"记下它的时刻"（条目自身的日子是事件时间，两者不是一回事）。
+    assert.ok(userMsgs[0].includes('- （记于 8月22日 13:05）上次主人在客厅夸小玖修好了路由器'), '记忆条目要带记录时刻: ' + userMsgs[0])
+    assert.ok(userMsgs[0].includes('（记于 8月21日 22:00）'), '每条都要带时刻')
+    // 旧 → 新：读起来是一条时间线，不是一叠碎片
+    assert.ok(
+      userMsgs[0].indexOf('（记于 8月21日 22:00）') < userMsgs[0].indexOf('（记于 8月22日 13:05）'),
+      '最近的家史按时间从早到晚排',
+    )
   } finally {
     await rmSafe(dir7)
+  }
+})
+
+// 路由 handler 直调小助手（recall_memory 用例用）
+const callRoute = (ws, method, url, body) => {
+  const r = fakeRes()
+  return ws.routes[0].handler(fakeReq(method, url, body), r).then(() => r)
+}
+
+test('recall_memory：角色自己查旧事（BM25 过家史池、挡当前片），查完接着说；记忆步不扣动作预算', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-recall-'))
+  const ws = webServerStub()
+  const recallCalls = []
+  let currentSlice = ''
+  const memoryStub = {
+    recall: async (charId, query, limit, tags) => {
+      recallCalls.push({ charId, query, limit, tags: tags ? tags.slice() : tags })
+      if (query === '') return { entries: [], total: 0 } // 最近路：本用例不关心
+      return {
+        entries: [
+          { id: 'h1', text: '主人答应了如果下午作业完成就给小玖梳尾巴毛', createdAt: 5, date: '10月1日 16:27', tags: ['猫窝', '时间片', '20261001T102544'] },
+          { id: 'cur', text: '当前片里刚发生的事不该被翻出来', createdAt: 9, date: '10月2日 20:40', tags: ['猫窝', '时间片', currentSlice] },
+        ],
+        total: 2,
+      }
+    },
+  }
+  const seen = []
+  let kyuSteps = 0
+  const llm = {
+    stream: (opts) => {
+      const mine = typeof opts.system === 'string' && opts.system.includes('成员小玖')
+      if (mine) kyuSteps += 1
+      const s = mine ? kyuSteps : 0
+      if (s === 2) seen.push(opts.messages)
+      return (async function* () {
+        if (s === 0) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        // 前 4 步全花在翻记忆上：动作预算（MAX_STEPS=4）本该见底，靠宽限把第 5 步让出来
+        if (s <= 4) {
+          yield { type: 'tool-call-delta', index: 0, id: 'c' + s, name: 'recall_memory' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ query: '梳尾巴毛' }) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        if (s === 5) {
+          yield { type: 'tool-call-delta', index: 0, id: 'say1', name: 'say' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: '记得呀，说好作业做完就给我梳尾巴毛喵！' }) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+          return
+        }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm, memory: memoryStub })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    await callRoute(ws, 'POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    currentSlice = String((await svc.status()).sliceId)
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'kitchen')
+    await callRoute(ws, 'POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '你还记得答应过我的事吗？' }))
+    await until(async () => {
+      const dr = await callRoute(ws, 'GET', '/catnest/api/dialogue')
+      return JSON.parse(dr.body).lines.some((l) => l.who === 'kyu')
+    })
+    // 宽限真的生效：4 步记忆 + 第 5 步说话（没有宽限的话第 5 步根本不会发生）
+    assert.equal(kyuSteps, 5, '记忆工具占的步数不该吃掉做事的步数')
+    // 查到的旧事回到了模型手里（第 2 步的 messages 里带 recall_memory 的回执）
+    const flat = JSON.stringify(seen[0])
+    assert.ok(flat.includes('梳尾巴毛'), 'recall_memory 的结果要回给模型: ' + flat.slice(0, 400))
+    assert.ok(flat.includes('记于 10月1日 16:27'), '回执要带记录时刻')
+    assert.ok(!flat.includes('当前片里刚发生的事'), '不许把当前时间片的事翻出来当旧事')
+    // 真正查记忆的那几次都带 时间片 池过滤
+    const toolCalls = recallCalls.filter((c) => c.query !== '')
+    assert.ok(toolCalls.length >= 1, '应触发 recall_memory')
+    assert.ok(toolCalls.every((c) => JSON.stringify(c.tags) === JSON.stringify(['时间片'])), '池级过滤照旧')
+    // 说话仍然一轮收尾：说完话那一轮就是最后一轮，不许多问一次
+    assert.equal(kyuSteps, 5, '说完话那一轮就是最后一轮')
+  } finally {
+    await rmSafe(dir)
   }
 })
 
@@ -1483,10 +1591,13 @@ test('say 打字机：argumentsDelta 分片增量抠 text（转义/切分边界/
     const frames = sseRes.written
       .filter((w) => w.startsWith('data: '))
       .map((w) => JSON.parse(w.replace(/^data: /, '').trim()))
-    // 每个角色的打字机帧各自成段：start→delta…→end；串行链下小玖段整体先于墨璃段
+    // 心跳帧（2026-09-24）：后端每收到一帧（含推理帧）就推一条 alive，前端拿它分辨
+    // 「还在动」和「真卡住」。它带 char 但不是打字机帧，分段时排除。
+    const aliveFrames = frames.filter((f) => f.kind === 'alive')
+    assert.ok(aliveFrames.length >= 1, 'SSE 应有 alive 心跳帧')
     for (const [cid, cname] of [['kyu', '小玖'], ['moli', '墨璃']]) {
       const seg = frames
-        .map((f, i) => ((f.char || null) === cid ? i : -1))
+        .map((f, i) => ((f.char || null) === cid && f.kind !== 'alive' ? i : -1))
         .filter((i) => i >= 0)
       assert.ok(seg.length >= 3, cid + ' 应有 start+多delta+end 帧段: ' + seg.length)
       assert.equal(frames[seg[0]].kind, 'deltaStart')
@@ -2431,6 +2542,9 @@ test('say.about 渲染 + 【当前话题】presence：话题内发言带标记�
     assert.ok(moliP.user.includes('【当前话题】'), '话题常驻动态窗口')
     assert.ok(moliP.user.includes('那盆花（小玖发起，已聊 2 轮）'), moliP.user)
     assert.ok(moliP.user.includes('现在是 '), '时钟行在场')
+    // 日历（2026-09-24）：日期属于 system 基本信息，不能只放在 user 动态快照里
+    assert.ok(/【今天】\d{4}年\d{1,2}月\d{1,2}日（周[日一二三四五六]）/.test(moliP.system), moliP.system.slice(0, 120))
+    assert.ok(moliP.system.includes('一律写绝对日期'), 'system 里要有写绝对日期的约定')
     assert.ok(moliP.user.includes('小玖（聊那盆花）：你看那盆花开了'), 'moli 视角开场白带标记')
   } finally {
     await rmSafe(dir)
@@ -3094,6 +3208,68 @@ test('家当工具接线（House §4）：猫娘 take_item 入账，下一轮时
   }
 })
 
+test('家当工具回执带刷新后的家当（2026-09-30 主人反馈：同一轮里状态不刷新 → 她会再拿一次）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-itemfix-'))
+  const ws = webServerStub()
+  const seen = [] // 每一步回填给模型的 tool-result 文本
+  const firstPrompt = []
+  const systems = []
+  const llm = {
+    stream: (opts) => {
+      const mine = typeof opts.system === 'string' && opts.system.includes('成员小玖')
+      const stop = !mine || hasAssistantToolCall(opts.messages)
+      if (mine) {
+        if (!stop) {
+          firstPrompt.push(opts.messages[0].content[0].text)
+          systems.push(opts.system)
+        }
+        for (const m of opts.messages || []) {
+          if (m.role !== 'user' || !Array.isArray(m.content)) continue
+          for (const c of m.content) {
+            if (c.type === 'tool-result' && c.content && c.content[0]) seen.push(c.content[0].text)
+          }
+        }
+      }
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'take_item' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ name: '消婴器', count: 2 }) }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'bedroom') // 只留小玖一个
+    await svc.setRoomItems('living', [{ name: '消婴器', count: 5 }], 'master')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '零食到了' }))
+    await until(() => seen.length >= 1)
+    // 轮首那一份仍是动手前的样子（有意保留：不动第一条 user 消息才不破坏前缀 cache）
+    assert.ok(firstPrompt[0].includes('【屋里有什么】客厅：消婴器×5'), '轮首家当行是动手前的：' + firstPrompt[0].slice(-200))
+    // 回执里必须带上刷新后的家当：同一轮的下一步看的就是这一份，不会再照旧数量拿一次
+    assert.ok(seen[0].includes('拿走了 2 个，还剩 3 个。'), '回执带数量：' + seen[0])
+    assert.ok(seen[0].includes('【屋里有什么】客厅：消婴器×3'), '回执带刷新后的家当：' + seen[0])
+    // 提示词侧同一条纪律也要在
+    assert.ok(systems[0].includes('以工具回执里带着的最新家当为准'), 'system 写明同轮以回执为准')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
 // ── §9.16（2026-09-16）：说话音量 + 跨片过期活动不补发唤醒 ──
 
 test('say 音量（§9.16）：小声不出屋 / 大声隔壁真切，隔墙也听得清', async () => {
@@ -3245,6 +3421,81 @@ test('POST say 音量：小声=耳语不出屋；大声=全屋清晰（2026-09-2
     assert.ok(!moliPrompt.user.includes('姐姐，只跟你说'), '耳语不出现在隔壁的时间线里')
   } finally {
     await rmSafe(dir)
+  }
+})
+
+// ── 场景音量（2026-10-07 主人要求：隔壁的小声传不过去）──
+// 病根：活动隔墙动静（§9.5）历来无条件 push，跟说话音量无关。实测片 20261007T093415：
+// 主人和小玖都在说小声，隔壁睡着的墨璃照样被「客厅传来在客厅里和主人缠绵的动静」喂满
+// 阈值 5 → T1 掀被子（22:09、22:36 两次）。这两例一正一反锁住效果。
+
+test('场景音量（2026-10-07）：客厅在说小声 → 小玖的活动动静一条都不投给隔壁睡着的墨璃', async () => {
+  const dirQ = await mkdtemp(join(tmpdir(), 'catnest-idx-quiet-'))
+  const wsQ = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = wsQ
+  try {
+    plugin.apply(ctx, { catnestDir: dirQ, tickRand: noRoll })
+    const svc = provided.catnest
+    const hQ = wsQ.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return hQ(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'bedroom') // 隔壁，挂着睡觉
+    await svc.setActivity('moli', '睡觉', 480)
+    assert.equal((await svc.hear('moli')).buffer.length, 0, '前置：她自己做事不给自己投条')
+    // 主人在客厅选小声，小玖也在说小声
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小声点哦', volume: '小声' }))
+    await svc.say('kyu', '（气声）嗯……', undefined, undefined, '小声')
+    // 小玖开始一件活动：历来这一下就往隔壁投一条「客厅传来…的动静」
+    await svc.setActivity('kyu', '在客厅里和主人缠绵', 90)
+    assert.equal((await svc.hear('moli')).buffer.length, 0, '小声的房间：活动开始条投不出去')
+    for (let i = 0; i < 3; i++) await svc.tick() // 心跳也走一遍（conditions/ambient/T6）
+    assert.equal((await svc.hear('moli')).buffer.length, 0, '心跳跑过也不投')
+    const log = await readLog(dirQ, (await svc.status()).sliceId)
+    assert.equal(
+      log.filter((e) => e.type === 'notice' && e.char === 'moli' && /传来/.test(e.text || '')).length,
+      0,
+      '没有一条把墨璃叫起来的动静 notice',
+    )
+    assert.equal(log.filter((e) => e.type === 'hear' && e.char === 'moli').length, 0, '账本里也没有墨璃的 hear 行')
+  } finally {
+    await rmSafe(dirQ)
+  }
+})
+
+test('场景音量：客厅说正常话时，活动动静照旧传给隔壁（§9.5 主体先于事件不误杀）', async () => {
+  const dirL = await mkdtemp(join(tmpdir(), 'catnest-idx-loud-'))
+  const wsL = webServerStub()
+  const prompts = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(prompts) })
+  ctx.webServer = wsL
+  try {
+    plugin.apply(ctx, { catnestDir: dirL, tickRand: noRoll })
+    const svc = provided.catnest
+    const hL = wsL.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return hL(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'bedroom')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '做饭啦' })) // 缺省=正常
+    await svc.say('kyu', '嗯，我来搭把手', undefined, undefined, '正常')
+    const before = (await svc.hear('moli')).buffer.length
+    await svc.setActivity('kyu', '做饭', 90)
+    const buf = (await svc.hear('moli')).buffer
+    assert.equal(buf.length, before + 1, '正常音量：活动动静照旧投给隔壁')
+    assert.equal(buf[buf.length - 1].room, 'living', 'hear 条目带声源房间')
+  } finally {
+    await rmSafe(dirL)
   }
 })
 
@@ -3556,6 +3807,582 @@ test('llmStep 落诊断：首字节/帧数/finish 原因/正文与推理字数/u
     assert.ok(!/\[object Object\]/.test(dbg), '不许出现 [object Object]，' + tail)
     assert.ok(/推理=11字/.test(dbg), 'reasoning-delta 累计字数（11 字），' + tail)
     assert.ok(/in=15234/.test(dbg) && /out=6120/.test(dbg) && /cache=14000/.test(dbg), 'usage 落盘，' + tail)
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// ── 看门狗语义（2026-09-24 主人指正）──────────────────────────────
+// 旧口径：整步总时长 150s，到点判无动作 → 把「想得久」误判成「没回复」。
+// 9/24 上午 5 次沉默全是这么来的（推理 1.3~1.7 万字、流好好的、finish 还没到）。
+// 新口径：连续无帧超过阈值才算卡死。真实阈值 60s 没法进用例，靠 llmIdleMs 压到 150ms 来测。
+const trickleStreamStub = (text, gapMs, frames) => ({
+  stream: (opts) => {
+    const stop = hasAssistantToolCall(opts && opts.messages)
+    return (async function* () {
+      if (stop) {
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      // 慢，但一直有帧：总时长会超过阈值，单帧间隔不会
+      for (let i = 0; i < frames; i++) {
+        await new Promise((r) => setTimeout(r, gapMs))
+        yield { type: 'reasoning-delta', index: 0, text: '想' }
+      }
+      yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+      yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text }) }
+      yield { type: 'finish', reason: { kind: 'tool-calls' } }
+    })()
+  },
+})
+
+const stuckStreamStub = () => ({
+  stream: () => (async function* () {
+    yield { type: 'reasoning-delta', index: 0, text: '嗯……' }
+    await new Promise((r) => setTimeout(r, 800)) // 一口气静默掉，超过阈值
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  })(),
+})
+
+test('llmStep 看门狗：一直在吐帧就不算超时（总时长超阈值也不误杀）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-idle-ok-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: trickleStreamStub('小玖在呢', 60, 5) })
+  ctx.webServer = ws
+  try {
+    // 阈值 150ms：5 帧 × 60ms 间隔，总耗时约 300ms（超阈值），单次静默 60ms（不超）
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll, llmIdleMs: 150 })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    await until(async () => {
+      const lines = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+      return lines.length > 0
+    })
+    const st = await svc.status()
+    const dbg = await readFile(join(dir, 'slices', st.sliceId, 'agent-debug.log'), 'utf8')
+    assert.ok(/said=true/.test(dbg), '一直在吐帧就不该判死，' + dbg.slice(-300))
+    assert.ok(!/静默超时/.test(dbg), '不该出现静默超时，' + dbg.slice(-300))
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('llmStep 看门狗：连续静默超过阈值才判死，落诊断并整轮沉默', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-idle-stuck-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: stuckStreamStub() })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll, llmIdleMs: 150 })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    const st = await svc.status()
+    const dbgPath = join(dir, 'slices', st.sliceId, 'agent-debug.log')
+    await until(async () => {
+      try {
+        return /回合结束/.test(await readFile(dbgPath, 'utf8'))
+      } catch {
+        return false
+      }
+    })
+    const dbg = await readFile(dbgPath, 'utf8')
+    assert.ok(/LLM 步静默超时（阈值 150ms/.test(dbg), '判死要落静默超时诊断，' + dbg.slice(-400))
+    assert.ok(/said=false/.test(dbg), '静默超时的整轮就该沉默，' + dbg.slice(-300))
+    const lines = ((await svc.transcript()).lines || []).filter((l) => l.type === 'say' && l.who === 'kyu')
+    assert.equal(lines.length, 0, '卡死这一步不该有台词入账')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// ── 网关抽风的错因（2026-09-27 晚盲区）────────────────────────────
+// 实测那一帧：`帧=2 finish=error`，一个 delta 都没有，错因（TRANSPORT / 520 SERVER）
+// 只在 finish.failure 里。旧 fmt 只在 kind==='aborted' 时拼 failure，于是埋点把最想看的
+// 那句丢了，当晚只能另写 curl 探针反推网关状态。这条用例钉住「任何 kind 带 failure 都要拼出来」。
+const errorFinishStreamStub = () => ({
+  stream: () => (async function* () {
+    // 复刻实测的两帧：一个 block-start，然后直接 finish=error，正文与推理都是零字
+    yield { type: 'block-start', index: 0 }
+    yield {
+      type: 'finish',
+      reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'Stream ended without finish_reason' } },
+    }
+  })(),
+})
+
+test('llmStep 埋点：finish=error 也要带出 failure 的 code/message（别只剩 finish=error）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-err-finish-'))
+  const ws = webServerStub()
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: errorFinishStreamStub() })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll, llmIdleMs: 5000 })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '小玖？' }))
+    const st = await svc.status()
+    const dbgPath = join(dir, 'slices', st.sliceId, 'agent-debug.log')
+    await until(async () => {
+      try {
+        return /回合结束/.test(await readFile(dbgPath, 'utf8'))
+      } catch {
+        return false
+      }
+    })
+    const dbg = await readFile(dbgPath, 'utf8')
+    assert.ok(
+      /finish=error\(TRANSPORT:Stream ended without finish_reason\)/.test(dbg),
+      'error 帧的错因必须落进埋点，' + dbg.slice(-400),
+    )
+    assert.ok(/帧=2/.test(dbg), '两帧就是两帧，' + dbg.slice(-400))
+    assert.ok(/正文=0字/.test(dbg) && /推理=0字/.test(dbg), '零输出要看得出来，' + dbg.slice(-400))
+    assert.ok(/said=false/.test(dbg), '整轮没台词就该记 said=false，' + dbg.slice(-300))
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// ── 模型选择面板：显示名对齐工作模式（2026-09-28 主人定）──
+// 工作模式选择器显示的是 LlmModelInfo.name（简称，如 waifu / CC-DeepSeek-V4.1-Flash）；
+// 猫窝此前把模型 id 当名字显示，而 llamacpp 的 id 是 gguf 全路径，长得没法看。
+// id 仍是选中/提交与比对用的键，name 只负责显示。
+test('GET /catnest/api/models：current 带简称 name、列表给 {id,name}；名字拿不到时选择不丢', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-model-'))
+  const dir2 = await mkdtemp(join(tmpdir(), 'catnest-idx-model2-'))
+  try {
+    const ws = webServerStub()
+    const { ctx } = mkCtx({
+      personas: PERSONAS_STUB,
+      agentDefaultModel: { currentSelection: () => ({ provider: 'llamacpp', model: '/models/waifu.gguf' }) },
+      llm: {
+        listProviders: () => ['llamacpp', 'commandcode'],
+        listModels: async (p) =>
+          p === 'llamacpp'
+            ? [
+                { id: '/models/waifu.gguf', name: 'waifu' },
+                { id: '/models/qwen.gguf', name: 'unsloth' },
+              ]
+            : [{ id: 'deepseek/deepseek-v4.1-flash', name: 'CC-DeepSeek-V4.1-Flash' }],
+      },
+    })
+    ctx.webServer = ws
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const handler = ws.routes[0].handler
+
+    let res = fakeRes()
+    await handler(fakeReq('GET', '/catnest/api/models'), res)
+    assert.equal(res.code, 200)
+    const info = JSON.parse(res.body)
+    assert.deepEqual(info.current, { provider: 'llamacpp', model: '/models/waifu.gguf', name: 'waifu' })
+    assert.deepEqual(info.providers, ['llamacpp', 'commandcode'])
+
+    res = fakeRes()
+    await handler(fakeReq('GET', '/catnest/api/models/llamacpp'), res)
+    assert.deepEqual(JSON.parse(res.body).models, [
+      { id: '/models/waifu.gguf', name: 'waifu' },
+      { id: '/models/qwen.gguf', name: 'unsloth' },
+    ])
+
+    // 反向验证：listModels 抽风时 current 仍要返回（前端回落显示 id），
+    // 不能因为拿不到名字就把"当前选的是谁"一起丢掉。
+    const ws2 = webServerStub()
+    const { ctx: ctx2 } = mkCtx({
+      personas: PERSONAS_STUB,
+      agentDefaultModel: { currentSelection: () => ({ provider: 'llamacpp', model: '/models/waifu.gguf' }) },
+      llm: {
+        listProviders: () => ['llamacpp'],
+        listModels: async () => {
+          throw new Error('boom')
+        },
+      },
+    })
+    ctx2.webServer = ws2
+    plugin.apply(ctx2, { catnestDir: dir2, tickRand: noRoll })
+    const res2 = fakeRes()
+    await ws2.routes[0].handler(fakeReq('GET', '/catnest/api/models'), res2)
+    assert.equal(res2.code, 200)
+    assert.deepEqual(JSON.parse(res2.body).current, { provider: 'llamacpp', model: '/models/waifu.gguf' })
+  } finally {
+    await rmSafe(dir)
+    await rmSafe(dir2)
+  }
+})
+
+// ── 模型档解耦（2026-10-02 主人定）──
+// 病根：猫窝面板的选择器直接读写宿主默认档（agentDefaultModel），工作模式换一次模型、
+// 或者开个新 session 换了档，家里全家跟着换。现在猫窝有自己的 ~/.dsh/.catnest/model.json：
+// 首次读不到时从宿主默认档快照一次（迁移平滑），之后两边各走各的。
+test('模型档解耦：首次从宿主默认档快照；工作模式换档猫窝不跟随；猫窝换档也不写宿主', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-modeldec-'))
+  const ws = webServerStub()
+  let hostSel = { provider: 'llamacpp', model: '/models/waifu.gguf' }
+  const hostSaves = []
+  const { ctx } = mkCtx({
+    personas: PERSONAS_STUB,
+    agentDefaultModel: {
+      currentSelection: () => hostSel,
+      saveSelection: async (s) => {
+        hostSaves.push(s)
+      },
+    },
+    llm: {
+      listProviders: () => ['llamacpp', 'commandcode'],
+      listModels: async (p) =>
+        p === 'llamacpp'
+          ? [
+              { id: '/models/waifu.gguf', name: 'waifu' },
+              { id: '/models/qwen.gguf', name: 'unsloth' },
+            ]
+          : [{ id: 'deepseek/deepseek-v4.1-flash', name: 'CC-DeepSeek-V4.1-Flash' }],
+    },
+  })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const handler = ws.routes[0].handler
+    const getModels = async () => {
+      const r = fakeRes()
+      await handler(fakeReq('GET', '/catnest/api/models'), r)
+      return JSON.parse(r.body)
+    }
+    const selectModel = async (provider, model) => {
+      const r = fakeRes()
+      await handler(fakeReq('POST', '/catnest/api/action', JSON.stringify({ op: 'selectModel', provider, model })), r)
+      return r
+    }
+
+    // ① 首次：猫窝还没有自己的档 → 从宿主默认档快照一次（不会突然换模型）
+    assert.deepEqual((await getModels()).current, { provider: 'llamacpp', model: '/models/waifu.gguf', name: 'waifu' })
+    assert.equal(JSON.parse(await readFile(join(dir, 'model.json'), 'utf8')).model, '/models/waifu.gguf')
+
+    // ② 工作模式换档（等价于开个新 session 换了模型）：猫窝不动
+    hostSel = { provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }
+    assert.deepEqual(
+      (await getModels()).current,
+      { provider: 'llamacpp', model: '/models/waifu.gguf', name: 'waifu' },
+      '工作模式换档后猫窝必须保持自己的档',
+    )
+
+    // ③ 猫窝换档：只落猫窝自己的文件，不碰宿主默认档
+    const ok = await selectModel('llamacpp', '/models/qwen.gguf')
+    assert.equal(ok.code, 200)
+    assert.deepEqual(hostSaves, [], 'selectModel 不得写宿主默认档')
+    const saved = JSON.parse(await readFile(join(dir, 'model.json'), 'utf8'))
+    assert.equal(saved.provider, 'llamacpp')
+    assert.equal(saved.model, '/models/qwen.gguf')
+    assert.deepEqual((await getModels()).current, { provider: 'llamacpp', model: '/models/qwen.gguf', name: 'unsloth' })
+
+    // ④ 宿主默认档再变回去，猫窝照样不动
+    hostSel = { provider: 'llamacpp', model: '/models/waifu.gguf' }
+    assert.deepEqual((await getModels()).current, { provider: 'llamacpp', model: '/models/qwen.gguf', name: 'unsloth' })
+
+    // ⑤ 重新 apply（等价于重启）：同一个目录，档还在，不被宿主档覆盖
+    const ws2 = webServerStub()
+    const { ctx: ctx2 } = mkCtx({
+      personas: PERSONAS_STUB,
+      agentDefaultModel: { currentSelection: () => ({ provider: 'commandcode', model: 'x' }) },
+      llm: { listProviders: () => ['llamacpp'], listModels: async () => [{ id: '/models/qwen.gguf', name: 'unsloth' }] },
+    })
+    ctx2.webServer = ws2
+    plugin.apply(ctx2, { catnestDir: dir, tickRand: noRoll })
+    const res2 = fakeRes()
+    await ws2.routes[0].handler(fakeReq('GET', '/catnest/api/models'), res2)
+    assert.deepEqual(JSON.parse(res2.body).current, { provider: 'llamacpp', model: '/models/qwen.gguf', name: 'unsloth' })
+
+    // ⑥ 非法输入：400 且不改盘
+    assert.equal((await selectModel('', '')).code, 400)
+    assert.equal(JSON.parse(await readFile(join(dir, 'model.json'), 'utf8')).model, '/models/qwen.gguf')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('模型档解耦：生成用的是猫窝自己的档（llm.stream 收到 model.json 里那一对）', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-modelgen-'))
+  await writeFile(
+    join(dir, 'model.json'),
+    JSON.stringify({ provider: 'llamacpp', model: '/models/waifu.gguf' }, null, 2) + '\n',
+  )
+  const ws = webServerStub()
+  const calls = []
+  const llm = {
+    stream: (opts) => {
+      calls.push({ provider: opts.provider, model: opts.model })
+      const stop = hasAssistantToolCall(opts.messages)
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify({ text: '在的喵' }) }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({
+    personas: PERSONAS_STUB,
+    // 工作模式那边是另一个模型：猫窝不该用它
+    agentDefaultModel: { currentSelection: () => ({ provider: 'commandcode', model: 'deepseek/deepseek-v4.1-flash' }) },
+    llm,
+  })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const handler = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return handler(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'moveMaster', room: 'living' }))
+    await provided.catnest.moveCharacter('kyu', 'living')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
+    await until(() => calls.length >= 1)
+    assert.deepEqual(calls[0], { provider: 'llamacpp', model: '/models/waifu.gguf' }, '接话要走猫窝自己的档')
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// ── 点名接话（2026-09-28 主人定）：补上「当面那只耳朵」的绳子 ──
+// 病根：同房的话走 audience.clear，只写进家庭时间线、不唤醒任何人；隔墙的话反而进缓冲，
+// 攒够阈值会被 recheckHear 掀被子。于是「姐姐当面喊你没反应，隔壁有人走动你倒醒了」。
+// 新规矩：say 带 to 点名 + 同房 + 不忙 → 当场叫醒接话；不点名 / 不同房 / 对方忙 都不叫。
+
+// 给角色挂一个"还没到期"的活动（测试用）：isBusy 为真，点名也不该叫醒她。
+const busyActivity = async (dir, charId, activity = '看书', minutes = 60) => {
+  const file = join(dir, 'home.json')
+  const home = JSON.parse(await readFile(file, 'utf8'))
+  const ch = home.characters[charId]
+  ch.activity = activity
+  ch.activityEndsAt = new Date(Date.now() + minutes * 60000).toISOString()
+  await writeFile(file, JSON.stringify(home, null, 2) + '\n')
+}
+
+test('点名接话：同房姐妹被点名会当场醒来接话，notice 与触发句都要对', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-call-'))
+  const ws = webServerStub()
+  const prompts = []
+  const llm = {
+    stream: (opts) => {
+      const isMoli = String(opts.system || '').includes('成员墨璃')
+      prompts.push({ who: isMoli ? 'moli' : 'kyu', user: captureUser(opts.messages[0]) })
+      const stop = hasAssistantToolCall(opts.messages)
+      return (async function* () {
+        if (stop) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          argumentsDelta: JSON.stringify(
+            isMoli ? { text: '小玖，来尝尝姐姐做的', to: '小玖' } : { text: '来啦喵' },
+          ),
+        }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living') // 主人在家 → T6 不参与，隔离出点名这一条路
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'living')
+    // 墨璃的活动到期 → tick 第 2 步 T3 叫醒她；她醒来后点名小玖
+    await expireActivity(dir, 'moli')
+    await svc.tick()
+    await until(() => prompts.filter((p) => p.who === 'kyu').length >= 1)
+    assert.equal(prompts.filter((p) => p.who === 'kyu').length, 1, '被点名的小玖应当醒来接话')
+    const st = await svc.status()
+    const log = await readLog(dir, st.sliceId)
+    const calls = log.filter((e) => e.type === 'notice' && /点了你的名/.test(e.text || ''))
+    assert.equal(calls.length, 1, '点名要留一条私有 notice 当掀被子的理由')
+    assert.equal(calls[0].char, 'kyu')
+    assert.equal(calls[0].source, 'moli')
+    assert.equal(calls[0].private, true)
+    const kyuP = prompts.find((p) => p.who === 'kyu')
+    assert.ok(/点了你的名/.test(kyuP.user || ''), '小玖醒来时该看到是谁叫的她：' + String(kyuP.user).slice(-260))
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+test('点名接话的反面：不点名 / 不在同房 / 对方正忙，都不叫醒', async () => {
+  const run = async (label, opts) => {
+    const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-callx-'))
+    const ws = webServerStub()
+    const prompts = []
+    const llm = {
+      stream: (o) => {
+        const isMoli = String(o.system || '').includes('成员墨璃')
+        prompts.push({ who: isMoli ? 'moli' : 'kyu' })
+        const stop = hasAssistantToolCall(o.messages)
+        return (async function* () {
+          if (stop) {
+            yield { type: 'finish', reason: { kind: 'stop' } }
+            return
+          }
+          yield { type: 'tool-call-delta', index: 0, id: 'call_1', name: 'say' }
+          yield { type: 'tool-call-delta', index: 0, argumentsDelta: JSON.stringify(opts.args) }
+          yield { type: 'finish', reason: { kind: 'tool-calls' } }
+        })()
+      },
+    }
+    const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+    ctx.webServer = ws
+    try {
+      plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+      const svc = provided.catnest
+      const h = ws.routes[0].handler
+      const call = (method, url, body) => {
+        const r = fakeRes()
+        return h(fakeReq(method, url, body), r).then(() => r)
+      }
+      await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+      await svc.moveMaster('living')
+      await svc.moveCharacter('kyu', opts.kyuRoom || 'living')
+      await svc.moveCharacter('moli', 'living')
+      if (opts.busyKyu) await busyActivity(dir, 'kyu')
+      await expireActivity(dir, 'moli')
+      await svc.tick()
+      await until(() => prompts.filter((p) => p.who === 'moli').length >= 1)
+      await new Promise((r) => setTimeout(r, 150)) // 给可能发生的误唤醒留时间
+      assert.equal(prompts.filter((p) => p.who === 'kyu').length, 0, label + '：不该叫醒')
+      const st = await svc.status()
+      const log = await readLog(dir, st.sliceId)
+      assert.equal(
+        log.filter((e) => e.type === 'notice' && /点了你的名/.test(e.text || '')).length,
+        0,
+        label + '：不该留点名 notice',
+      )
+    } finally {
+      await rmSafe(dir)
+    }
+  }
+  await run('不点名', { args: { text: '自言自语一句' } })
+  await run('不在同房', { args: { text: '小玖？', to: '小玖' }, kyuRoom: 'kitchen' })
+  await run('对方正忙', { args: { text: '小玖？', to: '小玖' }, busyKyu: true })
+})
+
+// 活动剩余时间进【此刻的位置】（2026-09-28 主人定）：只写「在做：X」时模型看不见这口锅
+// 还剩多少火，于是每轮都想重新声明一次（当天实测 112 次挂活动里 95 次是没到点就重挂）。
+test('【此刻的位置】里活动带剩余时间：她看得见这口锅还剩多少火', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-left-'))
+  const ws = webServerStub()
+  const out = []
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm: silentCapture(out) })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await busyActivity(dir, 'kyu', '守着主人写作业', 90)
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
+    await until(() => out.some((o) => String(o.system).includes('成员小玖')))
+    const kyuP = out.find((o) => String(o.system).includes('成员小玖'))
+    assert.ok(
+      /（在做：守着主人写作业·还剩 [0-9]+(分钟|小时)/.test(kyuP.user),
+      'presence 要带剩余时间：' + String(kyuP.user).slice(-300),
+    )
+  } finally {
+    await rmSafe(dir)
+  }
+})
+
+// 覆盖播报要真的进她的片内时间线（2026-09-28 主人定）：lib 层只证明写进了账本，
+// 这条证明「下一轮她看得见旧活动被撂下」——她缺的正是这个"结束"的感知。
+test('活动被顶掉后，下一轮她的时间线里看得到「撂下了X」', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'catnest-idx-replace-'))
+  const ws = webServerStub()
+  const out = []
+  let calls = 0
+  const llm = {
+    stream: (opts) => {
+      calls += 1
+      out.push({ user: captureUser(opts.messages[0]) })
+      const first = calls === 1
+      return (async function* () {
+        if (!first) {
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+        yield { type: 'tool-call-delta', index: 0, id: 'c1', name: 'do_activity' }
+        yield {
+          type: 'tool-call-delta',
+          index: 0,
+          argumentsDelta: JSON.stringify({ activity: '陪主人吃午饭', minutes: 60 }),
+        }
+        yield { type: 'finish', reason: { kind: 'tool-calls' } }
+      })()
+    },
+  }
+  const { ctx, provided } = mkCtx({ personas: PERSONAS_STUB, llm })
+  ctx.webServer = ws
+  try {
+    plugin.apply(ctx, { catnestDir: dir, tickRand: noRoll })
+    const svc = provided.catnest
+    const h = ws.routes[0].handler
+    const call = (method, url, body) => {
+      const r = fakeRes()
+      return h(fakeReq(method, url, body), r).then(() => r)
+    }
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'open' }))
+    await svc.moveMaster('living')
+    await svc.moveCharacter('kyu', 'living')
+    await svc.moveCharacter('moli', 'kitchen') // 隔离：只留小玖接话
+    await busyActivity(dir, 'kyu', '吃饭', 60) // 她手上本来端着「吃饭」
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '在吗' }))
+    await until(() => out.length >= 1)
+    assert.ok(!String(out[0].user).includes('撂下了'), '覆盖发生前她看不到这条')
+    await call('POST', '/catnest/api/action', JSON.stringify({ op: 'say', text: '吃点什么好' }))
+    await until(() => out.some((o) => String(o.user).includes('撂下了')))
+    const last = out[out.length - 1]
+    assert.ok(
+      String(last.user).includes('撂下了「吃饭」，转去做「陪主人吃午饭」'),
+      '下一轮她的时间线里该看见旧活动被撂下：' + String(last.user).slice(-400),
+    )
   } finally {
     await rmSafe(dir)
   }
