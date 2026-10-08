@@ -717,7 +717,7 @@ export function makeStamper(out) {
 }
 
 // 周期结算（纯函数，就地把结果写回 home）：
-//   ① 首次播种：没有周期档的猫按 firstDelayDays 错开排第一轮（家里不会开场双发情）
+//   ① 首次播种：没有周期档的猫按 firstDelayDays 错开排第一轮
 //   ② 滚动：本轮整段过去 → 排下一轮（gapDays + 抖动，抖动落盘）
 //   ③ 临近（≤ CYCLE_LEAD_DAYS 天）→ 写 pending 进 conditions（一次性；已有同名条目不动，
 //      免得覆盖猫自己挂的那条）
@@ -1455,7 +1455,7 @@ export function sliceEventsText(home, logText) {
         )
         break
       case 'notice':
-        // 调度层事件行：公共=家庭事实原样；私有=该角色的感知（「墨璃被发情叫醒」也是家史）
+        // 调度层事件行：公共=家庭事实原样；私有=该角色的感知
         put(e.t, e.private ? `${charName(home, e.char)}注意到：${e.text}` : e.text)
         break
       case 'hear':

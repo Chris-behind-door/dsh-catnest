@@ -1271,7 +1271,7 @@ test('settleCycles：首次播种按 CYCLE_CONFIG 错开（姐姐 4 天 / 小玖
   const kyuDelay = Math.round((new Date(home.cycles.kyu.nextStart).getTime() - t0) / day)
   assert.equal(moliDelay, CYCLE_CONFIG.moli.firstDelayDays)
   assert.equal(kyuDelay, CYCLE_CONFIG.kyu.firstDelayDays)
-  assert.ok(kyuDelay > moliDelay, '第一轮错开，不会开场双发情')
+  assert.ok(kyuDelay > moliDelay, '第一轮错开')
   assert.equal(home.cycles.kyu.gapDays, 40, '小玖 40 天一轮')
   assert.equal(home.cycles.moli.gapDays, 30, '姐姐 30 天一轮')
   assert.equal(home.cycles.moli.durDays, 3)
